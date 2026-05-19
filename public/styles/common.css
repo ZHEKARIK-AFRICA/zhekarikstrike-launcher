@@ -1,0 +1,90 @@
+@import url('variables.css');
+
+@import url("../assets/fonts/Benzin/stylesheet.css");
+
+body {
+    font-family: var(--main-font);
+    background-color: var(--black-color);
+    color: white;
+    text-align: left;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    opacity: 0;
+    transition: opacity 1s ease-in-out;
+}
+
+
+body.fade-in {
+    opacity: 1;
+}
+
+body.fade-out {
+    opacity: 0;
+}
+
+*::selection{
+    background-color: white;
+    color: var(--black-color);
+}
+
+.background-container {
+    position: relative;
+    overflow: hidden; /* Гарантирует, что фон не выходит за пределы контейнера */
+}
+
+
+
+h1 {
+    font-family: "Benzin";
+    margin: 1vh 0;
+    line-height: 1.05;
+    user-select: none;
+    margin-top: 6vh;
+}
+
+
+
+
+input{
+    background: none;
+    border:none;
+    color:white
+}
+
+.input{
+    display: flex;
+    border: 0.1vh var(--border-color-input) solid;
+    max-width: 100%;
+    padding: 1.7vh 3vh;
+    margin-bottom: 1vh;
+    backdrop-filter:blur(1.2vh);
+    justify-content: space-between;
+    border-radius: var(--buttons-border-radius);
+    color: var(--light-grey-color);
+    font-size: var(--main-font-size);
+    transition: border 0.3s ease, background 0.3s ease; 
+    background:radial-gradient(transparent, transparent);
+}
+
+input:focus {
+    outline: none;
+    border: 0.1vh var(--border-color-button) solid;
+    background:radial-gradient(transparent, #00000025);
+}
+
+label {
+    display: block;
+    margin-bottom: 0.6vh;
+    font-size: var(--main-font-size);
+    float: inline-start;
+    margin-left:2vh;
+    user-select: none;
+}
+
+.launcher-container {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    margin: 3.5% 7%;
+}

@@ -1,0 +1,51 @@
+.window-control-button {
+    color: var(--grey-color);
+    background-color: transparent;
+    border: none;
+    padding: 0.5vh 1.8vw;
+    cursor: pointer;
+    transition: background-color 0.3s;
+    font-size:1.2vw;
+    filter:grayscale(1);
+    user-select: none;
+}
+
+.window-control-button#settings-button {
+    padding: 0.5vh 1vw;
+}
+
+#settings-button img{
+    margin-top:0.1vw;
+    height:1.8vw;
+}
+
+.window-control-button:hover {
+    background-color: var(--black-color-hover);
+}
+
+.window-control-button:active {
+    background-color: #777;
+}
+
+
+.language-toggle {
+    align-content: center;
+}
+
+.language-toggle:hover {
+    background-color: transparent;   
+}
+
+.language-option {
+    cursor: pointer;
+    user-select: none;
+}
+
+.language-option.active {
+    color: var(--light-grey-color); /* Белый цвет для активного языка */
+    font-weight: bold; /* Выделим активный язык */
+}
+
+.language-option:hover {
+    color: var(--light-grey-color); /* Меняем цвет при наведении */
+}

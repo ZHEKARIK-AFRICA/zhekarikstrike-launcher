@@ -1,0 +1,12 @@
+:root {
+    --main-font: 'Arial', sans-serif;
+    --black-color: #1E1E1E;
+    --black-color-hover: #242424;
+    --grey-color: #A6A6A6;
+    --main-font-size: 2.3vh;
+    --light-grey-color:#d0d0d0;
+    --dark-grey-color: #5E5E5E;
+    --buttons-border-radius: 2.6vh;
+    --border-color-input: #FFFFFF13;
+    --border-color-button: #FFFFFF28;
+}

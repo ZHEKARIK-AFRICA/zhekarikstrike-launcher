@@ -1,0 +1,35 @@
+#error-modal-ok {
+    margin-top: 3vh;
+}
+
+#error-modal-content::before {
+    top: 0;
+    left: -7%;
+    width: 60%;
+    height: 100%;
+    background-image: url('../assets/img/cancel_bg.png'); /* Замените на путь к вашему изображению */
+    background-size: cover; /* Или используйте 'contain' или конкретные размеры */
+    background-position: center; /* Измените на нужное вам расположение */
+    background-repeat: no-repeat;
+    opacity: 0.03; /* Настройте уровень прозрачности */
+}
+
+
+#error-message {
+    font-size: 3vh;
+    color: var(--light-grey-color);
+    text-align: left;
+    margin: 0;
+    
+    text-transform: lowercase;
+    z-index: 1;
+}
+
+
+
+#error-modal-close:hover,
+#error-modal-close:focus {
+    color: var(--black-color);
+    text-decoration: none;
+    cursor: pointer;
+}

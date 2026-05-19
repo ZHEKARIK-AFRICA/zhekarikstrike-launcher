@@ -1,0 +1,291 @@
+.background-image {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    transform:scale(2.4);
+    background-image: url('../assets/img/bg.png');
+    background-size: cover;
+    background-position: center;
+    opacity: 0.02; /* Настраивает непрозрачность */
+    z-index: -1; /* Размещает фон позади содержимого */
+    left:0%;
+    top:40%;
+    filter:invert(1) grayscale(1);
+}
+
+h1 {
+    font-size: 11vh;
+    width:40%;
+    margin-bottom: 4vh;
+}
+
+
+
+.install-container {
+    flex-direction: column;
+}
+
+#install-path{
+    width:100%;
+    padding-right: 9vh;
+}
+
+.installing-menu{
+    width:60%;
+    align-self:center;
+    margin-top: 3%;
+}
+
+.settings .image-section {
+    padding: 1vh;
+    border-radius: 1vh;
+    margin: 1vh;
+    width:100%;
+}
+
+#modelCanvas {
+    width:100%;
+    height: 100%;
+    transform:scale(1)
+    
+}
+
+.settings {
+    display: flex;
+    flex-direction: column;
+}
+
+
+
+.field-group {
+    display: flex;
+    justify-content: space-between;
+    margin-top:1vh;
+    gap:2vh;
+}
+
+.field {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+}
+
+#clantag-field{
+    width:35%;
+}
+
+.main-action-button{
+    font-family: "Benzin";
+    font-weight: 700;
+    width: 100%;
+    height: 14vh;
+    background-color: #fff;
+    color: var(--black-color);
+    border: none;
+    border-radius: var(--buttons-border-radius);
+    font-size: 4.5vh;
+    cursor: pointer;
+    transition: box-shadow 0.3s ease, transform 0.3s ease;
+    box-shadow: transparent 0 0 35px;
+    transform:scale(1);
+    position: relative;
+    overflow: hidden;
+    user-select: none;
+}
+
+.main-action-button:hover{
+    box-shadow: #FFFFFF17 0 0 35px;
+    transform:scale(1.005);
+}
+
+.main-action-button:disabled{
+    filter: brightness(0.5);
+    cursor: not-allowed;
+    box-shadow: none;
+    transform: none;
+}
+
+.main-action-button:disabled:hover{
+    box-shadow: none;
+    transform: none;
+}
+
+/* Эффект загрузки при disabled */
+.main-action-button:disabled::after{
+    content: "";
+    position: absolute;
+    top: 0;
+    left: -100%;
+    width: 100%;
+    height: 100%;
+    background: linear-gradient(to right, transparent 0%, rgba(255, 255, 255, 0.3) 50%, transparent 100%);
+    animation: loading-animation 1.5s infinite;
+}
+
+/* Анимация градиента */
+@keyframes loading-animation {
+    0% {
+        left: -100%;
+    }
+    100% {
+        left: 100%;
+    }
+}
+
+
+
+#play-button {
+    margin-top:3vh;
+}
+
+#play-button:hover {
+    
+}
+
+.bottom-controls {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 1vh;
+}
+
+#check-files {
+    padding: 1.7vh;
+    background-color: var(--black-color);
+    color: white;
+    border: 0.1vh var(--border-color-button) solid;
+    border-radius: var(--buttons-border-radius);
+    cursor: pointer;
+    transition: background-color 0.3s ease;
+    font-size:var(--main-font-size);
+    width: 60%;
+    min-width: 60%;
+    margin-right: 2vw;
+    user-select: none;
+    text-transform: lowercase;
+}
+
+#check-files:hover {
+    background-color: var(--black-color-hover);
+}
+
+#launcher-status {
+    color: var(--grey-color);
+    font-size:var(--main-font-size);
+    width:40%;
+    max-width: 40%;
+    padding: 0 4vh;
+    text-wrap: nowrap;
+    text-align: center;
+    text-transform: lowercase;
+}
+
+.image-section{
+    padding-left:0;
+    margin-left: 5%;
+    margin-right: -5%;
+    width:75%;
+    height:90vh;
+    filter:contrast(0.95) brightness(3);
+    overflow: hidden;
+}
+
+
+
+
+.choose-path {
+    /* Дополнительные стили для контейнера, если необходимо */
+}
+
+.choose-path-input {
+    position: relative;
+    display: inline-block;
+    width: 100%; /* Занимает всю доступную ширину */
+}
+
+.choose-path-input .input {
+    width: 100%;
+    padding-right: 2vh; /* Оставляем место для кнопки */
+    box-sizing: border-box;
+    /* Добавьте любые другие стили для поля ввода */
+}
+
+.choose-folder-button {
+    position: absolute;
+    right: 1vh;
+    top: 45%;
+    transform: translateY(-50%) scale(0.6);
+    border: none;
+    background: none;
+    cursor: pointer;
+    padding: 0;
+    margin: 0;
+    width:5vw;
+    outline: none;
+    transition: transform 200ms ease;
+    filter: brightness(0.7);
+    user-select: none;
+
+}
+
+.choose-folder-button:hover {
+    transform:translateY(-50%) scale(0.57);
+    filter: brightness(1.6);
+}
+
+.choose-folder-button img{
+    width:4vw;
+}
+
+.install-buttons{
+    display:flex;
+    justify-content: space-between;
+    flex-direction: column;
+    margin-top:2vh;
+    gap:2vh;
+}
+
+.main-actions{
+    display: flex;
+    flex-direction: row;
+}
+
+#cancel-install{
+    padding:2vh;
+    width:160%;
+    height: 100%;
+    font-size: var(--main-font-size);
+    background-color: var(--black-color);
+    color:white;
+    border: 0.1vw var(--border-color-button) solid;
+    border-radius: var(--buttons-border-radius);
+    transition: background-color 300ms ease;
+    user-select: none;
+}
+
+#cancel-install:not(:disabled):hover {
+    cursor: pointer;
+    background-color: var(--black-color);
+}
+
+#cancel-install:disabled{
+    color: var(--grey-color);
+    border: 0.1vw var(--border-color-input) solid;
+}
+
+
+#install-status{
+    padding:2vh;
+    height: 100%;
+    margin:0;
+    font-size: var(--main-font-size);
+    align-self: center;
+    width:100%;
+    color:var(--grey-color);
+    text-transform: lowercase;
+    text-wrap:nowrap;
+    text-align: center;
+}
+

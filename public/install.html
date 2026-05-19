@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title id="page-title">ЖЕКАРИК СТРАЙК - Установка</title>
+    <link rel="stylesheet" href="styles/footer.css">
+    <link rel="stylesheet" href="styles/error.css">
+    <link rel="stylesheet" href="styles/dragbar.css">
+    <link rel="stylesheet" href="styles/windowcontrol.css">
+    <link rel="stylesheet" href="styles/common.css">
+    <link rel="stylesheet" href="styles/styles.css">
+    <link rel="stylesheet" href="styles/modal.css">
+</head>
+<body>
+    <div class="background-image"></div>
+    <div id="drag-bar" class="drag-bar">
+        <div class="language-toggle window-control-button no-drag">
+            <span id="language-en" class="language-option">EN</span> /
+            <span id="language-ru" class="language-option">RU</span>
+        </div>
+        <button id="minimize-window" class="window-control-button no-drag">—</button>
+        <button id="close-window" class="window-control-button no-drag">╳</button>
+    </div>
+    <div id="error-modal" class="modal">
+        <div id="error-modal-content" class="modal-content">
+            <h2 id="error-modal-title">ашибка...</h2>
+            <p id="error-message">произошла ошибка.</p>
+            <button id="error-modal-ok" class="modal-ok">понял</button>
+        </div>
+    </div>
+    <div class="launcher-container install-container">
+        <h1 id="zhekarik-strike-title">ЖЕКАРИК СТРАЙК</h1>
+        <div class="installing-menu">
+            <div class="choose-path">
+                <label for="install-path" id="install-path-label" spellcheck="false">куда установить игру?</label>
+                <div class="choose-path-input">
+                    <input type="text" id="install-path" class="input" placeholder="путь к жекарик страйку">
+                    <button id="choose-folder" class="choose-folder-button">
+                        <img src="assets/img/browse-button-icon.svg" alt="Выбрать папку">
+                    </button>
+                </div>
+            </div>
+            <div class="install-buttons">
+                <button id="start-install" class="main-action-button">НАЧАТЬ УСТАНОВКУ</button>
+                <div class="main-actions">
+                    <button id="cancel-install">отмена</button>
+                    <p id="install-status">ожидание...</p>
+                </div>
+            </div>
+        </div>
+    </div>
+    <footer>
+        <div class="footer-down">
+            <div class="footer-links">
+                <a href="https://zhekarik.africa/strike">www.zhekarik.africa</a>
+                <a href="https://zhekarik.africa/strike/stream">/stream</a>
+                <a href="https://zhekarik.africa/strike/vip">/vip</a>
+                <a href="https://zhekarik.africa/strike/demos">/demos</a>
+            </div>
+            <p id="progress-info"></p>
+        </div>
+        <div id="progress-container">
+            <div id="progress-bar"></div>
+        </div>
+    </footer>
+    <script src="../src/renderer/common.js" type="module"></script>
+    <script src="../src/renderer/renderer_install.js" type="module"></script>
+    <script src="../src/renderer/renderer.js" type="module"></script>
+    <script src="../src/localization/localization_install.js" type="module" defer></script>
+</body>
+</html>

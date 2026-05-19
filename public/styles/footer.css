@@ -1,0 +1,59 @@
+#progress-container {
+    width: 100%;
+    background-color: #2c2c2c;
+    border-radius: 2vw;
+    margin: 0 auto 1vh auto;
+    height: 1.5vh;
+    position: relative;
+}
+
+/* Стиль для самого прогресс-бара */
+#progress-bar {
+    width: 0%; /* Начальное значение — 0%, его будет изменять JavaScript */
+    height: 100%;
+    background-color: var(--grey-color);
+    border-radius: 1vw;
+    transition: width 0.05s ease; /* Плавное увеличение ширины */
+    border-radius: 2vw;
+}
+
+#progress-info{
+    padding:0 2vh;
+    margin:0;
+    user-select: none;
+}
+
+.footer-down{
+    display: flex;
+    justify-content: space-between;
+    flex-direction: row-reverse;
+}
+
+footer {
+    position: absolute;
+    left:50%;
+    transform:translateX(-50%);
+    bottom:0;
+    margin-bottom: 0.2%;
+    width:95%;
+    font-size: var(--main-font-size);
+    color: var(--grey-color);
+}
+
+.footer-links{
+    text-align: -webkit-center;
+    margin-bottom: 0.8%;
+    user-select: none;
+}
+
+footer a {
+    color: var(--grey-color);
+    text-decoration: none;
+    padding: 0 2vh;
+    text-decoration: underline;
+}
+
+footer a:hover {
+    
+}
+

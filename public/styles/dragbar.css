@@ -1,0 +1,17 @@
+
+.drag-bar {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    background-color: rgba(41, 41, 41, 0.22); /* Прозрачный фон */
+    -webkit-app-region: drag; /* Позволяет перетаскивать окно */
+    cursor: move; /* Иконка курсора "движение" */
+    justify-content: end;
+    display:flex;
+}
+
+/* Чтобы элементы внутри drag-bar не мешали перетаскиванию, можно задать -webkit-app-region: no-drag */
+.no-drag {
+    -webkit-app-region: no-drag;
+}

@@ -1,0 +1,24 @@
+#settings-modal-content::before {
+    top: 0;
+    right: -8%;
+    width: 60%;
+    height: 100%;
+    background-image: url('../assets/img/settings_bg.png'); /* Замените на путь к вашему изображению */
+    background-size: cover; /* Или используйте 'contain' или конкретные размеры */
+    background-position: center; /* Измените на нужное вам расположение */
+    background-repeat: no-repeat;
+    opacity: 0.03; /* Настройте уровень прозрачности */
+    filter: invert();
+    mix-blend-mode: screen;
+    transform: scaleX(-1);
+}
+
+
+.settings-buttons {
+    display: flex;
+    justify-content: space-between;
+}
+
+.settings-content {
+    margin-top:2vh;
+}

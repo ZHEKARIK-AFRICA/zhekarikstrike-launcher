@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ЖЕКАРИК СТРАЙК</title>
+    <link rel="stylesheet" href="styles/common.css">
+    <link rel="stylesheet" href="styles/styles.css">
+    <link rel="stylesheet" href="styles/footer.css">
+    <link rel="stylesheet" href="styles/error.css">
+    <link rel="stylesheet" href="styles/dragbar.css">
+    <link rel="stylesheet" href="styles/windowcontrol.css">
+    <link rel="stylesheet" href="styles/settings.css">
+    <link rel="stylesheet" href="styles/modal.css">
+</head>
+<body>
+    <div class="background-image"></div>
+    <div id="drag-bar" class="drag-bar">
+        <div class="language-toggle window-control-button no-drag">
+            <span id="language-en" class="language-option">EN</span> /
+            <span id="language-ru" class="language-option">RU</span>
+        </div>
+        <button id="settings-button" class="window-control-button no-drag"><img src="assets/icons/settings.svg" /></button>
+        <button id="minimize-window" class="window-control-button no-drag">—</button>
+        <button id="close-window" class="window-control-button no-drag">╳</button>
+    </div>
+    <div id="error-modal" class="modal">
+        <div id="error-modal-content" class="modal-content">
+            <h2 id="error-modal-title">ашибка...</h2>
+            <p id="error-message">произошла ошибка.</p>
+            <button id="error-modal-ok" class="modal-ok">понял</button>
+        </div>
+    </div>
+    <div id="settings-modal" class="modal">
+        <div class="modal-content" id="settings-modal-content">
+            <h2>настройки</h2>
+            <label for="game-path">путь к игре:</label>
+            <input type="text" id="game-path" class="input" placeholder="C:\Program Files\Zhekarik Strike" spellcheck="false">
+            
+            <button id="close-settings" class="modal-ok">закрыть</button>
+        </div>
+    </div>
+    <div class="launcher-container">
+        <!-- Блок настроек -->
+        <div class="settings">
+            <h1 id="zhekarik-strike-title">ЖЕКАРИК СТРАЙК</h1>
+            <label for="launch-params">параметры запуска</label>
+            <input type="text" id="launch-params" class = "input" spellcheck="false" placeholder="-windowed -novid">
+            
+            <div class="field-group">
+                <div class="field" id="clantag-field">
+                    <label for="clan-tag">клантег</label>
+                    <input type="text" id="clan-tag" class = "input" spellcheck="false" placeholder="zhekariks">
+                </div>
+                <div class="field">
+                    <label for="nickname" id="nickname-field">никнейм</label>
+                    <input type="text" id="nickname" class = "input" spellcheck="false" placeholder="хизару">
+                </div>
+            </div>
+
+            <button id="play-button" class="main-action-button">ИГРАТЬ</button>
+
+            <div class="bottom-controls">
+                <button id="check-files">проверить целостность файлов</button>
+                <p id="launcher-status">готов к запуску!</p>
+            </div>
+        </div>
+
+        <!-- Блок с картинкой -->
+        <div class="image-section">
+            <canvas id="modelCanvas"></canvas>
+        </div>
+    </div>
+
+    <!-- Ссылки -->
+    <footer>
+        <div class="footer-down">
+            <div class="footer-links">
+                <a href="https://zhekarik.africa/">www.zhekarik.africa</a>
+                <a href="https://zhekarik.africa/strike/stream">/stream</a>
+                <a href="https://zhekarik.africa/strike/vip">/vip</a>
+                <a href="https://zhekarik.africa/strike/demos">/demos</a>
+            </div>
+            <p id="progress-info"></p>
+        </div>
+        <div id="progress-container">
+            <div id="progress-bar"></div>
+        </div>
+    </footer>
+    <script src="../src/localization/localization_index.js" type="module" defer></script>
+    <script src="../src/renderer/renderer_index.js" type="module" defer></script>
+    <script src="../src/renderer/common.js" type="module"></script>
+    <script src="../src/renderer/renderer.js" type="module"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+    
+    <script src="../src/renderer/3dmodel_renderer.js"></script>
+</body>
+</html>

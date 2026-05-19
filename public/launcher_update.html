@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ЖЕКАРИК СТРАЙК - Обновление</title>
+    <link rel="stylesheet" href="styles/common.css">
+    <link rel="stylesheet" href="styles/dragbar.css">
+    <link rel="stylesheet" href="styles/windowcontrol.css">
+    <link rel="stylesheet" href="styles/settings.css">
+    <link rel="stylesheet" href="styles/error.css">
+    <link rel="stylesheet" href="styles/modal.css">
+    <link rel="stylesheet" href="styles/launcher_update.css">
+
+</head>
+<body>
+    <div class="background-image"></div>
+    <div id="drag-bar" class="drag-bar">
+        <div class="language-toggle window-control-button no-drag">
+            <span id="language-en" class="language-option">EN</span> /
+            <span id="language-ru" class="language-option">RU</span>
+        </div>
+        <button id="minimize-window" class="window-control-button no-drag">—</button>
+        <button id="close-window" class="window-control-button no-drag">╳</button>
+    </div>
+    <div id="error-modal" class="modal">
+        <div id="error-modal-content" class="modal-content">
+            <h2>ашибка...</h2>
+            <p id="error-message">произошла ошибка.</p>
+            <button id="error-modal-ok" class="modal-ok">понял</button>
+        </div>
+    </div>
+    <div class="launcher-container update-container">
+        <h1>ТВОЙ ЛАУНЧЕР - <br />УСТАРЕВШАЯ Х*****Я</h1>
+    </div>
+    <footer>
+        <div class="footer-down">
+            <p id="progress-status">скачиваю новую версию...</p>
+            <p id="progress-info"></p>
+        </div>
+        <div id="progress-container">
+            <div id="progress-bar"></div>
+        </div>
+        <div class="update-info">после обновления откроется кмд который заменит текущий лаунчер на новый и запустит его, не пугайся</div>
+    </footer>
+    <script src="../src/localization/localization_update.js" type="module" defer></script>
+    <script src="../src/renderer/common.js" type="module"></script>
+    <script src="../src/renderer/renderer.js" type="module"></script>
+    <script src="../src/renderer/renderer_launcher_update.js" type="module"></script> <!-- Add this line -->
+</body>
+</html>
