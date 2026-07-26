@@ -6,20 +6,22 @@ use crate::state::{AppState, OperationKind};
 
 #[tauri::command]
 pub async fn launch_game(app: AppHandle, state: State<'_, AppState>) -> Result<(), AppError> {
-    state
-        .acquire_operation(OperationKind::LaunchingGame)
-        .await?;
-    let game_path = config_service::get_game_path()
-        .await?
-        .ok_or(AppError::GamePathNotSet)?;
-    let result = game_process_service::launch_game(app.clone(), state.inner(), game_path).await;
-    state.release_operation().await;
+    let _lease = state.begin_operation(OperationKind::LaunchingGame, None)?;
 
-    if let Err(error) = result.as_ref() {
-        app.emit("game-error", error.frontend_error())?;
+    #[cfg(feature = "e2e")]
+    {
+        app.emit("game-started", ())?;
+        app.emit("game-closed", ())?;
+        return Ok(());
     }
 
-    result
+    #[cfg(not(feature = "e2e"))]
+    {
+        let game_path = config_service::get_game_path()
+            .await?
+            .ok_or(AppError::GamePathNotSet)?;
+        game_process_service::launch_game(app, state.inner(), game_path).await
+    }
 }
 
 #[tauri::command]

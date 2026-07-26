@@ -103,34 +103,18 @@ impl ApiClient {
         &self,
         current_version: &str,
     ) -> Result<LauncherUpdateManifest, AppError> {
-        let modern_url = format!(
+        let url = format!(
             "{}/launcher/update/windows/x86_64/{}",
             MODERN_API_BASE_URL, current_version
         );
-        let modern_result = self
+        Ok(self
             .http
-            .get(modern_url)
+            .get(url)
             .send()
-            .await
-            .and_then(|response| response.error_for_status());
-
-        if let Ok(response) = modern_result {
-            if let Ok(manifest) = response.json::<LauncherUpdateManifest>().await {
-                return Ok(manifest);
-            }
-        }
-
-        let version = self.get_version_info().await?;
-        Ok(LauncherUpdateManifest {
-            version: version.launcher_version,
-            notes: None,
-            pub_date: Some(Utc::now().to_rfc3339()),
-            platforms: None,
-            url: Some(format!("{}/download_launcher", self.api_base_url)),
-            signature: None,
-            sha256: None,
-            size: None,
-        })
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
     }
 
     pub async fn get_archive_manifest(&self) -> Result<GameArchiveManifest, AppError> {

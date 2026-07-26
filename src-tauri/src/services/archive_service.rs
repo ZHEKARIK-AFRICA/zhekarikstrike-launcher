@@ -72,3 +72,22 @@ fn safe_zip_path(target_dir: &Path, entry_name: &str) -> Result<PathBuf, AppErro
 
     Ok(target_dir.join(relative))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::safe_zip_path;
+
+    #[test]
+    fn zip_entries_cannot_escape_the_target_directory() {
+        let root = Path::new(r"D:\Games\ZS");
+        assert_eq!(
+            safe_zip_path(root, "csgo/maps/test.bsp").expect("relative entry should be safe"),
+            root.join("csgo/maps/test.bsp")
+        );
+        assert!(safe_zip_path(root, "../../launcher.exe").is_err());
+        assert!(safe_zip_path(root, r"C:\Windows\system.ini").is_err());
+        assert!(safe_zip_path(root, "/Windows/system.ini").is_err());
+    }
+}

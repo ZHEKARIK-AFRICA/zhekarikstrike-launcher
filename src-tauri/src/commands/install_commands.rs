@@ -1,11 +1,10 @@
 use std::path::PathBuf;
 
-use tauri::{AppHandle, Emitter, State};
-use tokio_util::sync::CancellationToken;
+use tauri::{AppHandle, State};
 
 use crate::error::AppError;
 use crate::services::install_service;
-use crate::state::{AppState, OperationKind};
+use crate::state::{AppState, CancellationSlot, OperationKind};
 
 #[tauri::command]
 pub async fn install_game(
@@ -13,39 +12,33 @@ pub async fn install_game(
     state: State<'_, AppState>,
     game_path: String,
 ) -> Result<(), AppError> {
-    state.acquire_operation(OperationKind::Installing).await?;
-    let cancel = CancellationToken::new();
-    *state.install_cancel_token.lock().await = Some(cancel.clone());
+    let lease =
+        state.begin_operation(OperationKind::Installing, Some(CancellationSlot::Install))?;
+    let cancel = lease
+        .cancellation_token()
+        .expect("install operations always have a cancellation token");
 
-    let result = install_service::install_game(app.clone(), PathBuf::from(game_path), cancel).await;
-
-    *state.install_cancel_token.lock().await = None;
-    state.release_operation().await;
-
-    match result {
-        Ok(()) => {
-            app.emit("install-complete", ())?;
-            app.emit("install-finalized", ())?;
-            Ok(())
+    #[cfg(feature = "e2e")]
+    {
+        let _ = app;
+        if game_path.to_ascii_lowercase().contains("error") {
+            return Err(AppError::Network(
+                "native install fixture failed".to_string(),
+            ));
         }
-        Err(AppError::Canceled) => {
-            app.emit("install-canceled", ())?;
-            app.emit("install-finalized", ())?;
-            Err(AppError::Canceled)
+        if game_path.to_ascii_lowercase().contains("cancel") {
+            cancel.cancelled().await;
+            return Err(AppError::Canceled);
         }
-        Err(error) => {
-            app.emit("install-error", error.frontend_error())?;
-            app.emit("install-finalized", ())?;
-            Err(error)
-        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        return Ok(());
     }
+
+    #[cfg(not(feature = "e2e"))]
+    install_service::install_game(app, PathBuf::from(game_path), cancel).await
 }
 
 #[tauri::command]
 pub async fn cancel_install(state: State<'_, AppState>) -> Result<bool, AppError> {
-    if let Some(token) = state.install_cancel_token.lock().await.take() {
-        token.cancel();
-        return Ok(true);
-    }
-    Ok(false)
+    Ok(state.cancel_install())
 }

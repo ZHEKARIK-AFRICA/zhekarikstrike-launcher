@@ -15,15 +15,15 @@ tauri-build = { version = "2", features = [] }
 [features]
 default = []
 portable = []
+e2e = ["dep:tauri-plugin-wdio", "dep:tauri-plugin-wdio-webdriver"]
 
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
-tauri-plugin-fs = "2"
 tauri-plugin-log = "2"
 tauri-plugin-opener = "2"
-tauri-plugin-process = "2"
-tauri-plugin-shell = "2"
+tauri-plugin-wdio = { version = "1", optional = true }
+tauri-plugin-wdio-webdriver = { version = "1", optional = true }
 
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
@@ -46,6 +46,7 @@ hex = "0.4"
 
 sysinfo = "0.33"
 directories = "6"
+sys-locale = "0.3"
 
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -64,3 +65,6 @@ windows = { version = "0.58", features = [
 
 discord-rich-presence = "0.2"
 minisign-verify = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

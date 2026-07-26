@@ -92,6 +92,7 @@ out
 dist
 src-tauri/target/
 src-tauri/gen/
+release/
 
 # Gatsby files
 .cache/

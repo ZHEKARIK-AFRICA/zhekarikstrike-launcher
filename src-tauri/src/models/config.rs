@@ -22,3 +22,35 @@ pub struct StartupState {
     #[serde(rename = "language")]
     pub language: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::LauncherConfig;
+
+    #[test]
+    fn reads_legacy_config_without_version_or_language() {
+        let config: LauncherConfig =
+            serde_json::from_str(r#"{"gamePath":"D:\\Games\\ZHEKARIKSTRIKE"}"#)
+                .expect("legacy config should deserialize");
+
+        assert_eq!(
+            config.game_path.as_deref(),
+            Some("D:\\Games\\ZHEKARIKSTRIKE")
+        );
+        assert_eq!(config.game_version, None);
+        assert_eq!(config.language, None);
+    }
+
+    #[test]
+    fn preserves_existing_config_keys() {
+        let config: LauncherConfig = serde_json::from_str(
+            r#"{"gamePath":"D:\\Games\\ZS","gameVersion":"1.6.0","language":"en"}"#,
+        )
+        .expect("current config should deserialize");
+        let serialized = serde_json::to_value(config).expect("config should serialize");
+
+        assert_eq!(serialized["gamePath"], "D:\\Games\\ZS");
+        assert_eq!(serialized["gameVersion"], "1.6.0");
+        assert_eq!(serialized["language"], "en");
+    }
+}

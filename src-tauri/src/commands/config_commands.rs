@@ -15,6 +15,10 @@ pub async fn get_config() -> Result<LauncherConfig, AppError> {
 
 #[tauri::command]
 pub async fn get_game_path() -> Result<Option<String>, AppError> {
+    #[cfg(feature = "e2e")]
+    return Ok(Some("D:\\Games\\ZHEKARIKSTRIKE".to_string()));
+
+    #[cfg(not(feature = "e2e"))]
     Ok(config_service::get_game_path()
         .await?
         .map(|path| path.to_string_lossy().to_string()))
@@ -27,12 +31,16 @@ pub async fn set_game_path(game_path: String) -> Result<(), AppError> {
 
 #[tauri::command]
 pub async fn get_game_version() -> Result<String, AppError> {
+    #[cfg(feature = "e2e")]
+    return Ok("1.6.0".to_string());
+
+    #[cfg(not(feature = "e2e"))]
     config_service::get_game_version().await
 }
 
 #[tauri::command]
 pub async fn get_current_state(state: State<'_, AppState>) -> Result<CurrentState, AppError> {
-    Ok(state.current_state().await)
+    Ok(state.current_state())
 }
 
 #[tauri::command]
@@ -75,30 +83,48 @@ async fn check_game_exists_inner() -> Result<GameExistenceStatus, AppError> {
         });
     };
 
-    let required = [
-        constants::REV_LOADER_EXE,
-        constants::GAME_PROCESS_NAME,
-        constants::REV_INI,
-    ];
-    let mut missing_files = Vec::new();
-    for file in required {
-        if !tokio::fs::try_exists(game_path.join(file))
-            .await
-            .unwrap_or(false)
-        {
-            missing_files.push(file.to_string());
-        }
-    }
+    Ok(check_game_exists_at(game_path).await)
+}
 
-    let game_version = config_service::get_game_version().await?;
-    if game_version.is_empty() || game_version == "0.0.0" {
-        missing_files.push("gameVersion".to_string());
-    }
-
-    let exists = missing_files.is_empty();
-    Ok(GameExistenceStatus {
-        exists,
+async fn check_game_exists_at(game_path: PathBuf) -> GameExistenceStatus {
+    let loader_exists = tokio::fs::try_exists(game_path.join(constants::REV_LOADER_EXE))
+        .await
+        .unwrap_or(false);
+    GameExistenceStatus {
+        exists: loader_exists,
         game_path: Some(game_path.to_string_lossy().to_string()),
-        missing_files,
-    })
+        missing_files: if loader_exists {
+            Vec::new()
+        } else {
+            vec![constants::REV_LOADER_EXE.to_string()]
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_game_exists_at;
+
+    #[tokio::test]
+    async fn rev_loader_is_enough_to_recognize_an_existing_installation() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        tokio::fs::write(directory.path().join("RevLoader.exe"), b"test")
+            .await
+            .expect("write RevLoader fixture");
+
+        let status = check_game_exists_at(directory.path().to_path_buf()).await;
+
+        assert!(status.exists);
+        assert!(status.missing_files.is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_rev_loader_requires_installation() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+
+        let status = check_game_exists_at(directory.path().to_path_buf()).await;
+
+        assert!(!status.exists);
+        assert_eq!(status.missing_files, vec!["RevLoader.exe"]);
+    }
 }

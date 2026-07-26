@@ -11,9 +11,6 @@ pub enum ProgressStage {
     Extract,
     Verify,
     Update,
-    Copy,
-    Cleanup,
-    Error,
     Complete,
 }
 

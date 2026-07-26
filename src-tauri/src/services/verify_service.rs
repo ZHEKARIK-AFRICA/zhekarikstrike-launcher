@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tauri::AppHandle;
 use tokio_util::sync::CancellationToken;
@@ -15,11 +15,6 @@ use crate::services::manifest_service::{load_manifest, VerifyMode};
 use crate::utils::hash_utils::{md5_file, sha256_file};
 use crate::utils::path_utils::safe_join;
 
-#[derive(Debug, Clone)]
-pub struct VerifyResult {
-    pub downloaded_files: usize,
-}
-
 pub async fn verify_game_files(
     app: AppHandle,
     game_path: PathBuf,
@@ -27,7 +22,7 @@ pub async fn verify_game_files(
     cancel: CancellationToken,
     event_name: &str,
     operation_id: String,
-) -> Result<VerifyResult, AppError> {
+) -> Result<(), AppError> {
     if !elevation_service::is_elevated()? {
         return Err(AppError::AdminRequired);
     }
@@ -90,11 +85,11 @@ pub async fn verify_game_files(
     }
 
     progress.emit_stage(ProgressStage::Complete, Some(100.0), None)?;
-    Ok(VerifyResult { downloaded_files })
+    Ok(())
 }
 
 async fn needs_download(
-    game_path: &PathBuf,
+    game_path: &Path,
     file: &GameFileManifestEntry,
     exclude_files: &HashSet<String>,
 ) -> Result<bool, AppError> {

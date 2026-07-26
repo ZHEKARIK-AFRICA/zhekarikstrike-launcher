@@ -5,10 +5,6 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
-    "dialog:default",
-    "fs:default",
-    "opener:default",
-    "process:default",
-    "shell:default"
+    "dialog:default"
   ]
 }

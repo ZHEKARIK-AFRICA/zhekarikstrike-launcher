@@ -1,4 +1,4 @@
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, State};
 
 use crate::error::AppError;
 use crate::models::LauncherUpdateStatus;
@@ -15,25 +15,32 @@ pub async fn download_launcher_update(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), AppError> {
-    state
-        .acquire_operation(OperationKind::UpdatingLauncher)
-        .await?;
-    let result = launcher_update_service::download_launcher_update(app.clone()).await;
-    state.release_operation().await;
+    let _lease = state.begin_operation(OperationKind::UpdatingLauncher, None)?;
+    state.clear_launcher_update_path();
 
-    match result {
-        Ok(_) => {
-            app.emit("launcher-update-ready", ())?;
-            Ok(())
-        }
-        Err(error) => {
-            app.emit("launcher-update-error", error.frontend_error())?;
-            Err(error)
-        }
+    #[cfg(feature = "e2e")]
+    {
+        let _ = app;
+        return Err(AppError::InvalidData(
+            "tampered native artifact".to_string(),
+        ));
+    }
+
+    #[cfg(not(feature = "e2e"))]
+    {
+        let path = launcher_update_service::download_launcher_update(app).await?;
+        state.set_launcher_update_path(path);
+        Ok(())
     }
 }
 
 #[tauri::command]
-pub async fn apply_launcher_update(app: AppHandle) -> Result<(), AppError> {
-    launcher_update_service::apply_launcher_update(app).await
+pub async fn apply_launcher_update(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), AppError> {
+    let path = state
+        .launcher_update_path()
+        .ok_or_else(|| AppError::InvalidData("no verified launcher update is ready".to_string()))?;
+    launcher_update_service::apply_launcher_update(app, &path).await
 }

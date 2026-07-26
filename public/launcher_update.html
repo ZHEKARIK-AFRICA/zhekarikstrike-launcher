@@ -15,7 +15,7 @@
 </head>
 <body>
     <div class="background-image"></div>
-    <div id="drag-bar" class="drag-bar">
+    <div id="drag-bar" class="drag-bar" data-tauri-drag-region>
         <div class="language-toggle window-control-button no-drag">
             <span id="language-en" class="language-option">EN</span> /
             <span id="language-ru" class="language-option">RU</span>
@@ -43,7 +43,6 @@
         </div>
         <div class="update-info">после обновления откроется кмд который заменит текущий лаунчер на новый и запустит его, не пугайся</div>
     </footer>
-    <script src="../src/renderer/tauri_bridge.js" type="module"></script>
     <script src="../src/localization/localization_update.js" type="module" defer></script>
     <script src="../src/renderer/common.js" type="module"></script>
     <script src="../src/renderer/renderer.js" type="module"></script>

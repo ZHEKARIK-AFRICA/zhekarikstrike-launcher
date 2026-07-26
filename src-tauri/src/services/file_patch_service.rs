@@ -10,12 +10,6 @@ use crate::error::AppError;
 use crate::utils::hash_utils::sha256_file;
 use crate::utils::path_utils::resource_path;
 
-#[derive(Debug, Clone)]
-pub enum FileTrackerKind {
-    Pure,
-    Game,
-}
-
 pub async fn copy_files_and_track(
     source_root: PathBuf,
     target_root: PathBuf,

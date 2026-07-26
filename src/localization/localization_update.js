@@ -1,70 +1,36 @@
-// src/localization/localization_update.js
+import { getLanguage, initializeLanguage, setLanguage, t } from './i18n.js';
+import { waitForE2eReady } from '../renderer/e2e.js';
 
-let currentLanguage;
-
-async function applyUpdatePageTranslations() {
-    const h1Element = document.querySelector('h1');
-    if (h1Element) {
-        h1Element.textContent = await window.electronAPI.t('update_launcher_title');
-    }
-
-    const progressStatusElement = document.querySelector('#progress-status');
-    if (progressStatusElement) {
-        progressStatusElement.textContent = await window.electronAPI.t('updating_launcher');
-    }
-
-    const updateInfoElement = document.querySelector('.update-info');
-    if (updateInfoElement) {
-        updateInfoElement.textContent = await window.electronAPI.t('update_description');
-    }
-
-    const errorModalTitleElement = document.querySelector('#error-modal h2');
-    if (errorModalTitleElement) {
-        errorModalTitleElement.textContent = await window.electronAPI.t('error_title');
-    }
-
-    const errorMessageElement = document.querySelector('#error-message');
-    if (errorMessageElement) {
-        errorMessageElement.textContent = await window.electronAPI.t('error_message');
-    }
-
-    const errorModalOkElement = document.querySelector('#error-modal-ok');
-    if (errorModalOkElement) {
-        errorModalOkElement.textContent = await window.electronAPI.t('error_modal_ok');
-    }
-    
+function setText(selector, key) {
+    const element = document.querySelector(selector);
+    if (element) element.textContent = t(key);
 }
 
-// Используем window.electronAPI для изменения языка
-async function handleChangeLanguage(lang) {
-    currentLanguage = lang;
-    await window.electronAPI.setLanguage(lang); // Устанавливаем язык через API
-    applyUpdatePageTranslations();
-
-    // Обновляем активное состояние кнопки языка
-    document.querySelectorAll('.language-option').forEach(option => {
-        option.classList.remove('active');
-    });
-    const langButton = document.getElementById(`language-${lang}`);
-    if (langButton) {
-        langButton.classList.add('active');
-    }
+function applyTranslations() {
+    setText('h1', 'update_launcher_title');
+    setText('#progress-status', 'updating_launcher');
+    setText('.update-info', 'update_description');
+    setText('#error-modal h2', 'error_title');
+    setText('#error-message', 'error_message');
+    setText('#error-modal-ok', 'error_modal_ok');
 }
 
-// При загрузке страницы
+function updateActiveLanguage(language) {
+    document.querySelectorAll('.language-option').forEach((option) => option.classList.remove('active'));
+    document.getElementById(`language-${language}`)?.classList.add('active');
+}
+
+async function changeLanguage(language) {
+    await setLanguage(language);
+    applyTranslations();
+    updateActiveLanguage(language);
+}
+
 document.addEventListener('DOMContentLoaded', async () => {
-    currentLanguage = await window.electronAPI.getLanguage(); // Получаем сохранённый язык
-
-    await window.electronAPI.loadTranslations(currentLanguage); // Загружаем переводы
-    applyUpdatePageTranslations();
-
-    // Устанавливаем активную кнопку языка
-    const activeLangButton = document.getElementById(`language-${currentLanguage}`);
-    if (activeLangButton) {
-        activeLangButton.classList.add('active');
-    }
-
-    // Обработчики переключения языка
-    document.getElementById('language-en')?.addEventListener('click', () => handleChangeLanguage('en'));
-    document.getElementById('language-ru')?.addEventListener('click', () => handleChangeLanguage('ru'));
+    await waitForE2eReady();
+    await initializeLanguage();
+    applyTranslations();
+    updateActiveLanguage(getLanguage());
+    document.getElementById('language-en')?.addEventListener('click', () => changeLanguage('en'));
+    document.getElementById('language-ru')?.addEventListener('click', () => changeLanguage('ru'));
 });

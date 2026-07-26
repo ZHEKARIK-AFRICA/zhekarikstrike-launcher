@@ -4,23 +4,24 @@ use tauri::{Emitter, Manager, Size};
 
 use crate::commands::*;
 use crate::logger;
-use crate::services::{config_service, elevation_service, launcher_update_service};
+use crate::services::{elevation_service, launcher_update_service};
 use crate::state::AppState;
 
 const MAIN_WINDOW_SIZE: (f64, f64) = (892.0, 496.0);
 const UPDATE_WINDOW_SIZE: (f64, f64) = (788.0, 272.0);
 
 pub fn run() {
-    let config = tauri::async_runtime::block_on(config_service::load_config()).unwrap_or_default();
-
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_log::Builder::new().build())
-        .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_shell::init())
-        .manage(AppState::new(config))
+        .plugin(tauri_plugin_opener::init());
+    #[cfg(feature = "e2e")]
+    let builder = builder
+        .plugin(tauri_plugin_wdio::init())
+        .plugin(tauri_plugin_wdio_webdriver::init());
+
+    builder
+        .manage(AppState::new())
         .invoke_handler(tauri::generate_handler![
             minimize_window,
             close_window,
@@ -71,10 +72,12 @@ pub fn run() {
 
             logger::set_app_handle(app.handle().clone());
 
-            let update_status = tauri::async_runtime::block_on(
+            #[cfg(feature = "e2e")]
+            let show_update = false;
+            #[cfg(not(feature = "e2e"))]
+            let show_update = match tauri::async_runtime::block_on(
                 launcher_update_service::check_launcher_update(env!("CARGO_PKG_VERSION")),
-            );
-            let show_update = match update_status {
+            ) {
                 Ok(status) if status.has_update && status.can_apply => {
                     logger::info(&format!(
                         "signed launcher update available: {} -> {}",
@@ -93,7 +96,9 @@ pub fn run() {
                 }
                 Ok(_) => false,
                 Err(error) => {
-                    logger::warn(&format!("launcher update check failed: {error}"));
+                    logger::warn(&format!(
+                        "SECURITY WARNING: signed launcher update check rejected: {error}"
+                    ));
                     false
                 }
             };
@@ -137,6 +142,7 @@ pub fn run() {
                 });
             }
 
+            #[cfg(not(feature = "e2e"))]
             if !show_update {
                 tauri::async_runtime::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(4_500)).await;
@@ -148,6 +154,9 @@ pub fn run() {
                     let _ = handle.emit("start-fade-out", next_page);
                 });
             }
+
+            #[cfg(feature = "e2e")]
+            let _ = handle;
 
             Ok(())
         })

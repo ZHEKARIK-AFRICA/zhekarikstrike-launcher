@@ -45,10 +45,6 @@ pub fn error(message: &str) {
     write("error", message);
 }
 
-pub fn emit_error(error: &AppError) {
-    emit_global_error(error.code(), &error.to_string());
-}
-
 fn emit_global_error(code: &str, message: &str) {
     if let Some(app) = APP_HANDLE.get() {
         let _ = app.emit(

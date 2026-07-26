@@ -40,12 +40,3 @@ pub struct GameProcessState {
     pub kind: GameProcessStateKind,
     pub pid: Option<u32>,
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TemporaryFileRule {
-    pub path: String,
-    #[serde(rename = "replaceAfterMs")]
-    pub replace_after_ms: u64,
-    #[serde(rename = "replacementSource")]
-    pub replacement_source: String,
-}

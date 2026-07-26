@@ -1,11 +1,13 @@
+import './e2e.js';
 
-// common.js
+import { t } from '../localization/i18n.js';
+import { errorMessage } from './errors.js';
 
 export function showErrorModal(message) {
     const errorModal = document.getElementById('error-modal');
     const errorMessageElement = document.getElementById('error-message');
     if (errorModal && errorMessageElement) {
-        errorMessageElement.textContent = message;
+        errorMessageElement.textContent = errorMessage(message);
         errorModal.style.display = 'block';
     }
 }
@@ -13,98 +15,71 @@ export function showErrorModal(message) {
 export function setupErrorModal() {
     const errorModal = document.getElementById('error-modal');
     const errorModalOk = document.getElementById('error-modal-ok');
-
     if (errorModalOk) {
         errorModalOk.onclick = () => {
-            errorModal.style.display = 'none';
+            if (errorModal) errorModal.style.display = 'none';
         };
     }
-
-    window.onclick = (event) => {
-        if (event.target === errorModal) {
-            errorModal.style.display = 'none';
-        }
-    };
+    window.addEventListener('click', (event) => {
+        if (event.target === errorModal) errorModal.style.display = 'none';
+    });
 }
 
-export function handleError(event, message) {
+export function handleError(_event, error) {
+    const message = errorMessage(error);
     console.error('Error received:', message);
     showErrorModal(message);
 }
 
-export async function updateProgressBar(progress, stage, timeRemaining, progressBarId, statusId, infoId) {
+export function updateProgressBar(progress, stage, timeRemaining, progressBarId, statusId, infoId) {
     const progressBar = document.getElementById(progressBarId);
     const statusElement = document.getElementById(statusId);
     const progressInfo = document.getElementById(infoId);
+    const safeProgress = Number.isFinite(progress) ? progress : 0;
 
-    if (progressBar) {
-        progressBar.style.width = `${progress}%`;
+    if (progressBar) progressBar.style.width = `${safeProgress}%`;
+    if (statusElement) statusElement.textContent = t(`stageMessages.${stage}`) || stage;
+    if (!progressInfo) return;
+
+    if (stage === 'error') {
+        progressInfo.textContent = t('stageMessages.error');
+        return;
     }
-    if (statusElement) {
-        // Используем асинхронную функцию для перевода
-        const translatedStage = await window.electronAPI.t(`stageMessages.${stage}`) || stage;
-        statusElement.textContent = translatedStage;
+
+    const formattedProgress = Math.floor(safeProgress).toString().padStart(2, '0');
+    if (timeRemaining == null) {
+        progressInfo.textContent = `${formattedProgress}%`;
+        return;
     }
-    if (progressInfo) {
-        if (stage === 'error') {
-            progressInfo.textContent = await window.electronAPI.t('stageMessages.error') || 'Произошла ошибка';
-            return;
-        }
 
-        // Форматирование процента без десятичных и с добавлением 0 перед числами меньше 10
-        const formattedProgress = progress < 10 ? `0${Math.floor(progress)}` : Math.floor(progress);
-
-        if (timeRemaining != null) {
-            let timeText = '';
-
-            // Если осталось больше часа
-            if (timeRemaining >= 3600) {
-                const hours = Math.floor(timeRemaining / 3600);
-                timeText = `${hours} ${await window.electronAPI.t('time_units.hours')}`;
-            }
-            // Если осталось больше минуты
-            else if (timeRemaining >= 60) {
-                const minutes = Math.floor(timeRemaining / 60);
-                timeText = `${minutes} ${await window.electronAPI.t('time_units.minutes')}`;
-            }
-            // Если осталось меньше минуты, показываем секунды
-            else {
-                const seconds = Math.floor(timeRemaining);
-                timeText = `${seconds} ${await window.electronAPI.t('time_units.seconds')}`;
-            }
-
-            // Обновление текста с прогрессом
-            progressInfo.textContent = `${formattedProgress}% ${await window.electronAPI.t('time_units.remaining')}: ${timeText}`;
-        } else {
-            progressInfo.textContent = `${formattedProgress}%`;
-        }
+    let timeText;
+    if (timeRemaining >= 3600) {
+        timeText = `${Math.floor(timeRemaining / 3600)} ${t('time_units.hours')}`;
+    } else if (timeRemaining >= 60) {
+        timeText = `${Math.floor(timeRemaining / 60)} ${t('time_units.minutes')}`;
+    } else {
+        timeText = `${Math.max(0, Math.floor(timeRemaining))} ${t('time_units.seconds')}`;
     }
+    progressInfo.textContent = `${formattedProgress}% ${t('time_units.remaining')}: ${timeText}`;
 }
 
-
-export async function resetProgressUI(progressBarId, statusId, infoId, statusMessageKey = '') {
+export function resetProgressUI(progressBarId, statusId, infoId, statusMessageKey = '') {
     const progressBar = document.getElementById(progressBarId);
     const statusElement = document.getElementById(statusId);
     const progressInfo = document.getElementById(infoId);
-
-    if (progressBar) {
-        progressBar.style.width = '0%';
-    }
+    if (progressBar) progressBar.style.width = '0%';
     if (statusElement) {
-        // Используем window.electronAPI.t для перевода
-        const translatedStatus = statusMessageKey ? await window.electronAPI.t(`stageMessages.${statusMessageKey}`) || await window.electronAPI.t(statusMessageKey) : '';
-        statusElement.textContent = translatedStatus;
+        const stageKey = `stageMessages.${statusMessageKey}`;
+        const translated = statusMessageKey ? t(stageKey) : '';
+        statusElement.textContent = translated === stageKey ? t(statusMessageKey) : translated;
     }
-    if (progressInfo) {
-        progressInfo.textContent = '';
-    }
+    if (progressInfo) progressInfo.textContent = '';
 }
 
-export async function updateStatus(messageKey, statusId) {
+export function updateStatus(messageKey, statusId) {
     const statusElement = document.getElementById(statusId);
-    if (statusElement) {
-        // Используем window.electronAPI.t для перевода
-        const translatedMessage = await window.electronAPI.t(`stageMessages.${messageKey}`) || await window.electronAPI.t(messageKey);
-        statusElement.textContent = translatedMessage;
-    }
+    if (!statusElement) return;
+    const stageKey = `stageMessages.${messageKey}`;
+    const translated = t(stageKey);
+    statusElement.textContent = translated === stageKey ? t(messageKey) : translated;
 }

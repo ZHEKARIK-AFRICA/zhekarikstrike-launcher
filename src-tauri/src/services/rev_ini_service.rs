@@ -64,6 +64,30 @@ pub async fn update_rev_ini(
         "English"
     };
     let content = tokio::fs::read_to_string(&rev_ini_path).await?;
+    let updated = rewrite_rev_ini(
+        &content,
+        &nickname,
+        &clan_tag,
+        &launch_params,
+        language_value,
+    );
+
+    tokio::fs::write(&rev_ini_path, updated).await?;
+
+    if let Err(error) = generate_avatar(game_path, nickname).await {
+        eprintln!("avatar generation failed: {error}");
+    }
+
+    Ok(())
+}
+
+fn rewrite_rev_ini(
+    content: &str,
+    nickname: &str,
+    clan_tag: &str,
+    launch_params: &str,
+    language_value: &str,
+) -> String {
     let mut has_player_name = false;
     let mut has_clan_tag = false;
     let mut has_proc_name = false;
@@ -105,11 +129,48 @@ pub async fn update_rev_ini(
         lines.push(format!("Language = {language_value}"));
     }
 
-    tokio::fs::write(&rev_ini_path, lines.join("\r\n")).await?;
+    lines.join("\r\n")
+}
 
-    if let Err(error) = generate_avatar(game_path, nickname).await {
-        eprintln!("avatar generation failed: {error}");
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::{read_rev_ini, rewrite_rev_ini};
+
+    #[tokio::test]
+    async fn reads_existing_rev_ini_values() {
+        let directory = tempdir().expect("temp directory should be created");
+        fs::write(
+            directory.path().join("rev.ini"),
+            "PlayerName=Player\nClanTag=ZS\nProcName=zhekarikstrike.exe -steam -novid",
+        )
+        .expect("fixture should be written");
+
+        let data = read_rev_ini(directory.path().to_path_buf())
+            .await
+            .expect("rev.ini should be read");
+        assert_eq!(data.nickname.as_deref(), Some("Player"));
+        assert_eq!(data.clan_tag.as_deref(), Some("ZS"));
+        assert_eq!(data.launch_params.as_deref(), Some("-novid"));
     }
 
-    Ok(())
+    #[test]
+    fn rewrites_and_adds_rev_ini_values() {
+        let updated = rewrite_rev_ini(
+            "PlayerName=Old\r\nLanguage = Russian\r\nUntouched=1",
+            "New",
+            "TAG",
+            "-novid",
+            "English",
+        );
+
+        assert!(updated.contains("PlayerName=New"));
+        assert!(updated.contains("ClanTag=TAG"));
+        assert!(updated.contains("ProcName=zhekarikstrike.exe -steam -novid"));
+        assert!(updated.contains("Language = English"));
+        assert!(updated.contains("Untouched=1"));
+    }
 }

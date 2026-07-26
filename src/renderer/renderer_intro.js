@@ -1,19 +1,22 @@
-// renderer_intro.js
+import { listen } from '@tauri-apps/api/event';
+
+import './e2e.js';
+import { navigateToPage } from './navigation.js';
+
 document.addEventListener('DOMContentLoaded', () => {
     document.body.classList.add('fade-in');
 });
 
-function fadeOutAndNavigate(page) {
-    console.log('fadeOutAndNavigate called with page:', page);
+const unlisteners = [];
+listen('start-fade-out', ({ payload: nextPage }) => {
     document.body.classList.remove('fade-in');
     document.body.classList.add('fade-out');
-
-    document.body.addEventListener('animationend', function handler() {
+    document.body.addEventListener('animationend', async function handler() {
         document.body.removeEventListener('animationend', handler);
-        window.electronAPI.navigateToPage(page);
+        await navigateToPage(nextPage);
     });
-}
+}).then((unlisten) => unlisteners.push(unlisten));
 
-window.electronAPI.on('start-fade-out', (event, nextPage) => {
-    fadeOutAndNavigate(nextPage);
+window.addEventListener('pagehide', () => {
+    unlisteners.splice(0).forEach((unlisten) => unlisten());
 });

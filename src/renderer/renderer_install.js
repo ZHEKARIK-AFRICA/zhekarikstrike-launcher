@@ -1,109 +1,77 @@
-import { handleError, setupErrorModal, updateProgressBar, resetProgressUI, updateStatus } from './common.js';
+import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
+
+import { initializeLanguage, t } from '../localization/i18n.js';
+import { errorMessage } from './errors.js';
+import { waitForE2eReady } from './e2e.js';
+import { handleError, resetProgressUI, setupErrorModal, updateProgressBar } from './common.js';
+import { navigateToPage } from './navigation.js';
 
 setupErrorModal();
 
 const startInstallButton = document.getElementById('start-install');
 const cancelInstallButton = document.getElementById('cancel-install');
+const installPathInput = document.getElementById('install-path');
+const unlisteners = [];
 
-if (startInstallButton) {
-    startInstallButton.disabled = false;
-}
-if (cancelInstallButton) {
-    cancelInstallButton.disabled = true;
+function setInstalling(value) {
+    if (startInstallButton) startInstallButton.disabled = value;
+    if (cancelInstallButton) cancelInstallButton.disabled = !value;
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
     try {
+        await waitForE2eReady();
+        await initializeLanguage();
+        const savedPath = await invoke('get_game_path');
+        if (savedPath && installPathInput && !installPathInput.value) installPathInput.value = savedPath;
+        setInstalling(false);
         document.body.classList.add('fade-in');
     } catch (error) {
-        const translatedError = await window.electronAPI.t('stageMessages.error_loading_data');
-        handleError(null, `${translatedError}: ${error.message}`);
+        handleError(null, `${t('stageMessages.error_loading_data')}: ${errorMessage(error)}`);
     }
 });
 
-function fadeOutAndNavigate(page) {
-    document.body.classList.remove('fade-in');
-    document.body.classList.add('fade-out');
+startInstallButton?.addEventListener('click', async () => {
+    const gamePath = installPathInput?.value?.trim();
+    if (!gamePath) {
+        handleError(null, t('errors.install_path_not_set'));
+        return;
+    }
 
-    document.body.addEventListener('transitionend', function handler() {
-        document.body.removeEventListener('transitionend', handler);
-        window.electronAPI.navigateToPage(page);
-    });
-}
-
-if (startInstallButton && cancelInstallButton) {
-    startInstallButton.addEventListener('click', async () => {
-        const gamePath = document.getElementById('install-path').value;
-
-        if (!gamePath || gamePath.trim() === '') {
-            const translatedError = await window.electronAPI.t('errors.install_path_not_set');
-            handleError(null, translatedError);
-            return;
-        }
-
-        startInstallButton.disabled = true;
-        cancelInstallButton.disabled = false;
-
-        window.electronAPI.invoke('install-game', gamePath).then(() => {
-            console.log('Installation started');
-        }).catch(async (error) => {
-            const translatedError = await window.electronAPI.t('errors.unknown_error');
-            handleError(null, `${translatedError}: ${error.message}`);
-            startInstallButton.disabled = false;
-            cancelInstallButton.disabled = true;
-        });
-    });
-
-    cancelInstallButton.addEventListener('click', async () => {
-        const canceled = await window.electronAPI.invoke('cancel-install');
-        if (canceled) {
-            console.log('Installation canceled by user');
+    setInstalling(true);
+    try {
+        await invoke('install_game', { gamePath });
+        resetProgressUI('progress-bar', 'install-status', 'progress-info', 'game-installed');
+        document.body.classList.remove('fade-in');
+        document.body.classList.add('fade-out');
+        await navigateToPage('./public/index.html');
+    } catch (error) {
+        if (error?.code === 'canceled') {
+            resetProgressUI('progress-bar', 'install-status', 'progress-info', 'cancel');
         } else {
-            console.log('No active installation to cancel');
+            resetProgressUI('progress-bar', 'install-status', 'progress-info', 'error');
+            handleError(null, `${t('errors.unknown_error')}: ${errorMessage(error)}`);
         }
-    });
-}
-
-const chooseFolderButton = document.getElementById('choose-folder');
-if (chooseFolderButton) {
-    chooseFolderButton.addEventListener('click', async () => {
-        let folderPath = await window.electronAPI.invoke('select-folder');
-        if (folderPath) {
-            folderPath = `${folderPath}\\ZHEKARIKSTRIKE`;
-            document.getElementById('install-path').value = folderPath;
-        }
-    });
-}
-
-window.electronAPI.on('install-progress', async (event, { progress, stage, timeRemaining, errorMessage }) => {
-    updateProgressBar(progress, stage, timeRemaining, 'progress-bar', 'install-status', 'progress-info');
-
-    if (errorMessage) {
-        const translatedError = await window.electronAPI.t('errors.unknown_error');
-        handleError(event, `${translatedError}: ${errorMessage}`);
+    } finally {
+        setInstalling(false);
     }
 });
 
-window.electronAPI.on('install-complete', () => {
-    console.log('Installation completed successfully');
-    startInstallButton.disabled = false;
-    cancelInstallButton.disabled = true;
-    resetProgressUI('progress-bar', 'install-status', 'progress-info', 'game-installed');
-    fadeOutAndNavigate('./public/index.html');
+cancelInstallButton?.addEventListener('click', () => invoke('cancel_install'));
+
+document.getElementById('choose-folder')?.addEventListener('click', async () => {
+    const folderPath = await invoke('select_game_folder');
+    if (folderPath && installPathInput) installPathInput.value = `${folderPath}\\ZHEKARIKSTRIKE`;
 });
 
-window.electronAPI.on('install-canceled', async () => {
-    console.log('Installation canceled');
-    startInstallButton.disabled = false;
-    cancelInstallButton.disabled = true;
-    resetProgressUI('progress-bar', 'install-status', 'progress-info', 'cancel');
-});
+listen('install-progress', ({ payload }) => {
+    updateProgressBar(
+        payload.progress, payload.stage, payload.timeRemainingSec,
+        'progress-bar', 'install-status', 'progress-info'
+    );
+}).then((unlisten) => unlisteners.push(unlisten));
 
-window.electronAPI.on('install-error', async (event, errorMessage) => {
-    const translatedError = await window.electronAPI.t('errors.unknown_error');
-    console.error(`${translatedError}: ${errorMessage}`);
-    startInstallButton.disabled = false;
-    cancelInstallButton.disabled = true;
-    resetProgressUI('progress-bar', 'install-status', 'progress-info', `error`);
-    handleError(event, `${translatedError}: ${errorMessage}`);
+window.addEventListener('pagehide', () => {
+    unlisteners.splice(0).forEach((unlisten) => unlisten());
 });

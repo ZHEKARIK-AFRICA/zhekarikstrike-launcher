@@ -29,18 +29,16 @@ pub struct GameArchiveManifest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LauncherUpdateManifest {
     pub version: String,
-    pub notes: Option<String>,
-    pub pub_date: Option<String>,
-    pub platforms: Option<HashMap<String, LauncherUpdateManifestPlatform>>,
-    pub url: Option<String>,
-    pub signature: Option<String>,
-    pub sha256: Option<String>,
-    pub size: Option<u64>,
+    pub notes: String,
+    pub pub_date: String,
+    pub platforms: HashMap<String, LauncherUpdateManifestPlatform>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LauncherUpdateManifestPlatform {
     pub url: String,
     pub sha256: String,
@@ -49,20 +47,7 @@ pub struct LauncherUpdateManifestPlatform {
 }
 
 impl LauncherUpdateManifest {
-    pub fn platform(&self, key: &str) -> Option<LauncherUpdateManifestPlatform> {
-        if let Some(platform) = self
-            .platforms
-            .as_ref()
-            .and_then(|platforms| platforms.get(key))
-        {
-            return Some(platform.clone());
-        }
-
-        Some(LauncherUpdateManifestPlatform {
-            url: self.url.clone()?,
-            sha256: self.sha256.clone()?,
-            signature: self.signature.clone()?,
-            size: self.size?,
-        })
+    pub fn platform(&self, key: &str) -> Option<&LauncherUpdateManifestPlatform> {
+        self.platforms.get(key)
     }
 }

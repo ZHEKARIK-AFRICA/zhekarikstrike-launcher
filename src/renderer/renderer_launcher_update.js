@@ -1,74 +1,48 @@
-// renderer_launcher_update.js
+import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 
-import { updateProgressBar, handleError, updateStatus } from './common.js';
+import { initializeLanguage, t } from '../localization/i18n.js';
+import { errorMessage } from './errors.js';
+import { waitForE2eReady } from './e2e.js';
+import { handleError, updateProgressBar, updateStatus } from './common.js';
+import { navigateToPage } from './navigation.js';
 
-let updateFailed = false;
-
-function continueWithoutUpdate() {
-    document.body.classList.remove('fade-in');
-    document.body.classList.add('fade-out');
-    document.body.addEventListener('transitionend', function handler() {
-        document.body.removeEventListener('transitionend', handler);
-        window.electronAPI.navigateToPage('./public/intro.html');
-    });
-}
+const unlisteners = [];
 
 function ensureContinueButton() {
     let button = document.getElementById('continue-without-update');
     if (button) return button;
-
     button = document.createElement('button');
     button.id = 'continue-without-update';
     button.className = 'modal-ok';
     button.type = 'button';
     button.textContent = 'продолжить без обновления';
-    button.addEventListener('click', continueWithoutUpdate);
-
-    const footer = document.querySelector('footer');
-    footer?.appendChild(button);
+    button.addEventListener('click', () => navigateToPage('./public/intro.html'));
+    document.querySelector('footer')?.appendChild(button);
     return button;
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
-    console.log('Launcher update page loaded');
+    await waitForE2eReady();
+    await initializeLanguage();
     document.body.classList.add('fade-in');
-
-    window.electronAPI.on('update-progress', async (event, { progress, stage, timeRemaining, errorMessage }) => {
-        updateProgressBar(progress, stage, timeRemaining, 'progress-bar', 'update-status', 'progress-info');
-
-        if (errorMessage) {
-            console.error(`Error during update: ${errorMessage}`);
-            handleError(event, `${await window.electronAPI.t('stageMessages.error')}: ${errorMessage}`);
-        }
-    });
-
-    window.electronAPI.on('launcher-update-ready', async () => {
-        if (updateFailed) return;
-        updateStatus('complete', 'update-status');
-        try {
-            await window.electronAPI.invoke('apply-launcher-update');
-        } catch (error) {
-            updateFailed = true;
-            ensureContinueButton();
-            handleError(null, `${await window.electronAPI.t('stageMessages.error')}: ${error.message}`);
-        }
-    });
-
-    window.electronAPI.on('launcher-update-error', async (event, errorMessage) => {
-        updateFailed = true;
-        ensureContinueButton();
-        handleError(event, `${await window.electronAPI.t('stageMessages.error')}: ${errorMessage}`);
-    });
-
-    window.electronAPI.on('launcher-update-applied', () => {
-        updateStatus('complete', 'update-status');
-    });
-
     try {
-        await window.electronAPI.invoke('download-launcher-update');
+        await invoke('download_launcher_update');
+        updateStatus('complete', 'progress-status');
+        await invoke('apply_launcher_update');
     } catch (error) {
-        updateFailed = true;
         ensureContinueButton();
-        handleError(null, `${await window.electronAPI.t('stageMessages.error')}: ${error.message}`);
+        handleError(null, `${t('stageMessages.error')}: ${errorMessage(error)}`);
     }
+});
+
+listen('launcher-update-progress', ({ payload }) => {
+    updateProgressBar(
+        payload.progress, payload.stage, payload.timeRemainingSec,
+        'progress-bar', 'update-status', 'progress-info'
+    );
+}).then((unlisten) => unlisteners.push(unlisten));
+
+window.addEventListener('pagehide', () => {
+    unlisteners.splice(0).forEach((unlisten) => unlisten());
 });

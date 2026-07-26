@@ -1,0 +1,46 @@
+name: Signed Windows release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install minisign
+        shell: powershell
+        run: choco install minisign --yes --no-progress
+
+      - name: Build, test, sign, and publish
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MINISIGN_SECRET_KEY_BASE64: ${{ secrets.MINISIGN_SECRET_KEY_BASE64 }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+          LAUNCHER_RELEASE_API_TOKEN: ${{ secrets.LAUNCHER_RELEASE_API_TOKEN }}
+        run: |
+          $version = '${{ github.ref_name }}'.Substring(1)
+          ./scripts/release.ps1 -Version $version -Publish
