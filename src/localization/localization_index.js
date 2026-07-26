@@ -1,5 +1,12 @@
 let currentLanguage;
 
+function setText(selector, value) {
+    const element = document.querySelector(selector);
+    if (element) {
+        element.textContent = value;
+    }
+}
+
 // Используем await window.electronAPI.t() вместо t()
 async function applyMainPageTranslations() {
     document.querySelector('#settings-modal h2').textContent = await window.electronAPI.t('settings');
@@ -18,9 +25,9 @@ async function applyMainPageTranslations() {
 
 
     // Update footer links
-    document.querySelector('a[href="https://zhekarik.africa/stream"]').textContent = await window.electronAPI.t('links.stream');
-    document.querySelector('a[href="https://zhekarik.africa/vip"]').textContent = await window.electronAPI.t('links.vip');
-    document.querySelector('a[href="https://zhekarik.africa/demos"]').textContent = await window.electronAPI.t('links.demos');
+    setText('a[href="https://zhekarik.africa/strike/stream"]', await window.electronAPI.t('links.stream'));
+    setText('a[href="https://zhekarik.africa/strike/vip"]', await window.electronAPI.t('links.vip'));
+    setText('a[href="https://zhekarik.africa/strike/demos"]', await window.electronAPI.t('links.demos'));
 }
 
 // Используем window.electronAPI вместо локальной функции

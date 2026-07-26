@@ -2,6 +2,13 @@
 
 let currentLanguage;
 
+function setText(selector, value) {
+    const element = document.querySelector(selector);
+    if (element) {
+        element.textContent = value;
+    }
+}
+
 async function applyInstallPageTranslations() {
     document.getElementById('zhekarik-strike-title').textContent = await window.electronAPI.t('zhekarik_strike_title');
     document.getElementById('page-title').textContent = await window.electronAPI.t('install_game');
@@ -15,9 +22,9 @@ async function applyInstallPageTranslations() {
     document.getElementById('error-modal-ok').textContent = await window.electronAPI.t('error_modal_ok');
 
     // Обновляем ссылки в футере
-    document.querySelector('a[href="https://zhekarik.africa/stream"]').textContent = await window.electronAPI.t('links.stream');
-    document.querySelector('a[href="https://zhekarik.africa/vip"]').textContent = await window.electronAPI.t('links.vip');
-    document.querySelector('a[href="https://zhekarik.africa/demos"]').textContent = await window.electronAPI.t('links.demos');
+    setText('a[href="https://zhekarik.africa/strike/stream"]', await window.electronAPI.t('links.stream'));
+    setText('a[href="https://zhekarik.africa/strike/vip"]', await window.electronAPI.t('links.vip'));
+    setText('a[href="https://zhekarik.africa/strike/demos"]', await window.electronAPI.t('links.demos'));
 }
 
 // Используем window.electronAPI для изменения языка

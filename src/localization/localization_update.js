@@ -30,7 +30,7 @@ async function applyUpdatePageTranslations() {
 
     const errorModalOkElement = document.querySelector('#error-modal-ok');
     if (errorModalOkElement) {
-        errorModalOkElement.textContent = await window.electronAPI.t('error_ok');
+        errorModalOkElement.textContent = await window.electronAPI.t('error_modal_ok');
     }
     
 }
@@ -65,6 +65,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     // Обработчики переключения языка
-    document.getElementById('language-en').addEventListener('click', () => handleChangeLanguage('en'));
-    document.getElementById('language-ru').addEventListener('click', () => handleChangeLanguage('ru'));
+    document.getElementById('language-en')?.addEventListener('click', () => handleChangeLanguage('en'));
+    document.getElementById('language-ru')?.addEventListener('click', () => handleChangeLanguage('ru'));
 });

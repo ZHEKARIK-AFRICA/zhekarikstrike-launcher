@@ -1,3 +1,6 @@
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+
 // Создаем рендерер и устанавливаем размер
 const canvas = document.getElementById('modelCanvas');
 const renderer = new THREE.WebGLRenderer({ canvas: canvas, alpha: true, antialias: true });
@@ -26,8 +29,13 @@ scene.add(light3);
 
 
 
-const models = ['assets/3dmodel/Trollface.glb', 'assets/3dmodel/Trollface2.glb','assets/3dmodel/Trollface3.glb','assets/3dmodel/Trollface4.glb','assets/3dmodel/Trollface5.glb'];
-const randomModel = models[Math.floor(Math.random() * models.length)];
+const models = [
+    new URL('../../public/assets/3dmodel/Trollface.glb', import.meta.url).href,
+    new URL('../../public/assets/3dmodel/Trollface2.glb', import.meta.url).href,
+    new URL('../../public/assets/3dmodel/Trollface3.glb', import.meta.url).href,
+    new URL('../../public/assets/3dmodel/Trollface4.glb', import.meta.url).href,
+    new URL('../../public/assets/3dmodel/Trollface5.glb', import.meta.url).href
+];
 const loadedModels = []; // Массив для хранения загруженных моделей
 let baseRotationSpeed = 0.025; // Базовая скорость вращения
 let rotationSpeed = baseRotationSpeed; // Текущая скорость вращения
@@ -48,7 +56,7 @@ function preloadModels() {
 }
 
 // Загружаем 3D модель
-const loader = new THREE.GLTFLoader();
+const loader = new GLTFLoader();
 loader.load(models[0], (gltf) => {
     model = gltf.scene;
     scene.add(model);
@@ -71,15 +79,6 @@ loader.load(models[0], (gltf) => {
     console.error('An error occurred loading the model:', error);
 });
 
-// Рассчитываем центральное положение канваса
-function getCanvasCenter() {
-    const rect = canvas.getBoundingClientRect();
-    return {
-        x: rect.left + rect.width / 2,
-        y: rect.top + rect.height / 2
-    };
-}
-
 let mouseRotationX = 0;
 let mouseRotationY = 0;
 let clickRotationY = 0;
@@ -98,6 +97,8 @@ function getCanvasCenter() {
 
 // Вращение модели при движении мыши
 window.addEventListener('mousemove', (event) => {
+    if (!model) return;
+
     const canvasCenter = getCanvasCenter();
     const deltaX = event.clientX - canvasCenter.x;
     const deltaY = event.clientY - canvasCenter.y;
@@ -130,6 +131,8 @@ window.addEventListener('mousemove', (event) => {
 });
 
 canvas.addEventListener('click', () => {
+    if (!model) return;
+
     if (!isRotating) {
         isRotating = true;
         rotationAngle = 0;
@@ -148,12 +151,16 @@ function easeInOut(t) {
 let currentModelIndex = -1; // Индекс текущей модели, изначально -1, чтобы первая модель выбиралась всегда
 
 function loadRandomModel() {
+    if (!loadedModels.length) return;
+
     let randomIndex;
     do {
         randomIndex = Math.floor(Math.random() * loadedModels.length);
-    } while (randomIndex === currentModelIndex); // Повторяем, пока не выберется новая модель
+    } while (loadedModels.length > 1 && randomIndex === currentModelIndex); // Повторяем, пока не выберется новая модель
 
     currentModelIndex = randomIndex; // Обновляем индекс текущей модели
+
+    if (!loadedModels[randomIndex]) return;
 
     if (model) {
         scene.remove(model); // Удаляем текущую модель из сцены

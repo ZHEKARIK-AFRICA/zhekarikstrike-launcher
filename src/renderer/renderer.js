@@ -49,20 +49,19 @@ document.addEventListener('DOMContentLoaded', () => {
     const settingsButton = document.getElementById('settings-button');
     const settingsModal = document.getElementById('settings-modal');
     const closeSettingsButton = document.getElementById('close-settings');
-    const deleteGameButton = document.getElementById('delete-game-button');
-    const selectFolderButton = document.getElementById('select-folder-button');
 
-    // Открытие модального окна "Настройки"
+    if (!settingsButton || !settingsModal || !closeSettingsButton) {
+        return;
+    }
+
     settingsButton.addEventListener('click', () => {
         settingsModal.style.display = 'block';
     });
 
-    // Закрытие модального окна "Настройки"
     closeSettingsButton.addEventListener('click', () => {
         settingsModal.style.display = 'none';
     });
 
-    // Закрытие окна при клике вне его
     window.addEventListener('click', (event) => {
         if (event.target === settingsModal) {
             settingsModal.style.display = 'none';
