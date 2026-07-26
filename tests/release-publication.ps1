@@ -3,6 +3,18 @@ Set-StrictMode -Version Latest
 
 . "$PSScriptRoot\..\scripts\release-helpers.ps1"
 
+$signaturePath = Join-Path ([IO.Path]::GetTempPath()) "release-signature-$([guid]::NewGuid()).minisig"
+try {
+    [IO.File]::WriteAllText($signaturePath, "untrusted comment: test`r`nsignature`r`n")
+    $signatureText = Read-ReleaseTextFile -Path $signaturePath
+    $roundTrip = @{ signature = $signatureText } | ConvertTo-Json | ConvertFrom-Json
+    if ($roundTrip.signature -isnot [string]) {
+        throw 'Release text files must serialize as JSON strings without PowerShell provider metadata'
+    }
+} finally {
+    Remove-Item -LiteralPath $signaturePath -Force -ErrorAction SilentlyContinue
+}
+
 function New-LauncherManifest {
     param(
         [string]$Version = '1.6.1',

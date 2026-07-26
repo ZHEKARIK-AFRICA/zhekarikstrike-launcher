@@ -6,6 +6,13 @@ function Read-DpapiProtectedSecret {
     return ([PSCredential]::new('protected-secret', $secure)).GetNetworkCredential().Password
 }
 
+function Read-ReleaseTextFile {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $resolvedPath = (Resolve-Path -LiteralPath $Path).Path
+    return [IO.File]::ReadAllText($resolvedPath)
+}
+
 function Invoke-NpmWithoutWorkspaces {
     param(
         [Parameter(Mandatory = $true)][string]$Executable,

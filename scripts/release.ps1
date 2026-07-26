@@ -266,7 +266,7 @@ try {
     }
 
     $sha256 = (Get-FileHash -LiteralPath $updateAsset -Algorithm SHA256).Hash.ToLowerInvariant()
-    $signature = Get-Content -LiteralPath $signaturePath -Raw
+    $signature = Read-ReleaseTextFile -Path $signaturePath
     $downloadUrl = "https://github.com/$repository/releases/download/$expectedTag/$updateAssetName"
     $manifest = [ordered]@{
         version = $Version
@@ -342,7 +342,7 @@ try {
                     )
                     $existingManifestPath = Join-Path $existingReleaseDirectory $manifestAssetName
                     $existingUpdateAsset = Join-Path $existingReleaseDirectory $updateAssetName
-                    $existingManifestJson = Get-Content -LiteralPath $existingManifestPath -Raw
+                    $existingManifestJson = Read-ReleaseTextFile -Path $existingManifestPath
                     $existingManifest = $existingManifestJson | ConvertFrom-Json
                     if ([string]$existingManifest.version -ne $Version -or
                         -not (Test-LauncherManifestIdentity -Left $manifestObject -Right $existingManifest)) {
