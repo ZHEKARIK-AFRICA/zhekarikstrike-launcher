@@ -8,6 +8,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot 'release-helpers.ps1')
 
 function Invoke-Native {
     param(
@@ -171,21 +172,24 @@ try {
     }
     $publicKeyBase64 = $publicKeyLines[0]
 
-    Invoke-Native $npm @('ci')
-    Invoke-Native $npm @('run', 'lint')
-    Invoke-Native $npm @('run', 'test:unit')
-    Invoke-Native $npm @('run', 'test:e2e:browser')
-    Invoke-Native $npm @('run', 'build:frontend')
+    Invoke-NpmWithoutWorkspaces -Executable $npm -Arguments @('run', 'test:release-script')
+    Invoke-NpmWithoutWorkspaces -Executable $npm -Arguments @('ci')
+    Invoke-NpmWithoutWorkspaces -Executable $npm -Arguments @('run', 'lint')
+    Invoke-NpmWithoutWorkspaces -Executable $npm -Arguments @('run', 'test:unit')
+    Invoke-NpmWithoutWorkspaces -Executable $npm -Arguments @('run', 'test:e2e:browser')
+    Invoke-NpmWithoutWorkspaces -Executable $npm -Arguments @('run', 'build:frontend')
     Invoke-Native $cargo @('fmt', '--manifest-path', 'src-tauri/Cargo.toml', '--', '--check')
     Invoke-Native $cargo @('clippy', '--manifest-path', 'src-tauri/Cargo.toml', '--all-targets', '--', '-D', 'warnings')
     Invoke-Native $cargo @('test', '--manifest-path', 'src-tauri/Cargo.toml')
-    Invoke-Native $npm @('run', 'test:e2e:tauri')
+    Invoke-NpmWithoutWorkspaces -Executable $npm -Arguments @('run', 'test:e2e:tauri')
 
     # Debug + WebDriver artifacts are large on Windows and are not release inputs.
     Invoke-Native $cargo @('clean', '--manifest-path', 'src-tauri/Cargo.toml', '--profile', 'dev')
 
     $targetTriple = 'x86_64-pc-windows-msvc'
-    Invoke-Native $npx @('tauri', 'build', '--target', $targetTriple, '--bundles', 'nsis')
+    Invoke-NpmWithoutWorkspaces -Executable $npx -Arguments @(
+        'tauri', 'build', '--target', $targetTriple, '--bundles', 'nsis'
+    )
 
     $targetRelease = Join-Path $repoRoot "src-tauri\target\$targetTriple\release"
     $rawSource = Join-Path $targetRelease 'zhekarikstrike_launcher.exe'
@@ -218,7 +222,9 @@ try {
     Copy-Item -LiteralPath $rawSource -Destination $updateAsset
     Copy-Item -LiteralPath $installer.FullName -Destination $installerAsset
 
-    Invoke-Native $npx @('tauri', 'build', '--target', $targetTriple, '--no-bundle', '--features', 'portable')
+    Invoke-NpmWithoutWorkspaces -Executable $npx -Arguments @(
+        'tauri', 'build', '--target', $targetTriple, '--no-bundle', '--features', 'portable'
+    )
     Invoke-Native 'powershell.exe' @(
         '-NoProfile', '-ExecutionPolicy', 'Bypass',
         '-File', (Join-Path $repoRoot 'scripts\build-portable.ps1'),
@@ -236,9 +242,7 @@ try {
         $secretKeyPath = $temporarySecretKey
     }
     if ([string]::IsNullOrWhiteSpace($signingPassword)) {
-        $securePassword = Get-Content -LiteralPath $protectedPasswordPath -Raw | ConvertTo-SecureString
-        $credential = [PSCredential]::new('minisign', $securePassword)
-        $signingPassword = $credential.GetNetworkCredential().Password
+        $signingPassword = Read-DpapiProtectedSecret -Path $protectedPasswordPath
     }
 
     $signaturePath = "$updateAsset.minisig"

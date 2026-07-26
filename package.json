@@ -9,6 +9,7 @@
     "build:frontend": "vite build",
     "lint": "eslint src",
     "test:unit": "vitest run",
+    "test:release-script": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/release-password.ps1",
     "test:e2e:browser": "cross-env VITE_TAURI_E2E=browser start-test serve:e2e http://127.0.0.1:5173/public/intro.html wdio:browser",
     "serve:e2e": "vite --host 127.0.0.1 --port 5173",
     "wdio:browser": "wdio run wdio.browser.conf.js",
