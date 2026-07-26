@@ -288,6 +288,23 @@ try {
     if ($Publish) {
         $gh = Get-RequiredCommand 'gh.exe'
         $assets = Get-ChildItem -LiteralPath $artifactDirectory -File | ForEach-Object { $_.FullName }
+        $apiBase = $env:LAUNCHER_RELEASE_API_BASE_URL
+        if ([string]::IsNullOrWhiteSpace($apiBase)) {
+            $apiBase = 'https://api.zhekarik.africa'
+        }
+        $apiBase = $apiBase.TrimEnd('/')
+        $currentManifestUri = "$apiBase/launcher/update/windows/x86_64/$Version"
+        $activeManifest = $null
+        try {
+            $activeManifest = Invoke-RestMethod -Method Get -Uri $currentManifestUri
+        } catch {
+            $response = $_.Exception.Response
+            $statusCode = if ($null -eq $response) { 0 } else { [int]$response.StatusCode }
+            if ($statusCode -ne 404) {
+                throw
+            }
+        }
+
         $env:GH_TOKEN = $githubToken
         try {
             $previousErrorActionPreference = $ErrorActionPreference
@@ -298,20 +315,71 @@ try {
             } finally {
                 $ErrorActionPreference = $previousErrorActionPreference
             }
-            if ($releaseExists) {
-                Invoke-Native $gh (@('release', 'upload', $expectedTag, '--repo', $repository, '--clobber') + $assets)
-            } else {
+
+            $manifestObject = $manifestJson | ConvertFrom-Json
+            $publicationAction = Resolve-LauncherPublicationAction `
+                -CandidateManifest $manifestObject `
+                -ActiveManifest $activeManifest `
+                -ReleaseExists $releaseExists
+            if ($publicationAction -eq 'CreateRelease') {
                 Invoke-Native $gh (@('release', 'create', $expectedTag, '--repo', $repository, '--verify-tag', '--title', $expectedTag, '--generate-notes') + $assets)
+            } else {
+                $existingReleaseDirectory = Join-Path ([IO.Path]::GetTempPath()) "zhekarik-existing-release-$([guid]::NewGuid().ToString('N'))"
+                try {
+                    New-Item -ItemType Directory -Path $existingReleaseDirectory | Out-Null
+                    $manifestAssetName = "launcher-update-${Version}.json"
+                    Invoke-Native $gh @(
+                        'release', 'download', $expectedTag,
+                        '--repo', $repository,
+                        '--pattern', $manifestAssetName,
+                        '--dir', $existingReleaseDirectory
+                    )
+                    Invoke-Native $gh @(
+                        'release', 'download', $expectedTag,
+                        '--repo', $repository,
+                        '--pattern', $updateAssetName,
+                        '--dir', $existingReleaseDirectory
+                    )
+                    $existingManifestPath = Join-Path $existingReleaseDirectory $manifestAssetName
+                    $existingUpdateAsset = Join-Path $existingReleaseDirectory $updateAssetName
+                    $existingManifestJson = Get-Content -LiteralPath $existingManifestPath -Raw
+                    $existingManifest = $existingManifestJson | ConvertFrom-Json
+                    if ([string]$existingManifest.version -ne $Version -or
+                        -not (Test-LauncherManifestIdentity -Left $manifestObject -Right $existingManifest)) {
+                        throw "GitHub release $expectedTag contains another updater artifact. Publish a new version."
+                    }
+                    $existingPlatform = Get-LauncherManifestPlatform -Manifest $existingManifest
+                    $existingSize = (Get-Item -LiteralPath $existingUpdateAsset).Length
+                    if ($existingSize -ne [int64]$existingPlatform.size) {
+                        throw "Existing GitHub updater asset size does not match its manifest."
+                    }
+                    $existingHash = (Get-FileHash -LiteralPath $existingUpdateAsset -Algorithm SHA256).Hash.ToLowerInvariant()
+                    if ($existingHash -ne [string]$existingPlatform.sha256) {
+                        throw "Existing GitHub updater asset hash does not match its manifest."
+                    }
+                    $existingSignaturePath = Join-Path $existingReleaseDirectory "$updateAssetName.minisig"
+                    [IO.File]::WriteAllText(
+                        $existingSignaturePath,
+                        [string]$existingPlatform.signature,
+                        [Text.UTF8Encoding]::new($false)
+                    )
+                    Invoke-Native $minisign @(
+                        '-Vm', $existingUpdateAsset,
+                        '-P', $publicKeyBase64,
+                        '-x', $existingSignaturePath
+                    )
+                    $manifestJson = $existingManifestJson
+                } finally {
+                    if (Test-Path -LiteralPath $existingReleaseDirectory) {
+                        Remove-Item -LiteralPath $existingReleaseDirectory -Recurse -Force
+                    }
+                }
             }
         } finally {
             Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue
         }
 
-        $apiBase = $env:LAUNCHER_RELEASE_API_BASE_URL
-        if ([string]::IsNullOrWhiteSpace($apiBase)) {
-            $apiBase = 'https://api.zhekarik.africa'
-        }
-        $publishUri = "$($apiBase.TrimEnd('/'))/admin/launcher/releases/windows/x86_64/$Version"
+        $publishUri = "$apiBase/admin/launcher/releases/windows/x86_64/$Version"
         Invoke-RestMethod -Method Put -Uri $publishUri -Headers @{
             Authorization = "Bearer $releaseApiToken"
         } -ContentType 'application/json' -Body $manifestJson | Out-Null
