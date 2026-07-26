@@ -1,7 +1,6 @@
 use std::env;
 use std::io::Read;
 use std::path::Path;
-use std::path::PathBuf;
 
 use chrono::DateTime;
 use minisign_verify::{PublicKey, Signature};
@@ -11,9 +10,9 @@ use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::constants::LAUNCHER_UPDATE_PUBLIC_KEY;
+use crate::constants::{LAUNCHER_UPDATE_GITHUB_REPOSITORY, LAUNCHER_UPDATE_PUBLIC_KEY};
 use crate::error::AppError;
-use crate::models::{LauncherUpdateStatus, ProgressEmitter, ProgressStage};
+use crate::models::{LauncherUpdateStatus, ProgressEmitter, ProgressStage, VerifiedLauncherUpdate};
 use crate::services::api_client::ApiClient;
 use crate::services::download_service::download_file;
 use crate::utils::hash_utils::sha256_file;
@@ -26,7 +25,7 @@ pub async fn check_launcher_update(
     validate_update_manifest(&manifest, current_version, LAUNCHER_UPDATE_PUBLIC_KEY)
 }
 
-pub async fn download_launcher_update(app: AppHandle) -> Result<PathBuf, AppError> {
+pub async fn download_launcher_update(app: AppHandle) -> Result<VerifiedLauncherUpdate, AppError> {
     let api = ApiClient::new()?;
     let current_version = env!("CARGO_PKG_VERSION");
     let manifest = api.get_launcher_update(current_version).await?;
@@ -45,8 +44,12 @@ pub async fn download_launcher_update(app: AppHandle) -> Result<PathBuf, AppErro
             )
         })?;
 
-    let verified_path = env::temp_dir().join(format!(
-        "zhekarikstrike-launcher-{}-{}.exe",
+    let current = env::current_exe()?;
+    let update_directory = current.parent().ok_or_else(|| {
+        AppError::FileSystem("launcher executable has no parent directory".to_string())
+    })?;
+    let verified_path = update_directory.join(format!(
+        ".zhekarikstrike-launcher-{}-{}.exe",
         manifest.version,
         Uuid::new_v4()
     ));
@@ -82,7 +85,12 @@ pub async fn download_launcher_update(app: AppHandle) -> Result<PathBuf, AppErro
         verify_minisign_signature(&download.path, &platform.signature)?;
         tokio::fs::rename(&download.path, &verified_path).await?;
         progress.emit_stage(ProgressStage::Complete, Some(100.0), None)?;
-        Ok::<PathBuf, AppError>(verified_path.clone())
+        Ok::<VerifiedLauncherUpdate, AppError>(VerifiedLauncherUpdate {
+            path: verified_path.clone(),
+            sha256: platform.sha256.clone(),
+            signature: platform.signature.clone(),
+            size: platform.size,
+        })
     }
     .await;
 
@@ -93,34 +101,71 @@ pub async fn download_launcher_update(app: AppHandle) -> Result<PathBuf, AppErro
     result
 }
 
-pub async fn apply_launcher_update(app: AppHandle, new_launcher: &Path) -> Result<(), AppError> {
+pub async fn apply_launcher_update(
+    app: AppHandle,
+    update: &VerifiedLauncherUpdate,
+) -> Result<(), AppError> {
     let current = env::current_exe()?;
-
-    if !tokio::fs::try_exists(new_launcher).await.unwrap_or(false) {
-        return Err(AppError::FileSystem(format!(
-            "Downloaded launcher not found: {}",
-            new_launcher.display()
-        )));
-    }
+    validate_update_artifact(update).await?;
 
     let old = current.with_extension("old.exe");
-    let script = env::temp_dir().join("zhekarik_launcher_update.cmd");
-    let commands = format!(
-        "@echo off\r\nsetlocal\r\nset \"CURRENT={}\"\r\nset \"NEW={}\"\r\nset \"OLD={}\"\r\ntimeout /t 2 /nobreak >NUL\r\nif not exist \"%NEW%\" exit /b 10\r\nif exist \"%OLD%\" del /F /Q \"%OLD%\" >NUL 2>NUL\r\nmove /Y \"%CURRENT%\" \"%OLD%\" >NUL\r\nif errorlevel 1 exit /b 20\r\nmove /Y \"%NEW%\" \"%CURRENT%\" >NUL\r\nif errorlevel 1 (\r\n  if exist \"%OLD%\" move /Y \"%OLD%\" \"%CURRENT%\" >NUL\r\n  exit /b 30\r\n)\r\nstart \"\" \"%CURRENT%\"\r\nif errorlevel 1 (\r\n  del /F /Q \"%CURRENT%\" >NUL 2>NUL\r\n  if exist \"%OLD%\" move /Y \"%OLD%\" \"%CURRENT%\" >NUL\r\n  start \"\" \"%CURRENT%\"\r\n  exit /b 40\r\n)\r\nexit /b 0\r\n",
-        current.display(),
-        new_launcher.display(),
-        old.display()
-    );
+    let script_directory = current.parent().ok_or_else(|| {
+        AppError::FileSystem("launcher executable has no parent directory".to_string())
+    })?;
+    let script = script_directory.join(format!(".zhekarik-launcher-update-{}.cmd", Uuid::new_v4()));
+    let commands = "@echo off\r\nsetlocal\r\nset \"EXIT_CODE=0\"\r\ntimeout /t 2 /nobreak >NUL\r\nif not exist \"%ZHEKARIK_UPDATE_NEW%\" (set \"EXIT_CODE=10\" & goto cleanup)\r\nif exist \"%ZHEKARIK_UPDATE_OLD%\" del /F /Q \"%ZHEKARIK_UPDATE_OLD%\" >NUL 2>NUL\r\nmove /Y \"%ZHEKARIK_UPDATE_CURRENT%\" \"%ZHEKARIK_UPDATE_OLD%\" >NUL\r\nif errorlevel 1 (set \"EXIT_CODE=20\" & goto cleanup)\r\nmove /Y \"%ZHEKARIK_UPDATE_NEW%\" \"%ZHEKARIK_UPDATE_CURRENT%\" >NUL\r\nif errorlevel 1 (\r\n  if exist \"%ZHEKARIK_UPDATE_OLD%\" move /Y \"%ZHEKARIK_UPDATE_OLD%\" \"%ZHEKARIK_UPDATE_CURRENT%\" >NUL\r\n  set \"EXIT_CODE=30\"\r\n  goto cleanup\r\n)\r\nstart \"\" \"%ZHEKARIK_UPDATE_CURRENT%\"\r\nif errorlevel 1 (\r\n  del /F /Q \"%ZHEKARIK_UPDATE_CURRENT%\" >NUL 2>NUL\r\n  if exist \"%ZHEKARIK_UPDATE_OLD%\" move /Y \"%ZHEKARIK_UPDATE_OLD%\" \"%ZHEKARIK_UPDATE_CURRENT%\" >NUL\r\n  start \"\" \"%ZHEKARIK_UPDATE_CURRENT%\"\r\n  set \"EXIT_CODE=40\"\r\n)\r\n:cleanup\r\ndel /F /Q \"%~f0\" >NUL 2>NUL\r\nexit /b %EXIT_CODE%\r\n";
 
     tokio::fs::write(&script, commands).await?;
-    let script_arg = script.to_string_lossy().to_string();
+    let script_arg = format!("\"{}\"", script.display());
     Command::new("cmd")
-        .args(["/C", &script_arg])
+        .args(["/D", "/S", "/C", &script_arg])
+        .env("ZHEKARIK_UPDATE_CURRENT", &current)
+        .env("ZHEKARIK_UPDATE_NEW", &update.path)
+        .env("ZHEKARIK_UPDATE_OLD", &old)
         .spawn()
         .map_err(|error| AppError::Unknown(error.to_string()))?;
 
     app.exit(0);
     Ok(())
+}
+
+async fn validate_update_artifact(update: &VerifiedLauncherUpdate) -> Result<(), AppError> {
+    validate_update_artifact_with_key(
+        &update.path,
+        update.size,
+        &update.sha256,
+        &update.signature,
+        LAUNCHER_UPDATE_PUBLIC_KEY,
+    )
+    .await
+}
+
+async fn validate_update_artifact_with_key(
+    path: &Path,
+    expected_size: u64,
+    expected_sha256: &str,
+    signature: &str,
+    public_key: &str,
+) -> Result<(), AppError> {
+    let metadata = tokio::fs::metadata(path).await.map_err(|error| {
+        AppError::FileSystem(format!(
+            "downloaded launcher is unavailable at {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.is_file() || metadata.len() != expected_size {
+        return Err(AppError::InvalidData(
+            "downloaded launcher size changed after verification".to_string(),
+        ));
+    }
+
+    let actual_sha256 = sha256_file(path).await?;
+    if actual_sha256 != expected_sha256 {
+        return Err(AppError::InvalidData(
+            "downloaded launcher hash changed after verification".to_string(),
+        ));
+    }
+    verify_minisign_signature_with_key(path, signature, public_key)
 }
 
 fn validate_update_manifest(
@@ -146,6 +191,11 @@ fn validate_update_manifest(
         .path_segments()
         .map(|segments| segments.collect::<Vec<_>>())
         .unwrap_or_default();
+    let (expected_owner, expected_repository) = LAUNCHER_UPDATE_GITHUB_REPOSITORY
+        .split_once('/')
+        .expect("launcher update GitHub repository constant must be owner/repository");
+    let expected_tag = format!("v{}", manifest.version);
+    let expected_asset = format!("ZHEKARIK-STRIKE_{}_windows-x86_64.exe", manifest.version);
     if url.scheme() != "https"
         || url.host_str() != Some("github.com")
         || url.port().is_some()
@@ -153,11 +203,13 @@ fn validate_update_manifest(
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
-        || path_segments.len() < 6
+        || path_segments.len() != 6
+        || path_segments[0] != expected_owner
+        || path_segments[1] != expected_repository
         || path_segments[2] != "releases"
         || path_segments[3] != "download"
-        || path_segments[4].is_empty()
-        || path_segments[5].is_empty()
+        || path_segments[4] != expected_tag
+        || path_segments[5] != expected_asset
     {
         return Err(AppError::InvalidData(
             "launcher update must use a GitHub HTTPS release asset URL".to_string(),
@@ -251,7 +303,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        extract_public_key_base64, validate_update_manifest, verify_minisign_signature_with_key,
+        extract_public_key_base64, validate_update_artifact_with_key, validate_update_manifest,
+        verify_minisign_signature_with_key,
     };
     use crate::models::LauncherUpdateManifest;
 
@@ -265,7 +318,7 @@ mod tests {
             "pub_date": "2026-07-26T12:00:00Z",
             "platforms": {
                 "windows-x86_64": {
-                    "url": "https://github.com/example/launcher/releases/download/v1.6.1/launcher.exe",
+                    "url": format!("https://github.com/d3affy/zhekarikstrike-launcher/releases/download/v{version}/ZHEKARIK-STRIKE_{version}_windows-x86_64.exe"),
                     "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                     "signature": TEST_SIGNATURE,
                     "size": 4
@@ -321,7 +374,7 @@ mod tests {
             "pub_date": "2026-07-26T12:00:00Z",
             "platforms": {
                 "windows-x86_64": {
-                    "url": "https://github.com/example/launcher/releases/download/v1.6.1/launcher.exe",
+                    "url": "https://github.com/d3affy/zhekarikstrike-launcher/releases/download/v1.6.1/ZHEKARIK-STRIKE_1.6.1_windows-x86_64.exe",
                     "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                     "signature": "",
                     "size": 4
@@ -339,6 +392,14 @@ mod tests {
             .expect("platform should exist")
             .url = "https://github.com/example/launcher/raw/main/launcher.exe".to_string();
         assert!(validate_update_manifest(&unsafe_url, "1.6.0", TEST_PUBLIC_KEY).is_err());
+
+        let mut replayed_artifact = manifest("1.6.1");
+        replayed_artifact
+            .platforms
+            .get_mut("windows-x86_64")
+            .expect("platform should exist")
+            .url = "https://github.com/d3affy/zhekarikstrike-launcher/releases/download/v1.6.0/ZHEKARIK-STRIKE_1.6.0_windows-x86_64.exe".to_string();
+        assert!(validate_update_manifest(&replayed_artifact, "1.6.0", TEST_PUBLIC_KEY).is_err());
 
         assert!(serde_json::from_value::<LauncherUpdateManifest>(json!({
             "version": "1.6.1",
@@ -363,5 +424,33 @@ mod tests {
         assert!(
             verify_minisign_signature_with_key(&artifact, TEST_SIGNATURE, TEST_PUBLIC_KEY).is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn revalidates_the_selected_artifact_before_applying_it() {
+        let directory = tempdir().expect("temp directory should be created");
+        let artifact = directory.path().join("launcher.exe");
+        fs::write(&artifact, b"test").expect("fixture should be written");
+
+        validate_update_artifact_with_key(
+            &artifact,
+            4,
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            TEST_SIGNATURE,
+            TEST_PUBLIC_KEY,
+        )
+        .await
+        .expect("downloaded artifact should still be valid");
+
+        fs::write(&artifact, b"tampered after download").expect("fixture should be replaced");
+        assert!(validate_update_artifact_with_key(
+            &artifact,
+            4,
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            TEST_SIGNATURE,
+            TEST_PUBLIC_KEY,
+        )
+        .await
+        .is_err());
     }
 }

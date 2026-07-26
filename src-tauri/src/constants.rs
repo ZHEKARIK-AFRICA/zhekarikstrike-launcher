@@ -16,6 +16,7 @@ pub const DISCORD_BUTTON_LABEL: &str = "ГО ГО ГО";
 pub const DISCORD_BUTTON_URL: &str = "https://zhekarik.africa";
 
 pub const LAUNCHER_UPDATE_PUBLIC_KEY: &str = include_str!("../updater.pub");
+pub const LAUNCHER_UPDATE_GITHUB_REPOSITORY: &str = "d3affy/zhekarikstrike-launcher";
 pub const ELEVATION_ATTEMPT_ARG: &str = "--zhekarik-elevation-attempted";
 pub const INSTALL_SIZE_FALLBACK_BYTES: u64 = 9_216 * 1024 * 1024;
 

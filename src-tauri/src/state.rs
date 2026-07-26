@@ -7,7 +7,7 @@ use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::error::AppError;
-use crate::models::GameProcessState;
+use crate::models::{GameProcessState, VerifiedLauncherUpdate};
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -47,7 +47,7 @@ pub struct CurrentState {
 pub struct AppState {
     install_cancel_token: Arc<StdMutex<Option<CancellationToken>>>,
     verify_cancel_token: Arc<StdMutex<Option<CancellationToken>>>,
-    launcher_update_path: Arc<StdMutex<Option<PathBuf>>>,
+    launcher_update: Arc<StdMutex<Option<VerifiedLauncherUpdate>>>,
     pub file_patch_cancel_token: Arc<Mutex<Option<CancellationToken>>>,
     pub process_state: Arc<RwLock<GameProcessState>>,
     pub discord_rpc_state: Arc<Mutex<DiscordRpcState>>,
@@ -62,7 +62,7 @@ impl AppState {
         Self {
             install_cancel_token: Arc::new(StdMutex::new(None)),
             verify_cancel_token: Arc::new(StdMutex::new(None)),
-            launcher_update_path: Arc::new(StdMutex::new(None)),
+            launcher_update: Arc::new(StdMutex::new(None)),
             file_patch_cancel_token: Arc::new(Mutex::new(None)),
             process_state: Arc::new(RwLock::new(GameProcessState::default())),
             discord_rpc_state: Arc::new(Mutex::new(DiscordRpcState::default())),
@@ -124,16 +124,16 @@ impl AppState {
         }
     }
 
-    pub fn set_launcher_update_path(&self, path: PathBuf) {
-        *lock_unpoisoned(&self.launcher_update_path) = Some(path);
+    pub fn set_launcher_update(&self, update: VerifiedLauncherUpdate) {
+        *lock_unpoisoned(&self.launcher_update) = Some(update);
     }
 
-    pub fn launcher_update_path(&self) -> Option<PathBuf> {
-        lock_unpoisoned(&self.launcher_update_path).clone()
+    pub fn launcher_update(&self) -> Option<VerifiedLauncherUpdate> {
+        lock_unpoisoned(&self.launcher_update).clone()
     }
 
-    pub fn clear_launcher_update_path(&self) {
-        *lock_unpoisoned(&self.launcher_update_path) = None;
+    pub fn clear_launcher_update(&self) {
+        *lock_unpoisoned(&self.launcher_update) = None;
     }
 }
 

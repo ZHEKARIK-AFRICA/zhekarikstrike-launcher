@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +42,14 @@ pub struct LauncherUpdateManifest {
 #[serde(deny_unknown_fields)]
 pub struct LauncherUpdateManifestPlatform {
     pub url: String,
+    pub sha256: String,
+    pub signature: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct VerifiedLauncherUpdate {
+    pub path: PathBuf,
     pub sha256: String,
     pub signature: String,
     pub size: u64,

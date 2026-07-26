@@ -72,7 +72,20 @@ $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 Push-Location $repoRoot
 
 $temporarySecretKey = $null
-$loadedLocalPassword = $false
+$secretKeyBase64 = [string]$env:MINISIGN_SECRET_KEY_BASE64
+$configuredSecretKeyPath = [string]$env:MINISIGN_SECRET_KEY_PATH
+$signingPassword = [string]$env:MINISIGN_PASSWORD
+$githubToken = [string]$env:GH_TOKEN
+$releaseApiToken = [string]$env:LAUNCHER_RELEASE_API_TOKEN
+foreach ($secretName in @(
+    'MINISIGN_SECRET_KEY_BASE64',
+    'MINISIGN_SECRET_KEY_PATH',
+    'MINISIGN_PASSWORD',
+    'GH_TOKEN',
+    'LAUNCHER_RELEASE_API_TOKEN'
+)) {
+    Remove-Item "Env:$secretName" -ErrorAction SilentlyContinue
+}
 try {
     $npm = Get-RequiredCommand 'npm.cmd'
     $npx = Get-RequiredCommand 'npx.cmd'
@@ -81,7 +94,11 @@ try {
     $minisign = Get-RequiredCommand 'minisign.exe'
 
     $package = Get-Content -LiteralPath (Join-Path $repoRoot 'package.json') -Raw | ConvertFrom-Json
-    $packageLock = Get-Content -LiteralPath (Join-Path $repoRoot 'package-lock.json') -Raw | ConvertFrom-Json
+    $packageLockText = Get-Content -LiteralPath (Join-Path $repoRoot 'package-lock.json') -Raw
+    $packageLockMatch = [regex]::Match($packageLockText, '(?m)^\s*"version"\s*:\s*"([^"]+)"')
+    if (-not $packageLockMatch.Success) {
+        throw 'Unable to read root version from package-lock.json'
+    }
     $tauriConfig = Get-Content -LiteralPath (Join-Path $repoRoot 'src-tauri\tauri.conf.json') -Raw | ConvertFrom-Json
     $cargoToml = Get-Content -LiteralPath (Join-Path $repoRoot 'src-tauri\Cargo.toml') -Raw
     $cargoMatch = [regex]::Match($cargoToml, '(?ms)^\[package\].*?^version\s*=\s*"([^"]+)"')
@@ -90,65 +107,65 @@ try {
     }
 
     Assert-Version 'package.json' $package.version $Version
-    Assert-Version 'package-lock.json' $packageLock.version $Version
+    Assert-Version 'package-lock.json' $packageLockMatch.Groups[1].Value $Version
     Assert-Version 'src-tauri/Cargo.toml' $cargoMatch.Groups[1].Value $Version
     Assert-Version 'src-tauri/tauri.conf.json' $tauriConfig.version $Version
 
-    $expectedTag = "v$Version"
-    $tag = $env:GITHUB_REF_NAME
-    if ([string]::IsNullOrWhiteSpace($tag)) {
-        $tagOutput = & $git describe --tags --exact-match 2>$null
-        if ($LASTEXITCODE -eq 0) {
-            $tag = ($tagOutput | Select-Object -First 1).Trim()
-        } else {
-            $tag = $null
-        }
+    $workingTreeStatus = @(& $git status --porcelain --untracked-files=normal)
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Unable to inspect the Git working tree.'
     }
-    if ([string]::IsNullOrWhiteSpace($tag)) {
+    if ($workingTreeStatus.Count -ne 0) {
+        throw 'Release builds require a clean Git working tree.'
+    }
+
+    $expectedTag = "v$Version"
+    $headTags = @(& $git tag --points-at HEAD)
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Unable to read Git tags for the current commit.'
+    }
+    if ($headTags -notcontains $expectedTag) {
         throw "A release must be built from the exact Git tag $expectedTag"
     }
-    Assert-Version 'Git tag' $tag $expectedTag
+    if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_REF_NAME)) {
+        Assert-Version 'GitHub tag' $env:GITHUB_REF_NAME $expectedTag
+    }
 
     $defaultKeyDirectory = Join-Path $env:LOCALAPPDATA 'ZHEKARIKSTRIKE\release-keys'
-    $secretKeyPath = $env:MINISIGN_SECRET_KEY_PATH
-    if (-not [string]::IsNullOrWhiteSpace($env:MINISIGN_SECRET_KEY_BASE64)) {
-        $temporarySecretKey = Join-Path ([System.IO.Path]::GetTempPath()) "zhekarik-minisign-$([guid]::NewGuid().ToString('N')).key"
-        [System.IO.File]::WriteAllBytes(
-            $temporarySecretKey,
-            [Convert]::FromBase64String($env:MINISIGN_SECRET_KEY_BASE64)
-        )
-        $secretKeyPath = $temporarySecretKey
-    }
-    if ([string]::IsNullOrWhiteSpace($secretKeyPath)) {
+    $secretKeyPath = $configuredSecretKeyPath
+    if ([string]::IsNullOrWhiteSpace($secretKeyBase64) -and [string]::IsNullOrWhiteSpace($secretKeyPath)) {
         $defaultSecretKey = Join-Path $defaultKeyDirectory 'updater.key'
         if (Test-Path -LiteralPath $defaultSecretKey -PathType Leaf) {
             $secretKeyPath = $defaultSecretKey
         }
     }
-    if ([string]::IsNullOrWhiteSpace($secretKeyPath) -or -not (Test-Path -LiteralPath $secretKeyPath -PathType Leaf)) {
+    if ([string]::IsNullOrWhiteSpace($secretKeyBase64) -and
+        ([string]::IsNullOrWhiteSpace($secretKeyPath) -or -not (Test-Path -LiteralPath $secretKeyPath -PathType Leaf))) {
         throw 'Set MINISIGN_SECRET_KEY_BASE64 or MINISIGN_SECRET_KEY_PATH to a private key outside Git.'
     }
-    $secretKeyPath = (Resolve-Path -LiteralPath $secretKeyPath).Path
-    $repoPrefix = $repoRoot.TrimEnd('\') + '\'
-    if ($secretKeyPath.StartsWith($repoPrefix, [StringComparison]::OrdinalIgnoreCase)) {
-        throw 'The minisign private key must not be stored inside the repository.'
-    }
-    if ([string]::IsNullOrWhiteSpace($env:MINISIGN_PASSWORD)) {
-        $protectedPasswordPath = Join-Path $defaultKeyDirectory 'updater.password.dpapi'
-        if (Test-Path -LiteralPath $protectedPasswordPath -PathType Leaf) {
-            $securePassword = Get-Content -LiteralPath $protectedPasswordPath -Raw | ConvertTo-SecureString
-            $credential = [PSCredential]::new('minisign', $securePassword)
-            $env:MINISIGN_PASSWORD = $credential.GetNetworkCredential().Password
-            $loadedLocalPassword = $true
-        } else {
-            throw 'MINISIGN_PASSWORD must be set so minisign never prompts during a release.'
+    if ([string]::IsNullOrWhiteSpace($secretKeyBase64)) {
+        $secretKeyPath = (Resolve-Path -LiteralPath $secretKeyPath).Path
+        $repoPrefix = $repoRoot.TrimEnd('\') + '\'
+        if ($secretKeyPath.StartsWith($repoPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'The minisign private key must not be stored inside the repository.'
         }
+    }
+    $protectedPasswordPath = Join-Path $defaultKeyDirectory 'updater.password.dpapi'
+    if ([string]::IsNullOrWhiteSpace($signingPassword) -and
+        -not (Test-Path -LiteralPath $protectedPasswordPath -PathType Leaf)) {
+        throw 'MINISIGN_PASSWORD must be set so minisign never prompts during a release.'
+    }
+    if ($Publish -and [string]::IsNullOrWhiteSpace($githubToken)) {
+        throw 'GH_TOKEN is required with -Publish.'
+    }
+    if ($Publish -and [string]::IsNullOrWhiteSpace($releaseApiToken)) {
+        throw 'LAUNCHER_RELEASE_API_TOKEN is required with -Publish.'
     }
 
     $publicKeyPath = Join-Path $repoRoot 'src-tauri\updater.pub'
-    $publicKeyLines = Get-Content -LiteralPath $publicKeyPath | Where-Object {
+    $publicKeyLines = @(Get-Content -LiteralPath $publicKeyPath | Where-Object {
         -not [string]::IsNullOrWhiteSpace($_) -and -not $_.StartsWith('untrusted comment:')
-    }
+    })
     if ($publicKeyLines.Count -ne 1 -or $publicKeyLines[0] -notmatch '^RWQ[A-Za-z0-9+/=]+$') {
         throw 'src-tauri/updater.pub must contain a complete minisign public key.'
     }
@@ -210,17 +227,38 @@ try {
         '-TargetTriple', $targetTriple
     )
 
+    if (-not [string]::IsNullOrWhiteSpace($secretKeyBase64)) {
+        $temporarySecretKey = Join-Path ([System.IO.Path]::GetTempPath()) "zhekarik-minisign-$([guid]::NewGuid().ToString('N')).key"
+        [System.IO.File]::WriteAllBytes(
+            $temporarySecretKey,
+            [Convert]::FromBase64String($secretKeyBase64)
+        )
+        $secretKeyPath = $temporarySecretKey
+    }
+    if ([string]::IsNullOrWhiteSpace($signingPassword)) {
+        $securePassword = Get-Content -LiteralPath $protectedPasswordPath -Raw | ConvertTo-SecureString
+        $credential = [PSCredential]::new('minisign', $securePassword)
+        $signingPassword = $credential.GetNetworkCredential().Password
+    }
+
     $signaturePath = "$updateAsset.minisig"
-    Invoke-MinisignWithPassword $minisign @('-S', '-s', $secretKeyPath, '-m', $updateAsset, '-x', $signaturePath) $env:MINISIGN_PASSWORD
+    Invoke-MinisignWithPassword $minisign @('-S', '-s', $secretKeyPath, '-m', $updateAsset, '-x', $signaturePath) $signingPassword
     Invoke-Native $minisign @('-Vm', $updateAsset, '-P', $publicKeyBase64, '-x', $signaturePath)
 
     $repository = $env:GITHUB_REPOSITORY
     if ([string]::IsNullOrWhiteSpace($repository)) {
-        $remote = (& $git remote get-url origin).Trim()
-        if ($LASTEXITCODE -ne 0 -or $remote -notmatch 'github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$') {
+        $remoteOutput = @(& $git config --get remote.origin.url)
+        $remoteExitCode = $LASTEXITCODE
+        $remote = ($remoteOutput | Select-Object -First 1)
+        if ($remoteExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($remote) -or
+            $remote.Trim() -notmatch 'github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$') {
             throw 'Unable to determine GitHub repository from GITHUB_REPOSITORY or origin.'
         }
         $repository = $Matches[1]
+    }
+    $expectedRepository = 'd3affy/zhekarikstrike-launcher'
+    if ($repository -ne $expectedRepository) {
+        throw "Release repository mismatch: expected $expectedRepository, got $repository"
     }
 
     $sha256 = (Get-FileHash -LiteralPath $updateAsset -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -244,19 +282,25 @@ try {
     [System.IO.File]::WriteAllText($manifestPath, $manifestJson, [System.Text.UTF8Encoding]::new($false))
 
     if ($Publish) {
-        if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
-            throw 'GH_TOKEN is required with -Publish.'
-        }
-        if ([string]::IsNullOrWhiteSpace($env:LAUNCHER_RELEASE_API_TOKEN)) {
-            throw 'LAUNCHER_RELEASE_API_TOKEN is required with -Publish.'
-        }
         $gh = Get-RequiredCommand 'gh.exe'
         $assets = Get-ChildItem -LiteralPath $artifactDirectory -File | ForEach-Object { $_.FullName }
-        & $gh release view $expectedTag --repo $repository *> $null
-        if ($LASTEXITCODE -eq 0) {
-            Invoke-Native $gh (@('release', 'upload', $expectedTag, '--repo', $repository, '--clobber') + $assets)
-        } else {
-            Invoke-Native $gh (@('release', 'create', $expectedTag, '--repo', $repository, '--verify-tag', '--title', $expectedTag, '--generate-notes') + $assets)
+        $env:GH_TOKEN = $githubToken
+        try {
+            $previousErrorActionPreference = $ErrorActionPreference
+            try {
+                $ErrorActionPreference = 'SilentlyContinue'
+                & $gh release view $expectedTag --repo $repository *> $null
+                $releaseExists = $LASTEXITCODE -eq 0
+            } finally {
+                $ErrorActionPreference = $previousErrorActionPreference
+            }
+            if ($releaseExists) {
+                Invoke-Native $gh (@('release', 'upload', $expectedTag, '--repo', $repository, '--clobber') + $assets)
+            } else {
+                Invoke-Native $gh (@('release', 'create', $expectedTag, '--repo', $repository, '--verify-tag', '--title', $expectedTag, '--generate-notes') + $assets)
+            }
+        } finally {
+            Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue
         }
 
         $apiBase = $env:LAUNCHER_RELEASE_API_BASE_URL
@@ -265,7 +309,7 @@ try {
         }
         $publishUri = "$($apiBase.TrimEnd('/'))/admin/launcher/releases/windows/x86_64/$Version"
         Invoke-RestMethod -Method Put -Uri $publishUri -Headers @{
-            Authorization = "Bearer $($env:LAUNCHER_RELEASE_API_TOKEN)"
+            Authorization = "Bearer $releaseApiToken"
         } -ContentType 'application/json' -Body $manifestJson | Out-Null
         Write-Host "Published signed launcher manifest: $publishUri" -ForegroundColor Green
     }
@@ -275,8 +319,9 @@ try {
     if ($null -ne $temporarySecretKey -and (Test-Path -LiteralPath $temporarySecretKey)) {
         Remove-Item -LiteralPath $temporarySecretKey -Force
     }
-    if ($loadedLocalPassword) {
-        Remove-Item Env:MINISIGN_PASSWORD -ErrorAction SilentlyContinue
-    }
+    $secretKeyBase64 = $null
+    $signingPassword = $null
+    $githubToken = $null
+    $releaseApiToken = $null
     Pop-Location
 }

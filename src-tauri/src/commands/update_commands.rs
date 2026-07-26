@@ -16,7 +16,7 @@ pub async fn download_launcher_update(
     state: State<'_, AppState>,
 ) -> Result<(), AppError> {
     let _lease = state.begin_operation(OperationKind::UpdatingLauncher, None)?;
-    state.clear_launcher_update_path();
+    state.clear_launcher_update();
 
     #[cfg(feature = "e2e")]
     {
@@ -28,8 +28,8 @@ pub async fn download_launcher_update(
 
     #[cfg(not(feature = "e2e"))]
     {
-        let path = launcher_update_service::download_launcher_update(app).await?;
-        state.set_launcher_update_path(path);
+        let update = launcher_update_service::download_launcher_update(app).await?;
+        state.set_launcher_update(update);
         Ok(())
     }
 }
@@ -39,8 +39,8 @@ pub async fn apply_launcher_update(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), AppError> {
-    let path = state
-        .launcher_update_path()
+    let update = state
+        .launcher_update()
         .ok_or_else(|| AppError::InvalidData("no verified launcher update is ready".to_string()))?;
-    launcher_update_service::apply_launcher_update(app, &path).await
+    launcher_update_service::apply_launcher_update(app, &update).await
 }

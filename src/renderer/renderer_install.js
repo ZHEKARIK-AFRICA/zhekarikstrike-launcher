@@ -1,10 +1,10 @@
 import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
 
 import { initializeLanguage, t } from '../localization/i18n.js';
 import { errorMessage } from './errors.js';
 import { waitForE2eReady } from './e2e.js';
 import { handleError, resetProgressUI, setupErrorModal, updateProgressBar } from './common.js';
+import { listenUntilPageHide } from './event-listener.js';
 import { navigateToPage } from './navigation.js';
 
 setupErrorModal();
@@ -12,7 +12,6 @@ setupErrorModal();
 const startInstallButton = document.getElementById('start-install');
 const cancelInstallButton = document.getElementById('cancel-install');
 const installPathInput = document.getElementById('install-path');
-const unlisteners = [];
 
 function setInstalling(value) {
     if (startInstallButton) startInstallButton.disabled = value;
@@ -65,13 +64,9 @@ document.getElementById('choose-folder')?.addEventListener('click', async () => 
     if (folderPath && installPathInput) installPathInput.value = `${folderPath}\\ZHEKARIKSTRIKE`;
 });
 
-listen('install-progress', ({ payload }) => {
+listenUntilPageHide('install-progress', ({ payload }) => {
     updateProgressBar(
         payload.progress, payload.stage, payload.timeRemainingSec,
         'progress-bar', 'install-status', 'progress-info'
     );
-}).then((unlisten) => unlisteners.push(unlisten));
-
-window.addEventListener('pagehide', () => {
-    unlisteners.splice(0).forEach((unlisten) => unlisten());
 });

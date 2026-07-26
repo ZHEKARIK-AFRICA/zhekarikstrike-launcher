@@ -1,16 +1,15 @@
 import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
 
 import { initializeLanguage, t } from '../localization/i18n.js';
 import { errorMessage } from './errors.js';
 import { waitForE2eReady } from './e2e.js';
 import { handleError, resetProgressUI, setupErrorModal, updateProgressBar, updateStatus } from './common.js';
+import { listenUntilPageHide } from './event-listener.js';
 
 setupErrorModal();
 
 const playButton = document.getElementById('play-button');
 const checkFilesButton = document.getElementById('check-files');
-const unlisteners = [];
 let verificationInProgress = false;
 
 function updateUIBasedOnState() {
@@ -92,13 +91,9 @@ checkFilesButton?.addEventListener('click', async () => {
     }
 });
 
-listen('verify-progress', ({ payload }) => {
+listenUntilPageHide('verify-progress', ({ payload }) => {
     updateProgressBar(
         payload.progress, payload.stage, payload.timeRemainingSec,
         'progress-bar', 'launcher-status', 'progress-info'
     );
-}).then((unlisten) => unlisteners.push(unlisten));
-
-window.addEventListener('pagehide', () => {
-    unlisteners.splice(0).forEach((unlisten) => unlisten());
 });

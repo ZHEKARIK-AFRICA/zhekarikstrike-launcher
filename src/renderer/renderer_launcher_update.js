@@ -1,13 +1,11 @@
 import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
 
 import { initializeLanguage, t } from '../localization/i18n.js';
 import { errorMessage } from './errors.js';
 import { waitForE2eReady } from './e2e.js';
 import { handleError, updateProgressBar, updateStatus } from './common.js';
+import { listenUntilPageHide } from './event-listener.js';
 import { navigateToPage } from './navigation.js';
-
-const unlisteners = [];
 
 function ensureContinueButton() {
     let button = document.getElementById('continue-without-update');
@@ -23,10 +21,10 @@ function ensureContinueButton() {
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
-    await waitForE2eReady();
-    await initializeLanguage();
-    document.body.classList.add('fade-in');
     try {
+        await waitForE2eReady();
+        await initializeLanguage();
+        document.body.classList.add('fade-in');
         await invoke('download_launcher_update');
         updateStatus('complete', 'progress-status');
         await invoke('apply_launcher_update');
@@ -36,13 +34,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 });
 
-listen('launcher-update-progress', ({ payload }) => {
+listenUntilPageHide('launcher-update-progress', ({ payload }) => {
     updateProgressBar(
         payload.progress, payload.stage, payload.timeRemainingSec,
-        'progress-bar', 'update-status', 'progress-info'
+        'progress-bar', 'progress-status', 'progress-info'
     );
-}).then((unlisten) => unlisteners.push(unlisten));
-
-window.addEventListener('pagehide', () => {
-    unlisteners.splice(0).forEach((unlisten) => unlisten());
 });
