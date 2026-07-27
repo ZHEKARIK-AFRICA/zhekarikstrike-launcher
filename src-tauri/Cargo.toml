@@ -68,3 +68,11 @@ minisign-verify = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Generated Win32 bindings can exhaust the pagefile when LLVM optimizes their
+# full release surface at level 3. They are thin FFI wrappers, so a smaller
+# optimization level has negligible runtime impact while keeping release builds
+# reliable on the supported 16 GB Windows builder.
+[profile.release.package.windows]
+opt-level = 1
+codegen-units = 64
