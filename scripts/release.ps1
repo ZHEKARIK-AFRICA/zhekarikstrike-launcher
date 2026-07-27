@@ -72,6 +72,12 @@ function Invoke-MinisignWithPassword {
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 Push-Location $repoRoot
 
+# Keep native C/C++ dependency builds below the memory pressure that can make
+# MSVC fail to load its PDB runtime (C1356) on 16 GB Windows release hosts.
+if ([string]::IsNullOrWhiteSpace([string]$env:CARGO_BUILD_JOBS)) {
+    $env:CARGO_BUILD_JOBS = '2'
+}
+
 $temporarySecretKey = $null
 $secretKeyBase64 = [string]$env:MINISIGN_SECRET_KEY_BASE64
 $configuredSecretKeyPath = [string]$env:MINISIGN_SECRET_KEY_PATH
