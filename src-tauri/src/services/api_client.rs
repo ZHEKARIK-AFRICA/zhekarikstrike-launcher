@@ -10,6 +10,8 @@ use crate::models::{
     LauncherUpdateManifest,
 };
 
+const METADATA_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
 #[derive(Clone)]
 pub struct ApiClient {
     http: Client,
@@ -19,7 +21,6 @@ impl ApiClient {
     pub fn new() -> Result<Self, AppError> {
         let http = Client::builder()
             .connect_timeout(Duration::from_secs(15))
-            .timeout(Duration::from_secs(120))
             .pool_idle_timeout(Duration::from_secs(90))
             .user_agent(concat!(
                 "ZHEKARIK-STRIKE-Launcher/",
@@ -48,8 +49,7 @@ impl ApiClient {
 
     pub async fn get_updates_from(&self, version: &str) -> Result<GameManifest, AppError> {
         let manifest: GameManifest = self
-            .http
-            .get(Self::updates_url())
+            .metadata_get(Self::updates_url())
             .query(&[("from_version", version)])
             .send()
             .await?
@@ -67,8 +67,7 @@ impl ApiClient {
         }
 
         let response: ExcludeResponse = self
-            .http
-            .get(Self::excludes_url())
+            .metadata_get(Self::excludes_url())
             .send()
             .await?
             .error_for_status()?
@@ -91,8 +90,7 @@ impl ApiClient {
             MODERN_API_BASE_URL, current_version
         );
         Ok(self
-            .http
-            .get(url)
+            .metadata_get(&url)
             .send()
             .await?
             .error_for_status()?
@@ -103,8 +101,7 @@ impl ApiClient {
     pub async fn get_game_patch_manifest(&self) -> Result<GamePatchManifest, AppError> {
         let url = format!("{MODERN_API_BASE_URL}/launcher/game-files/manifest");
         Ok(self
-            .http
-            .get(url)
+            .metadata_get(&url)
             .send()
             .await?
             .error_for_status()?
@@ -144,13 +141,16 @@ impl ApiClient {
 
     async fn fetch_manifest(&self, url: &str) -> Result<GameManifest, AppError> {
         Ok(self
-            .http
-            .get(url)
+            .metadata_get(url)
             .send()
             .await?
             .error_for_status()?
             .json()
             .await?)
+    }
+
+    fn metadata_get(&self, url: &str) -> reqwest::RequestBuilder {
+        self.http.get(url).timeout(METADATA_REQUEST_TIMEOUT)
     }
 }
 
