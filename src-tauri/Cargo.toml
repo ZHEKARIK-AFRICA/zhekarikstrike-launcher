@@ -79,9 +79,9 @@ tempfile = "3"
 opt-level = 1
 codegen-units = 64
 
-# The launcher crate contains all Tauri command glue in one library and can hit
-# the same LLVM memory ceiling when the portable feature changes its link set.
-# CPU-heavy hashing, compression and HTTP work stays optimized in dependencies.
+# The launcher crate contains all Tauri command glue in one large library and
+# can hit the LLVM memory ceiling even at level 1. CPU-heavy hashing,
+# compression and HTTP work stays release-optimized in dependencies.
 [profile.release.package.zhekarikstrike_launcher]
-opt-level = 1
-codegen-units = 64
+opt-level = 0
+codegen-units = 16
