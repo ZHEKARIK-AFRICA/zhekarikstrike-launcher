@@ -15,6 +15,16 @@ use crate::utils::hash_utils::sha256_file;
 use crate::utils::time_utils::seconds_remaining;
 
 const DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_NETWORK_RETRIES: u32 = 20;
+const MAX_DATA_RETRIES: u32 = 3;
+#[cfg(not(test))]
+const RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
+#[cfg(test)]
+const RETRY_BASE_DELAY: Duration = Duration::from_millis(5);
+#[cfg(not(test))]
+const RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const RETRY_MAX_DELAY: Duration = Duration::from_millis(20);
 
 #[derive(Debug, Clone)]
 pub struct DownloadFileTask {
@@ -57,8 +67,9 @@ pub async fn download_file(
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    let mut last_error = None;
-    for attempt in 0..=3 {
+    let mut network_retries = 0;
+    let mut data_retries = 0;
+    loop {
         if cancel.is_cancelled() {
             let _ = tokio::fs::remove_file(&part_path).await;
             return Err(AppError::Canceled);
@@ -81,12 +92,12 @@ pub async fn download_file(
                 }
                 .await;
                 if let Err(error) = verification {
-                    last_error = Some(error);
                     let _ = tokio::fs::remove_file(&part_path).await;
-                    if attempt < 3 {
-                        let delay_ms = 500_u64.saturating_mul(2_u64.saturating_pow(attempt));
-                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    if data_retries >= MAX_DATA_RETRIES {
+                        return Err(error);
                     }
+                    data_retries += 1;
+                    wait_before_retry(&cancel, data_retries).await?;
                     continue;
                 }
 
@@ -111,22 +122,41 @@ pub async fn download_file(
             }
             Err(error) => {
                 let preserve_partial = matches!(error, AppError::Network(_));
-                last_error = Some(error);
                 if !preserve_partial {
                     let _ = tokio::fs::remove_file(&part_path).await;
                 }
-                if attempt < 3 {
-                    let delay_ms = 500_u64.saturating_mul(2_u64.saturating_pow(attempt));
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+
+                let retry = if preserve_partial {
+                    if network_retries >= MAX_NETWORK_RETRIES {
+                        return Err(error);
+                    }
+                    network_retries += 1;
+                    network_retries
+                } else {
+                    if data_retries >= MAX_DATA_RETRIES {
+                        return Err(error);
+                    }
+                    data_retries += 1;
+                    data_retries
+                };
+                if let Err(cancelled) = wait_before_retry(&cancel, retry).await {
+                    let _ = tokio::fs::remove_file(&part_path).await;
+                    return Err(cancelled);
                 }
             }
         }
     }
+}
 
-    if !matches!(&last_error, Some(AppError::Network(_))) {
-        let _ = tokio::fs::remove_file(&part_path).await;
+async fn wait_before_retry(cancel: &CancellationToken, retry_number: u32) -> Result<(), AppError> {
+    let multiplier = 2_u32.saturating_pow(retry_number.saturating_sub(1).min(16));
+    let delay = RETRY_BASE_DELAY
+        .saturating_mul(multiplier)
+        .min(RETRY_MAX_DELAY);
+    tokio::select! {
+        _ = cancel.cancelled() => Err(AppError::Canceled),
+        _ = tokio::time::sleep(delay) => Ok(()),
     }
-    Err(last_error.unwrap_or_else(|| AppError::Network("download failed".to_string())))
 }
 
 async fn try_download_file(
@@ -384,18 +414,44 @@ pub async fn download_files_parallel(
     progress: ProgressEmitter,
     cancel: CancellationToken,
 ) -> Result<(), AppError> {
+    download_files_parallel_inner(
+        client,
+        files,
+        target_root,
+        concurrency,
+        Some(progress),
+        cancel,
+    )
+    .await
+}
+
+async fn download_files_parallel_inner(
+    client: Client,
+    files: Vec<DownloadFileTask>,
+    target_root: PathBuf,
+    concurrency: usize,
+    progress: Option<ProgressEmitter>,
+    cancel: CancellationToken,
+) -> Result<(), AppError> {
     let concurrency = concurrency.clamp(1, crate::constants::MAX_DOWNLOAD_CONCURRENCY);
     let semaphore = Arc::new(Semaphore::new(concurrency));
+    let batch_cancel = cancel.child_token();
     let total = files.len().max(1);
     let mut completed = 0_usize;
     let mut futures = FuturesUnordered::new();
+    let mut first_error = None;
 
     for task in files {
-        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let permit = tokio::select! {
+            _ = batch_cancel.cancelled() => {
+                first_error = Some(AppError::Canceled);
+                break;
+            }
+            permit = semaphore.clone().acquire_owned() => permit.unwrap(),
+        };
         let client = client.clone();
         let target = target_root.join(&task.relative_path);
-        let progress = progress.clone();
-        let task_cancel = cancel.clone();
+        let task_cancel = batch_cancel.clone();
 
         futures.push(tokio::spawn(async move {
             let _permit = permit;
@@ -411,38 +467,63 @@ pub async fn download_files_parallel(
             .await
         }));
 
-        if cancel.is_cancelled() {
-            return Err(AppError::Canceled);
-        }
-
         while futures.len() >= concurrency {
             if let Some(result) = futures.next().await {
-                result.map_err(|error| AppError::Unknown(error.to_string()))??;
-                completed += 1;
-                progress.emit_stage(
-                    ProgressStage::Download,
-                    Some((completed as f64 / total as f64) * 100.0),
-                    None,
-                )?;
+                if let Err(error) =
+                    record_download_completion(result, &mut completed, total, progress.as_ref())
+                {
+                    first_error = Some(error);
+                    batch_cancel.cancel();
+                    break;
+                }
             }
+        }
+
+        if first_error.is_some() {
+            break;
         }
     }
 
     while let Some(result) = futures.next().await {
-        result.map_err(|error| AppError::Unknown(error.to_string()))??;
-        completed += 1;
+        if first_error.is_some() {
+            continue;
+        }
+        if let Err(error) =
+            record_download_completion(result, &mut completed, total, progress.as_ref())
+        {
+            first_error = Some(error);
+            batch_cancel.cancel();
+        }
+    }
+
+    if let Some(error) = first_error {
+        Err(error)
+    } else {
+        Ok(())
+    }
+}
+
+fn record_download_completion(
+    result: Result<Result<DownloadResult, AppError>, tokio::task::JoinError>,
+    completed: &mut usize,
+    total: usize,
+    progress: Option<&ProgressEmitter>,
+) -> Result<(), AppError> {
+    result.map_err(|error| AppError::Unknown(error.to_string()))??;
+    *completed += 1;
+    if let Some(progress) = progress {
         progress.emit_stage(
             ProgressStage::Download,
-            Some((completed as f64 / total as f64) * 100.0),
+            Some((*completed as f64 / total as f64) * 100.0),
             None,
         )?;
     }
-
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -450,10 +531,13 @@ mod tests {
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
-    use tokio::sync::Mutex;
+    use tokio::sync::{Mutex, Notify};
     use tokio_util::sync::CancellationToken;
 
-    use super::{download_file, parse_content_range, validate_download_size, ParsedContentRange};
+    use super::{
+        download_file, download_files_parallel_inner, parse_content_range, validate_download_size,
+        DownloadFileTask, ParsedContentRange,
+    };
     use crate::error::AppError;
 
     async fn read_request(socket: &mut TcpStream) -> String {
@@ -569,6 +653,227 @@ mod tests {
         assert!(requests[1]
             .lines()
             .any(|line| line.eq_ignore_ascii_case("range: bytes=5-")));
+    }
+
+    #[tokio::test]
+    async fn a_long_backend_restart_is_retried_without_discarding_the_partial_file() {
+        let payload = b"hello world!";
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server_requests = requests.clone();
+
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.expect("request should connect");
+                let request = read_request(&mut socket).await;
+                let attempt = {
+                    let mut requests = server_requests.lock().await;
+                    requests.push(request.clone());
+                    requests.len()
+                };
+                if attempt <= 5 {
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .expect("temporary failure should write");
+                    continue;
+                }
+
+                assert!(request
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case("range: bytes=5-")));
+                socket
+                    .write_all(
+                        b"HTTP/1.1 206 Partial Content\r\nContent-Length: 7\r\nContent-Range: bytes 5-11/12\r\nConnection: close\r\n\r\n world!",
+                    )
+                    .await
+                    .expect("resumed response should write");
+                break;
+            }
+        });
+
+        let directory = tempdir().expect("temporary directory should exist");
+        let target = directory.path().join("archive.zip");
+        let part = directory.path().join("archive.zip.part");
+        tokio::fs::write(&part, b"hello")
+            .await
+            .expect("partial download should exist");
+        let expected_hash = hex::encode(Sha256::digest(payload));
+        let result = download_file(
+            &reqwest::Client::new(),
+            &format!("http://{address}/archive"),
+            &target,
+            None,
+            CancellationToken::new(),
+            Some(payload.len() as u64),
+            Some(&expected_hash),
+        )
+        .await;
+
+        if result.is_err() {
+            server.abort();
+        } else {
+            server.await.expect("test server should finish");
+        }
+        result.expect("backend restart should be retried long enough to recover");
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), payload);
+        assert_eq!(requests.lock().await.len(), 6);
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_network_retry_backoff_and_removes_the_partial() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.expect("request should connect");
+                let _ = read_request(&mut socket).await;
+                socket
+                    .write_all(
+                        b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .expect("temporary failure should write");
+            }
+        });
+
+        let directory = tempdir().expect("temporary directory should exist");
+        let target = directory.path().join("archive.zip");
+        let part = directory.path().join("archive.zip.part");
+        tokio::fs::write(&part, b"hello")
+            .await
+            .expect("partial download should exist");
+        let cancel = CancellationToken::new();
+        let cancel_later = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(8)).await;
+            cancel_later.cancel();
+        });
+
+        let result = download_file(
+            &reqwest::Client::new(),
+            &format!("http://{address}/archive"),
+            &target,
+            None,
+            cancel,
+            Some(12),
+            None,
+        )
+        .await;
+
+        server.abort();
+        assert!(matches!(result, Err(AppError::Canceled)));
+        assert!(!part.exists());
+    }
+
+    #[tokio::test]
+    async fn parallel_failure_cancels_and_drains_sibling_downloads_before_returning() {
+        let sibling_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("sibling listener should bind");
+        let sibling_address = sibling_listener.local_addr().unwrap();
+        let sibling_started = Arc::new(Notify::new());
+        let sibling_requests = Arc::new(AtomicUsize::new(0));
+        let server_started = sibling_started.clone();
+        let server_requests = sibling_requests.clone();
+        let sibling_server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = sibling_listener
+                    .accept()
+                    .await
+                    .expect("sibling request should connect");
+                let _ = read_request(&mut socket).await;
+                server_requests.fetch_add(1, Ordering::SeqCst);
+                server_started.notify_one();
+                socket
+                    .write_all(
+                        b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .expect("temporary sibling failure should write");
+            }
+        });
+
+        let failing_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failing listener should bind");
+        let failing_address = failing_listener.local_addr().unwrap();
+        let failing_started = sibling_started.clone();
+        let failing_server = tokio::spawn(async move {
+            let (mut socket, _) = failing_listener
+                .accept()
+                .await
+                .expect("failing request should connect");
+            let _ = read_request(&mut socket).await;
+            failing_started.notified().await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx")
+                .await
+                .expect("terminal response should write");
+        });
+
+        let directory = tempdir().expect("temporary directory should exist");
+        let failing_target = directory.path().join("target-is-a-directory");
+        tokio::fs::create_dir(&failing_target)
+            .await
+            .expect("directory target should exist");
+        let sibling_part = directory.path().join("sibling.bin.part");
+        tokio::fs::write(&sibling_part, b"hello")
+            .await
+            .expect("sibling partial should exist");
+
+        let cancel = CancellationToken::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            download_files_parallel_inner(
+                reqwest::Client::new(),
+                vec![
+                    DownloadFileTask {
+                        url: format!("http://{failing_address}/terminal"),
+                        relative_path: "target-is-a-directory".to_string(),
+                        expected_size: Some(1),
+                        expected_sha256: None,
+                    },
+                    DownloadFileTask {
+                        url: format!("http://{sibling_address}/retrying"),
+                        relative_path: "sibling.bin".to_string(),
+                        expected_size: Some(12),
+                        expected_sha256: None,
+                    },
+                ],
+                directory.path().to_path_buf(),
+                2,
+                None,
+                cancel.clone(),
+            ),
+        )
+        .await
+        .expect("parallel batch should return promptly");
+
+        let part_existed_on_return = sibling_part.exists();
+        let requests_on_return = sibling_requests.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let requests_after_return = sibling_requests.load(Ordering::SeqCst);
+        cancel.cancel();
+        sibling_server.abort();
+        failing_server.abort();
+
+        assert!(matches!(result, Err(AppError::InvalidData(_))));
+        assert!(
+            !part_existed_on_return,
+            "sibling .part still existed when the failed batch returned"
+        );
+        assert_eq!(
+            requests_after_return, requests_on_return,
+            "sibling kept retrying after the failed batch returned"
+        );
     }
 
     #[tokio::test]

@@ -3,12 +3,34 @@ use std::time::Duration;
 use tauri::{Emitter, Manager, Size};
 
 use crate::commands::*;
+use crate::error::AppError;
 use crate::logger;
 use crate::services::{elevation_service, launcher_update_service};
 use crate::state::AppState;
 
 const MAIN_WINDOW_SIZE: (f64, f64) = (892.0, 496.0);
 const UPDATE_WINDOW_SIZE: (f64, f64) = (788.0, 272.0);
+
+#[derive(Debug, PartialEq, Eq)]
+enum StartupElevationAction {
+    Continue,
+    Relaunch,
+    Reject,
+}
+
+fn startup_elevation_action(
+    debug_build: bool,
+    elevated: bool,
+    elevation_attempted: bool,
+) -> StartupElevationAction {
+    if debug_build || elevated {
+        StartupElevationAction::Continue
+    } else if elevation_attempted {
+        StartupElevationAction::Reject
+    } else {
+        StartupElevationAction::Relaunch
+    }
+}
 
 pub fn run() {
     let builder = tauri::Builder::default()
@@ -61,13 +83,17 @@ pub fn run() {
         .setup(|app| {
             logger::init()?;
 
-            if !cfg!(debug_assertions) && !elevation_service::is_elevated()? {
-                if !elevation_service::elevation_attempted() {
+            match startup_elevation_action(
+                cfg!(debug_assertions),
+                elevation_service::is_elevated()?,
+                elevation_service::elevation_attempted(),
+            ) {
+                StartupElevationAction::Continue => {}
+                StartupElevationAction::Relaunch => {
                     elevation_service::relaunch_as_admin()?;
                     std::process::exit(0);
                 }
-
-                eprintln!("Launcher is still not elevated after relaunch attempt");
+                StartupElevationAction::Reject => return Err(AppError::AdminRequired.into()),
             }
 
             logger::set_app_handle(app.handle().clone());
@@ -162,4 +188,37 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{startup_elevation_action, StartupElevationAction};
+
+    #[test]
+    fn release_build_relaunches_when_not_elevated() {
+        assert_eq!(
+            startup_elevation_action(false, false, false),
+            StartupElevationAction::Relaunch
+        );
+    }
+
+    #[test]
+    fn release_build_rejects_a_second_unelevated_process() {
+        assert_eq!(
+            startup_elevation_action(false, false, true),
+            StartupElevationAction::Reject
+        );
+    }
+
+    #[test]
+    fn elevated_release_and_debug_builds_can_continue() {
+        assert_eq!(
+            startup_elevation_action(false, true, false),
+            StartupElevationAction::Continue
+        );
+        assert_eq!(
+            startup_elevation_action(true, false, false),
+            StartupElevationAction::Continue
+        );
+    }
 }
