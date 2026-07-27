@@ -184,17 +184,15 @@ async fn try_download_content_chunk(
             "content server rejected the resume offset".into(),
         ));
     }
-    if offset > 0 && response.status() == StatusCode::OK {
+    let status = response.status();
+    if offset > 0 && status == StatusCode::OK {
         offset = 0;
-    } else if offset > 0 && response.status() != StatusCode::PARTIAL_CONTENT {
+    }
+    let invalid_status = (offset > 0 && status != StatusCode::PARTIAL_CONTENT)
+        || (offset == 0 && !status.is_success());
+    if invalid_status {
         return Err(AppError::Network(format!(
-            "content chunk request failed with HTTP {}",
-            response.status()
-        )));
-    } else if offset == 0 && !response.status().is_success() {
-        return Err(AppError::Network(format!(
-            "content chunk request failed with HTTP {}",
-            response.status()
+            "content chunk request failed with HTTP {status}",
         )));
     }
     if offset > 0 {
