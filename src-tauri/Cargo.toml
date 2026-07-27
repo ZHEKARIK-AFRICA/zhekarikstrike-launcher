@@ -7,7 +7,9 @@ edition = "2021"
 
 [lib]
 name = "zhekarikstrike_launcher_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# This launcher only targets Windows desktop. Mobile Tauri builds need the
+# staticlib/cdylib outputs; desktop links the library through the rlib.
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
