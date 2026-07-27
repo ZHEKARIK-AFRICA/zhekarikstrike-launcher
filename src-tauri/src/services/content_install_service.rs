@@ -252,10 +252,7 @@ pub async fn install_or_update_content(
 
     let commit_result = commit_staged_files(&game_path, &staging, &journal).await;
     if let Err(error) = commit_result {
-        recover_interrupted_commit(&game_path, &journal).await.ok();
-        cleanup_transaction(&game_path, &transaction_id).await.ok();
-        remove_file_if_exists(&journal_path(&game_path)).await.ok();
-        return Err(error);
+        return Err(rollback_failed_install(&game_path, &journal, error).await);
     }
 
     let state = ContentCompletionState {
@@ -265,10 +262,7 @@ pub async fn install_or_update_content(
         game_version: manifest.game_version.clone(),
     };
     if let Err(error) = atomic_json(&state_path(&game_path), &state).await {
-        recover_interrupted_commit(&game_path, &journal).await.ok();
-        cleanup_transaction(&game_path, &transaction_id).await.ok();
-        remove_file_if_exists(&journal_path(&game_path)).await.ok();
-        return Err(error);
+        return Err(rollback_failed_install(&game_path, &journal, error).await);
     }
 
     config_service::set_game_version(manifest.game_version).await?;
@@ -277,6 +271,25 @@ pub async fn install_or_update_content(
     remove_file_if_exists(&journal_path(&game_path)).await.ok();
     progress.emit_stage(ProgressStage::Complete, Some(100.0), None)?;
     Ok(())
+}
+
+async fn rollback_failed_install(
+    game_path: &Path,
+    journal: &ContentJournal,
+    operation_error: AppError,
+) -> AppError {
+    if let Err(rollback_error) = recover_interrupted_commit(game_path, journal).await {
+        return AppError::FileSystem(format!(
+            "content install failed ({operation_error}); rollback also failed ({rollback_error}); recovery data was preserved"
+        ));
+    }
+    if let Err(cleanup_error) = cleanup_transaction(game_path, &journal.transaction_id).await {
+        return AppError::FileSystem(format!(
+            "content install failed ({operation_error}); rollback completed but transaction cleanup failed ({cleanup_error}); recovery journal was preserved"
+        ));
+    }
+    remove_file_if_exists(&journal_path(game_path)).await.ok();
+    operation_error
 }
 
 async fn load_previous_manifest(game_path: &Path) -> Result<Option<ContentManifest>, AppError> {

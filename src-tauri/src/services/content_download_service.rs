@@ -9,7 +9,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::AppError;
 use crate::models::ContentChunk;
-use crate::services::download_service::{validate_full_response, validate_partial_response};
+use crate::services::download_service::{
+    validate_full_response, validate_partial_response, wait_before_retry, DOWNLOAD_IDLE_TIMEOUT,
+    MAX_DATA_RETRIES, MAX_NETWORK_RETRIES,
+};
 use crate::utils::hash_utils::sha256_file;
 
 pub fn decode_verified_chunk(
@@ -79,6 +82,15 @@ pub async fn download_content_chunk(
     if verified_compressed_file(target, chunk).await? {
         return Ok(());
     }
+    if let Ok(metadata) = tokio::fs::symlink_metadata(target).await {
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(AppError::InvalidData(format!(
+                "content chunk target is not a regular file: {}",
+                target.display()
+            )));
+        }
+        tokio::fs::remove_file(target).await?;
+    }
     if let Some(parent) = target.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -88,105 +100,169 @@ pub async fn download_content_chunk(
             .map(|extension| format!("{}.part", extension.to_string_lossy()))
             .unwrap_or_else(|| "part".to_string()),
     );
-    let mut offset = tokio::fs::metadata(&part)
-        .await
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
-    if offset > chunk.compressed_size {
-        tokio::fs::remove_file(&part).await?;
-        offset = 0;
-    }
-    if offset == chunk.compressed_size && offset > 0 {
-        if verified_compressed_file(&part, chunk).await? {
-            tokio::fs::rename(&part, target).await?;
-            return Ok(());
-        }
-        tokio::fs::remove_file(&part).await?;
-        offset = 0;
-    }
-
-    for _ in 0..2 {
+    let mut network_retries = 0;
+    let mut data_retries = 0;
+    loop {
         if cancel.is_cancelled() {
             return Err(AppError::Canceled);
         }
-        let mut request = client.get(url);
-        if offset > 0 {
-            request = request.header(header::RANGE, format!("bytes={offset}-"));
-        }
-        let response = tokio::select! {
-            _ = cancel.cancelled() => return Err(AppError::Canceled),
-            result = request.send() => result?,
-        };
-        if response.status() == StatusCode::RANGE_NOT_SATISFIABLE && offset > 0 {
-            tokio::fs::remove_file(&part).await?;
-            offset = 0;
-            continue;
-        }
-        if offset > 0 && response.status() == StatusCode::OK {
-            offset = 0;
-        } else if offset > 0 && response.status() != StatusCode::PARTIAL_CONTENT {
-            return Err(AppError::Network(format!(
-                "content chunk request failed with HTTP {}",
-                response.status()
-            )));
-        } else if offset == 0 && !response.status().is_success() {
-            return Err(AppError::Network(format!(
-                "content chunk request failed with HTTP {}",
-                response.status()
-            )));
-        }
-        if offset > 0 {
-            validate_partial_response(&response, offset, Some(chunk.compressed_size))?;
-        } else {
-            validate_full_response(&response, Some(chunk.compressed_size))?;
-        }
-
-        let mut options = tokio::fs::OpenOptions::new();
-        options.create(true).write(true);
-        if offset > 0 {
-            options.append(true);
-        } else {
-            options.truncate(true);
-        }
-        let mut output = options.open(&part).await?;
-        let mut written = offset;
-        let mut stream = response.bytes_stream();
-        while let Some(next) = tokio::select! {
-            _ = cancel.cancelled() => return Err(AppError::Canceled),
-            next = stream.next() => next,
-        } {
-            let bytes = next?;
-            written = written
-                .checked_add(bytes.len() as u64)
-                .ok_or_else(|| AppError::InvalidData("content download size overflow".into()))?;
-            if written > chunk.compressed_size {
-                return Err(AppError::InvalidData(
-                    "content chunk exceeded its declared size".into(),
-                ));
+        match try_download_content_chunk(client, url, target, &part, chunk, &cancel).await {
+            Ok(()) => return Ok(()),
+            Err(AppError::Canceled) => return Err(AppError::Canceled),
+            Err(error @ AppError::Network(_)) => {
+                if network_retries >= MAX_NETWORK_RETRIES {
+                    return Err(error);
+                }
+                network_retries += 1;
+                wait_before_retry(&cancel, network_retries).await?;
             }
-            output.write_all(&bytes).await?;
+            Err(error @ AppError::InvalidData(_)) => {
+                tokio::fs::remove_file(&part).await.ok();
+                if data_retries >= MAX_DATA_RETRIES {
+                    return Err(error);
+                }
+                data_retries += 1;
+                wait_before_retry(&cancel, data_retries).await?;
+            }
+            Err(error) => return Err(error),
         }
-        output.flush().await?;
-        drop(output);
-        if written != chunk.compressed_size || !verified_compressed_file(&part, chunk).await? {
-            tokio::fs::remove_file(&part).await.ok();
+    }
+}
+
+async fn try_download_content_chunk(
+    client: &Client,
+    url: &str,
+    target: &Path,
+    part: &Path,
+    chunk: &ContentChunk,
+    cancel: &CancellationToken,
+) -> Result<(), AppError> {
+    let mut offset = match tokio::fs::symlink_metadata(part).await {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                return Err(AppError::InvalidData(format!(
+                    "content chunk partial is not a regular file: {}",
+                    part.display()
+                )));
+            }
+            metadata.len()
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error.into()),
+    };
+    if offset > chunk.compressed_size {
+        tokio::fs::remove_file(part).await?;
+        offset = 0;
+    }
+    if offset == chunk.compressed_size && offset > 0 {
+        if verified_compressed_file(part, chunk).await? {
+            tokio::fs::rename(part, target).await?;
+            return Ok(());
+        }
+        tokio::fs::remove_file(part).await?;
+        offset = 0;
+    }
+
+    let mut request = client.get(url);
+    if offset > 0 {
+        request = request.header(header::RANGE, format!("bytes={offset}-"));
+    }
+    let response = tokio::select! {
+        _ = cancel.cancelled() => return Err(AppError::Canceled),
+        result = tokio::time::timeout(DOWNLOAD_IDLE_TIMEOUT, request.send()) => {
+            match result {
+                Ok(response) => response?,
+                Err(_) => return Err(AppError::Network(
+                    "content download timed out waiting for response headers".into(),
+                )),
+            }
+        },
+    };
+    if response.status() == StatusCode::RANGE_NOT_SATISFIABLE && offset > 0 {
+        tokio::fs::remove_file(part).await?;
+        return Err(AppError::Network(
+            "content server rejected the resume offset".into(),
+        ));
+    }
+    if offset > 0 && response.status() == StatusCode::OK {
+        offset = 0;
+    } else if offset > 0 && response.status() != StatusCode::PARTIAL_CONTENT {
+        return Err(AppError::Network(format!(
+            "content chunk request failed with HTTP {}",
+            response.status()
+        )));
+    } else if offset == 0 && !response.status().is_success() {
+        return Err(AppError::Network(format!(
+            "content chunk request failed with HTTP {}",
+            response.status()
+        )));
+    }
+    if offset > 0 {
+        validate_partial_response(&response, offset, Some(chunk.compressed_size))?;
+    } else {
+        validate_full_response(&response, Some(chunk.compressed_size))?;
+    }
+
+    let mut options = tokio::fs::OpenOptions::new();
+    options.create(true).write(true);
+    if offset > 0 {
+        options.append(true);
+    } else {
+        options.truncate(true);
+    }
+    let mut output = options.open(part).await?;
+    let mut written = offset;
+    let mut stream = response.bytes_stream();
+    loop {
+        let next = tokio::select! {
+            _ = cancel.cancelled() => return Err(AppError::Canceled),
+            result = tokio::time::timeout(DOWNLOAD_IDLE_TIMEOUT, stream.next()) => {
+                match result {
+                    Ok(next) => next,
+                    Err(_) => return Err(AppError::Network(
+                        "content download stalled while waiting for data".into(),
+                    )),
+                }
+            },
+        };
+        let Some(next) = next else {
+            break;
+        };
+        let bytes = next?;
+        written = written
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| AppError::InvalidData("content download size overflow".into()))?;
+        if written > chunk.compressed_size {
             return Err(AppError::InvalidData(
-                "downloaded content chunk failed verification".into(),
+                "content chunk exceeded its declared size".into(),
             ));
         }
-        tokio::fs::rename(&part, target).await?;
-        return Ok(());
+        output.write_all(&bytes).await?;
     }
-    Err(AppError::Network(
-        "content server rejected the resume request".into(),
-    ))
+    output.flush().await?;
+    drop(output);
+    if written != chunk.compressed_size {
+        return Err(AppError::Network(
+            "content download ended before the declared size".into(),
+        ));
+    }
+    if !verified_compressed_file(part, chunk).await? {
+        return Err(AppError::InvalidData(
+            "downloaded content chunk failed verification".into(),
+        ));
+    }
+    tokio::fs::rename(part, target).await?;
+    Ok(())
 }
 
 pub async fn verified_compressed_file(path: &Path, chunk: &ContentChunk) -> Result<bool, AppError> {
-    let Ok(metadata) = tokio::fs::metadata(path).await else {
+    let Ok(metadata) = tokio::fs::symlink_metadata(path).await else {
         return Ok(false);
     };
-    if !metadata.is_file() || metadata.len() != chunk.compressed_size {
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() != chunk.compressed_size
+    {
         return Ok(false);
     }
     Ok(sha256_file(path).await? == chunk.compressed_sha256)

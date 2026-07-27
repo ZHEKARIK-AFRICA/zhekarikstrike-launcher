@@ -14,9 +14,9 @@ use crate::models::{ProgressEmitter, ProgressPayload, ProgressStage};
 use crate::utils::hash_utils::sha256_file;
 use crate::utils::time_utils::seconds_remaining;
 
-const DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
-const MAX_NETWORK_RETRIES: u32 = 20;
-const MAX_DATA_RETRIES: u32 = 3;
+pub(crate) const DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const MAX_NETWORK_RETRIES: u32 = 20;
+pub(crate) const MAX_DATA_RETRIES: u32 = 3;
 #[cfg(not(test))]
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
 #[cfg(test)]
@@ -148,7 +148,10 @@ pub async fn download_file(
     }
 }
 
-async fn wait_before_retry(cancel: &CancellationToken, retry_number: u32) -> Result<(), AppError> {
+pub(crate) async fn wait_before_retry(
+    cancel: &CancellationToken,
+    retry_number: u32,
+) -> Result<(), AppError> {
     let multiplier = 2_u32.saturating_pow(retry_number.saturating_sub(1).min(16));
     let delay = RETRY_BASE_DELAY
         .saturating_mul(multiplier)
