@@ -2,11 +2,10 @@ use tauri::{AppHandle, Emitter};
 
 use crate::error::AppError;
 use crate::models::GameProcessStateKind;
-use crate::services::file_patch_service::{
-    bundled_game_files, delete_tracked_files, restore_game_files,
-};
+use crate::services::file_patch_service::{delete_tracked_files, restore_game_files};
 use crate::services::{
-    config_service, discord_rpc_service, game_process_service, launcher_move_service,
+    config_service, discord_rpc_service, game_patch_service, game_process_service,
+    launcher_move_service,
 };
 use crate::state::AppState;
 
@@ -36,7 +35,7 @@ pub async fn cleanup_runtime(app: AppHandle, state: &AppState) -> Result<(), App
     }
 
     if let Some(game_path) = config_service::get_game_path().await? {
-        let source = bundled_game_files(&app);
+        let source = game_patch_service::game_patch_roots()?.game_files;
         match restore_game_files(source, game_path).await {
             Ok(restored) => {
                 *state.copied_game_files.lock().await = restored;

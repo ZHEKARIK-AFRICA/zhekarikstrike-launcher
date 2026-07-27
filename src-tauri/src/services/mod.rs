@@ -7,6 +7,7 @@ pub mod disk_service;
 pub mod download_service;
 pub mod elevation_service;
 pub mod file_patch_service;
+pub mod game_patch_service;
 pub mod game_process_service;
 pub mod install_service;
 pub mod launcher_move_service;

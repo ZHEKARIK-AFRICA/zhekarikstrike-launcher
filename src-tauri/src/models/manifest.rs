@@ -3,6 +3,37 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum GamePatchLayer {
+    GameFiles,
+    GameFilesPure,
+}
+
+impl GamePatchLayer {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::GameFiles => "game_files",
+            Self::GameFilesPure => "game_files_pure",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GamePatchManifest {
+    pub files: Vec<GamePatchManifestEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GamePatchManifestEntry {
+    pub layer: GamePatchLayer,
+    pub path: String,
+    pub size: u64,
+    pub sha256: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GameManifest {
     pub game_version: String,

@@ -1,14 +1,12 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use tauri::AppHandle;
 use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 
 use crate::constants::TEMPORARY_FILES;
 use crate::error::AppError;
 use crate::utils::hash_utils::sha256_file;
-use crate::utils::path_utils::resource_path;
 
 pub async fn copy_files_and_track(
     source_root: PathBuf,
@@ -75,15 +73,10 @@ pub async fn restore_game_files(
     source_root: PathBuf,
     target_root: PathBuf,
 ) -> Result<Vec<PathBuf>, AppError> {
+    if !tokio::fs::try_exists(&source_root).await.unwrap_or(false) {
+        return Ok(Vec::new());
+    }
     copy_files_and_track(source_root, target_root, false, None).await
-}
-
-pub fn bundled_game_files_pure(app: &AppHandle) -> PathBuf {
-    resource_path(app, "game_files_pure")
-}
-
-pub fn bundled_game_files(app: &AppHandle) -> PathBuf {
-    resource_path(app, "game_files")
 }
 
 async fn copy_one(source: &Path, target: &Path) -> Result<(), AppError> {
@@ -183,4 +176,45 @@ fn is_temporary(relative: &Path) -> bool {
     TEMPORARY_FILES
         .iter()
         .any(|temporary| temporary.eq_ignore_ascii_case(&normalized))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::restore_game_files;
+
+    #[tokio::test]
+    async fn missing_cached_game_files_are_a_cleanup_noop() {
+        let directory = tempdir().expect("temporary directory should exist");
+        let restored = restore_game_files(
+            directory.path().join("missing-cache"),
+            directory.path().join("game"),
+        )
+        .await
+        .expect("an uninitialized cache should not fail cleanup");
+
+        assert!(restored.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cached_game_files_are_restored_into_the_game_directory() {
+        let directory = tempdir().expect("temporary directory should exist");
+        let source = directory.path().join("game_files/csgo");
+        let target = directory.path().join("game");
+        fs::create_dir_all(&source).expect("cache directory should exist");
+        fs::write(source.join("base.bin"), b"base").expect("cache file should exist");
+
+        let restored = restore_game_files(directory.path().join("game_files"), target.clone())
+            .await
+            .expect("cache should restore");
+
+        assert_eq!(restored, vec![target.join("csgo/base.bin")]);
+        assert_eq!(
+            fs::read(target.join("csgo/base.bin")).expect("restored file should exist"),
+            b"base"
+        );
+    }
 }

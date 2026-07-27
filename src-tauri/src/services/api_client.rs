@@ -8,7 +8,8 @@ use serde::Deserialize;
 use crate::constants::{API_BASE_URL, DOWNLOAD_BASE_URL, MODERN_API_BASE_URL};
 use crate::error::AppError;
 use crate::models::{
-    GameArchiveManifest, GameFileManifestEntry, GameManifest, LauncherUpdateManifest, VersionInfo,
+    GameArchiveManifest, GameFileManifestEntry, GameManifest, GamePatchManifest,
+    GamePatchManifestEntry, LauncherUpdateManifest, VersionInfo,
 };
 use crate::utils::path_utils::normalize_manifest_path;
 
@@ -117,6 +118,32 @@ impl ApiClient {
             .await?)
     }
 
+    pub async fn get_game_patch_manifest(&self) -> Result<GamePatchManifest, AppError> {
+        let url = format!("{MODERN_API_BASE_URL}/launcher/game-files/manifest");
+        Ok(self
+            .http
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    pub fn game_patch_download_url(file: &GamePatchManifestEntry) -> String {
+        let encoded = file
+            .path
+            .split('/')
+            .map(url_encode_segment)
+            .collect::<Vec<_>>()
+            .join("/");
+        format!(
+            "{MODERN_API_BASE_URL}/launcher/game-files/{}/{}",
+            file.layer.as_str(),
+            encoded
+        )
+    }
+
     pub async fn get_archive_manifest(&self) -> Result<GameArchiveManifest, AppError> {
         Ok(GameArchiveManifest {
             url: format!("{}/download_game_archive", self.download_base_url),
@@ -209,4 +236,25 @@ struct CompatFileData {
     md5: Option<String>,
     sha256: Option<String>,
     size: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ApiClient;
+    use crate::models::{GamePatchLayer, GamePatchManifestEntry};
+
+    #[test]
+    fn game_patch_download_url_uses_the_fixed_backend_origin_and_encoded_segments() {
+        let file = GamePatchManifestEntry {
+            layer: GamePatchLayer::GameFilesPure,
+            path: "csgo/scripts/items game.txt".to_string(),
+            size: 4,
+            sha256: "a".repeat(64),
+        };
+
+        assert_eq!(
+            ApiClient::game_patch_download_url(&file),
+            "https://api.zhekarik.africa/launcher/game-files/game_files_pure/csgo/scripts/items%20game.txt"
+        );
+    }
 }

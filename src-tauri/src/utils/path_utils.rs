@@ -1,7 +1,5 @@
 use std::path::{Component, Path, PathBuf};
 
-use tauri::{path::BaseDirectory, AppHandle, Manager};
-
 use crate::error::AppError;
 
 pub fn normalize_manifest_path(path: &str) -> String {
@@ -25,18 +23,6 @@ pub fn safe_join(base: &Path, relative: &str) -> Result<PathBuf, AppError> {
     }
 
     Ok(base.join(safe))
-}
-
-pub fn resource_path(app: &AppHandle, relative: &str) -> PathBuf {
-    app.path()
-        .resolve(relative, BaseDirectory::Resource)
-        .unwrap_or_else(|_| {
-            std::env::current_exe()
-                .ok()
-                .and_then(|exe| exe.parent().map(|parent| parent.join(relative)))
-                .filter(|path| path.exists())
-                .unwrap_or_else(|| PathBuf::from("public").join(relative))
-        })
 }
 
 #[cfg(test)]

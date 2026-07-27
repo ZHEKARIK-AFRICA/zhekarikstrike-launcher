@@ -5,16 +5,17 @@ use sysinfo::System;
 use tauri::{AppHandle, Emitter};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::constants::{
     GAME_PROCESS_NAME, GAME_START_TIMEOUT_MS, PROCESS_POLL_INTERVAL_MS, REV_LOADER_EXE,
 };
 use crate::error::AppError;
 use crate::models::{GameProcessInfo, GameProcessStateKind};
-use crate::services::file_patch_service::{
-    bundled_game_files_pure, copy_files_and_track, delete_tracked_files,
+use crate::services::file_patch_service::{copy_files_and_track, delete_tracked_files};
+use crate::services::{
+    discord_rpc_service, elevation_service, game_patch_service, shutdown_service,
 };
-use crate::services::{discord_rpc_service, elevation_service, shutdown_service};
 use crate::state::AppState;
 
 pub async fn launch_game(
@@ -33,6 +34,23 @@ pub async fn launch_game(
         ));
     }
 
+    let patch_cancel = CancellationToken::new();
+    *state.file_patch_cancel_token.lock().await = Some(patch_cancel.clone());
+    let patch_roots = match game_patch_service::sync_game_patch_cache(
+        app.clone(),
+        patch_cancel.clone(),
+        "verify-progress",
+        Uuid::new_v4().to_string(),
+    )
+    .await
+    {
+        Ok(roots) => roots,
+        Err(error) => {
+            state.file_patch_cancel_token.lock().await.take();
+            return Err(error);
+        }
+    };
+
     app.emit("game-starting", ())?;
     {
         let mut process_state = state.process_state.write().await;
@@ -43,9 +61,7 @@ pub async fn launch_game(
     let previous = std::mem::take(&mut *state.copied_pure_files.lock().await);
     delete_tracked_files(previous).await?;
 
-    let patch_cancel = CancellationToken::new();
-    *state.file_patch_cancel_token.lock().await = Some(patch_cancel.clone());
-    let pure_source = bundled_game_files_pure(&app);
+    let pure_source = patch_roots.game_files_pure;
     let copied_pure =
         copy_files_and_track(pure_source, game_path.clone(), true, Some(patch_cancel)).await?;
     *state.copied_pure_files.lock().await = copied_pure;
