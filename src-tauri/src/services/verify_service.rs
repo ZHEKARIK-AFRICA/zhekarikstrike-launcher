@@ -12,7 +12,7 @@ use crate::services::config_service;
 use crate::services::download_service::{download_files_parallel, DownloadFileTask};
 use crate::services::elevation_service;
 use crate::services::manifest_service::{load_manifest, VerifyMode};
-use crate::utils::hash_utils::{md5_file, sha256_file};
+use crate::utils::hash_utils::sha256_file;
 use crate::utils::path_utils::safe_join;
 
 pub async fn verify_game_files(
@@ -55,8 +55,8 @@ pub async fn verify_game_files(
             files_to_download.push(DownloadFileTask {
                 url: file.url.clone(),
                 relative_path: file.path.clone(),
-                expected_md5: file.md5.clone(),
-                expected_sha256: file.sha256.clone(),
+                expected_md5: None,
+                expected_sha256: Some(file.sha256.clone()),
             });
         }
 
@@ -102,15 +102,6 @@ async fn needs_download(
         return Ok(false);
     }
 
-    if let Some(expected) = file.sha256.as_deref() {
-        let actual = sha256_file(&local_path).await?;
-        return Ok(!actual.eq_ignore_ascii_case(expected));
-    }
-
-    if let Some(expected) = file.md5.as_deref() {
-        let actual = md5_file(&local_path).await?;
-        return Ok(!actual.eq_ignore_ascii_case(expected));
-    }
-
-    Ok(false)
+    let actual = sha256_file(&local_path).await?;
+    Ok(actual != file.sha256)
 }

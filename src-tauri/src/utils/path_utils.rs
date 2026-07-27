@@ -2,10 +2,6 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::error::AppError;
 
-pub fn normalize_manifest_path(path: &str) -> String {
-    path.replace('\\', "/").trim_start_matches('/').to_string()
-}
-
 pub fn safe_join(base: &Path, relative: &str) -> Result<PathBuf, AppError> {
     let relative_path = Path::new(relative);
     let mut safe = PathBuf::new();

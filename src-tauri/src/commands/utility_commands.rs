@@ -3,7 +3,6 @@ use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
 
 use crate::constants::ALLOWED_EXTERNAL_URLS;
-use crate::constants::INSTALL_SIZE_FALLBACK_BYTES;
 use crate::error::AppError;
 use crate::services::api_client::ApiClient;
 use crate::services::{disk_service, elevation_service, launcher_move_service, shortcut_service};
@@ -37,8 +36,11 @@ pub async fn check_disk_space_for_install(
     game_path: String,
 ) -> Result<disk_service::DiskSpaceStatus, AppError> {
     let api = ApiClient::new()?;
-    let archive = api.get_archive_manifest().await?;
-    let required_bytes = archive.size.unwrap_or(INSTALL_SIZE_FALLBACK_BYTES);
+    let archive = api.get_full_manifest().await?.archive;
+    let required_bytes = archive
+        .size
+        .checked_add(archive.unpacked_size)
+        .ok_or_else(|| AppError::InvalidData("installation size overflow".to_string()))?;
     disk_service::check_disk_space(std::path::Path::new(&game_path), required_bytes).await
 }
 

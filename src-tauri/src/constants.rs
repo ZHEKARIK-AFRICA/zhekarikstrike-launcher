@@ -1,7 +1,5 @@
 pub const APP_NAME: &str = "ZHEKARIKSTRIKE";
 pub const PRODUCT_NAME: &str = "ZHEKARIK STRIKE";
-pub const API_BASE_URL: &str = "http://80.85.247.83:8000";
-pub const DOWNLOAD_BASE_URL: &str = "http://80.85.247.83:80";
 pub const MODERN_API_BASE_URL: &str = "https://api.zhekarik.africa";
 
 pub const GAME_PROCESS_NAME: &str = "zhekarikstrike.exe";
@@ -18,8 +16,6 @@ pub const DISCORD_BUTTON_URL: &str = "https://zhekarik.africa";
 pub const LAUNCHER_UPDATE_PUBLIC_KEY: &str = include_str!("../updater.pub");
 pub const LAUNCHER_UPDATE_GITHUB_REPOSITORY: &str = "d3affy/zhekarikstrike-launcher";
 pub const ELEVATION_ATTEMPT_ARG: &str = "--zhekarik-elevation-attempted";
-pub const INSTALL_SIZE_FALLBACK_BYTES: u64 = 9_216 * 1024 * 1024;
-
 pub const DOWNLOAD_CONCURRENCY: usize = 16;
 pub const MAX_DOWNLOAD_CONCURRENCY: usize = 32;
 pub const PROCESS_POLL_INTERVAL_MS: u64 = 3_000;

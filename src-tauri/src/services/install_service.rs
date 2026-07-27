@@ -4,7 +4,7 @@ use tauri::AppHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::constants::{INSTALL_SIZE_FALLBACK_BYTES, REV_LOADER_EXE};
+use crate::constants::REV_LOADER_EXE;
 use crate::error::AppError;
 use crate::models::{ProgressEmitter, ProgressStage};
 use crate::services::api_client::ApiClient;
@@ -33,10 +33,8 @@ pub async fn install_game(
     let progress = ProgressEmitter::new(app.clone(), "install-progress", operation_id.clone());
     let api = ApiClient::new()?;
     let manifest = api.get_full_manifest().await?;
-    let archive = manifest
-        .archive
-        .unwrap_or(api.get_archive_manifest().await?);
-    let required_bytes = archive.size.unwrap_or(INSTALL_SIZE_FALLBACK_BYTES);
+    let archive = manifest.archive;
+    let required_bytes = archive.size;
 
     if !tokio::fs::try_exists(game_path.join(REV_LOADER_EXE))
         .await
@@ -53,15 +51,13 @@ pub async fn install_game(
             Some(progress.clone()),
             cancel.clone(),
             None,
-            archive.sha256.as_deref(),
+            Some(&archive.sha256),
         )
         .await?;
 
-        if let Some(expected) = archive.sha256.as_deref() {
-            let actual = sha256_file(&archive_path).await?;
-            if !actual.eq_ignore_ascii_case(expected) {
-                return Err(AppError::InvalidData("Archive sha256 mismatch".to_string()));
-            }
+        let actual = sha256_file(&archive_path).await?;
+        if actual != archive.sha256 {
+            return Err(AppError::InvalidData("Archive sha256 mismatch".to_string()));
         }
 
         progress.emit_stage(ProgressStage::Extract, Some(0.0), None)?;

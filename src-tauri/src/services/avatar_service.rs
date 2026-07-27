@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::constants::API_BASE_URL;
+use crate::constants::MODERN_API_BASE_URL;
 use crate::error::AppError;
 
 pub async fn generate_avatar(game_path: PathBuf, nickname: String) -> Result<(), AppError> {
@@ -8,7 +8,7 @@ pub async fn generate_avatar(game_path: PathBuf, nickname: String) -> Result<(),
     tokio::fs::create_dir_all(&platform_dir).await?;
 
     let bytes = reqwest::Client::new()
-        .get(format!("{API_BASE_URL}/create_image"))
+        .get(format!("{MODERN_API_BASE_URL}/create_image"))
         .query(&[("nickname", nickname)])
         .send()
         .await?

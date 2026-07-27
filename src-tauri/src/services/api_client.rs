@@ -1,23 +1,18 @@
-use std::collections::HashMap;
 use std::time::Duration;
 
-use chrono::Utc;
 use reqwest::Client;
 use serde::Deserialize;
 
-use crate::constants::{API_BASE_URL, DOWNLOAD_BASE_URL, MODERN_API_BASE_URL};
+use crate::constants::MODERN_API_BASE_URL;
 use crate::error::AppError;
 use crate::models::{
-    GameArchiveManifest, GameFileManifestEntry, GameManifest, GamePatchManifest,
-    GamePatchManifestEntry, LauncherUpdateManifest, VersionInfo,
+    validate_game_path, GameManifest, GamePatchManifest, GamePatchManifestEntry,
+    LauncherUpdateManifest,
 };
-use crate::utils::path_utils::normalize_manifest_path;
 
 #[derive(Clone)]
 pub struct ApiClient {
     http: Client,
-    api_base_url: String,
-    download_base_url: String,
 }
 
 impl ApiClient {
@@ -32,51 +27,37 @@ impl ApiClient {
             ))
             .build()?;
 
-        Ok(Self {
-            http,
-            api_base_url: API_BASE_URL.to_string(),
-            download_base_url: DOWNLOAD_BASE_URL.to_string(),
-        })
+        Ok(Self { http })
     }
 
     pub fn http(&self) -> &Client {
         &self.http
     }
 
-    pub async fn get_version_info(&self) -> Result<VersionInfo, AppError> {
-        let url = format!("{}/version_number", self.api_base_url);
-        Ok(self
-            .http
-            .get(url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?)
-    }
-
     pub async fn get_full_manifest(&self) -> Result<GameManifest, AppError> {
-        self.compat_manifest("/all_files").await
+        let manifest = self.fetch_manifest(Self::full_manifest_url()).await?;
+        manifest.validate_complete()?;
+        Ok(manifest)
     }
 
     pub async fn get_additional_manifest(&self) -> Result<GameManifest, AppError> {
-        self.compat_manifest("/additional_check").await
+        let manifest = self.fetch_manifest(Self::additional_manifest_url()).await?;
+        manifest.validate_subset()?;
+        Ok(manifest)
     }
 
     pub async fn get_updates_from(&self, version: &str) -> Result<GameManifest, AppError> {
-        let url = format!("{}/get_updates", self.api_base_url);
-        let response: CompatUpdatesResponse = self
+        let manifest: GameManifest = self
             .http
-            .get(url)
+            .get(Self::updates_url())
             .query(&[("from_version", version)])
             .send()
             .await?
             .error_for_status()?
             .json()
             .await?;
-
-        self.manifest_from_map(response.updates.unwrap_or_default())
-            .await
+        manifest.validate_update()?;
+        Ok(manifest)
     }
 
     pub async fn get_exclude_files(&self) -> Result<Vec<String>, AppError> {
@@ -85,22 +66,20 @@ impl ApiClient {
             files: Option<Vec<String>>,
         }
 
-        let url = format!("{}/exclude_files", self.api_base_url);
         let response: ExcludeResponse = self
             .http
-            .get(url)
+            .get(Self::excludes_url())
             .send()
             .await?
             .error_for_status()?
             .json()
             .await?;
 
-        Ok(response
-            .files
-            .unwrap_or_default()
-            .into_iter()
-            .map(|path| normalize_manifest_path(&path))
-            .collect())
+        let files = response.files.unwrap_or_default();
+        for path in &files {
+            validate_game_path(path)?;
+        }
+        Ok(files)
     }
 
     pub async fn get_launcher_update(
@@ -147,67 +126,31 @@ impl ApiClient {
         )
     }
 
-    pub async fn get_archive_manifest(&self) -> Result<GameArchiveManifest, AppError> {
-        Ok(GameArchiveManifest {
-            url: format!("{}/download_game_archive", self.download_base_url),
-            size: Some(9_216 * 1024 * 1024),
-            sha256: None,
-        })
+    pub fn full_manifest_url() -> &'static str {
+        "https://api.zhekarik.africa/launcher/game/manifest"
     }
 
-    async fn compat_manifest(&self, endpoint: &str) -> Result<GameManifest, AppError> {
-        let url = format!("{}{}", self.api_base_url, endpoint);
-        let response: CompatFilesResponse = self
+    pub fn additional_manifest_url() -> &'static str {
+        "https://api.zhekarik.africa/launcher/game/additional"
+    }
+
+    pub fn updates_url() -> &'static str {
+        "https://api.zhekarik.africa/launcher/game/updates"
+    }
+
+    pub fn excludes_url() -> &'static str {
+        "https://api.zhekarik.africa/launcher/game/excludes"
+    }
+
+    async fn fetch_manifest(&self, url: &str) -> Result<GameManifest, AppError> {
+        Ok(self
             .http
             .get(url)
             .send()
             .await?
             .error_for_status()?
             .json()
-            .await?;
-
-        self.manifest_from_map(response.files.unwrap_or_default())
-            .await
-    }
-
-    async fn manifest_from_map(
-        &self,
-        files: HashMap<String, CompatFileData>,
-    ) -> Result<GameManifest, AppError> {
-        let version = self.get_version_info().await.unwrap_or_default();
-
-        let entries = files
-            .into_iter()
-            .map(|(path, data)| {
-                let normalized = normalize_manifest_path(&path);
-                let encoded = normalized
-                    .split('/')
-                    .map(url_encode_segment)
-                    .collect::<Vec<_>>()
-                    .join("/");
-
-                GameFileManifestEntry {
-                    path: normalized,
-                    size: data.size,
-                    md5: data.hash.or(data.md5),
-                    sha256: data.sha256,
-                    url: format!("{}/download/{}", self.download_base_url, encoded),
-                    excluded_from_hash_check: false,
-                    temporary: false,
-                }
-            })
-            .collect();
-
-        Ok(GameManifest {
-            game_version: if version.game_version.is_empty() {
-                "0.0.0".to_string()
-            } else {
-                version.game_version
-            },
-            generated_at: Some(Utc::now().to_rfc3339()),
-            files: entries,
-            archive: Some(self.get_archive_manifest().await?),
-        })
+            .await?)
     }
 }
 
@@ -221,24 +164,6 @@ fn url_encode_segment(value: &str) -> String {
             _ => format!("%{byte:02X}").chars().collect(),
         })
         .collect()
-}
-
-#[derive(Debug, Deserialize)]
-struct CompatFilesResponse {
-    files: Option<HashMap<String, CompatFileData>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CompatUpdatesResponse {
-    updates: Option<HashMap<String, CompatFileData>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CompatFileData {
-    hash: Option<String>,
-    md5: Option<String>,
-    sha256: Option<String>,
-    size: Option<u64>,
 }
 
 #[cfg(test)]
@@ -258,6 +183,26 @@ mod tests {
         assert_eq!(
             ApiClient::game_patch_download_url(&file),
             "https://api.zhekarik.africa/launcher/game-files/game_files_pure/csgo/scripts/items%20game.txt"
+        );
+    }
+
+    #[test]
+    fn game_client_api_uses_only_the_public_https_contract() {
+        assert_eq!(
+            ApiClient::full_manifest_url(),
+            "https://api.zhekarik.africa/launcher/game/manifest"
+        );
+        assert_eq!(
+            ApiClient::additional_manifest_url(),
+            "https://api.zhekarik.africa/launcher/game/additional"
+        );
+        assert_eq!(
+            ApiClient::updates_url(),
+            "https://api.zhekarik.africa/launcher/game/updates"
+        );
+        assert_eq!(
+            ApiClient::excludes_url(),
+            "https://api.zhekarik.africa/launcher/game/excludes"
         );
     }
 }

@@ -1,12 +1,4 @@
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct VersionInfo {
-    #[serde(default)]
-    pub game_version: String,
-    #[serde(default)]
-    pub launcher_version: String,
-}
+use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LauncherUpdateStatus {
