@@ -10,6 +10,7 @@ use crate::models::{ProgressEmitter, ProgressStage};
 use crate::services::api_client::ApiClient;
 use crate::services::archive_service::extract_zip;
 use crate::services::config_service;
+use crate::services::content_install_service;
 use crate::services::disk_service::ensure_disk_space;
 use crate::services::download_service::download_file;
 use crate::services::elevation_service;
@@ -35,8 +36,24 @@ pub async fn install_game(
     tokio::fs::create_dir_all(&game_path).await?;
 
     let operation_id = Uuid::new_v4().to_string();
-    let progress = ProgressEmitter::new(app.clone(), "install-progress", operation_id.clone());
     let api = ApiClient::new()?;
+    if let Some(manifest) = api.get_content_manifest().await? {
+        content_install_service::install_or_update_content(
+            app,
+            game_path.clone(),
+            api,
+            manifest,
+            cancel,
+            "install-progress",
+            operation_id,
+        )
+        .await?;
+        config_service::set_game_path(game_path).await?;
+        shortcut_service::create_default_shortcuts().await?;
+        return Ok(());
+    }
+
+    let progress = ProgressEmitter::new(app.clone(), "install-progress", operation_id.clone());
     let manifest = api.get_full_manifest().await?;
     let archive = manifest.archive;
     let required_bytes = required_install_bytes(archive.size, archive.unpacked_size)?;

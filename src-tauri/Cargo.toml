@@ -1,6 +1,6 @@
 [package]
 name = "zhekarikstrike_launcher"
-version = "1.6.5"
+version = "1.6.6"
 description = "ZHEKARIK STRIKE Launcher"
 authors = ["d3affy"]
 edition = "2021"
@@ -37,6 +37,7 @@ thiserror = "2"
 anyhow = "1"
 
 zip = "2"
+zstd = "0.13"
 walkdir = "2"
 fs_extra = "1"
 

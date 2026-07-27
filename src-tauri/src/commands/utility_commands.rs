@@ -5,7 +5,10 @@ use tauri_plugin_opener::OpenerExt;
 use crate::constants::ALLOWED_EXTERNAL_URLS;
 use crate::error::AppError;
 use crate::services::api_client::ApiClient;
-use crate::services::{disk_service, elevation_service, launcher_move_service, shortcut_service};
+use crate::services::{
+    content_install_service, disk_service, elevation_service, launcher_move_service,
+    shortcut_service,
+};
 
 #[tauri::command]
 pub async fn select_game_folder(app: AppHandle) -> Result<Option<String>, AppError> {
@@ -36,6 +39,14 @@ pub async fn check_disk_space_for_install(
     game_path: String,
 ) -> Result<disk_service::DiskSpaceStatus, AppError> {
     let api = ApiClient::new()?;
+    if let Some(manifest) = api.get_content_manifest().await? {
+        let game_path = std::path::Path::new(&game_path);
+        let backup =
+            content_install_service::estimate_existing_backup_bytes(game_path, &manifest).await?;
+        let required =
+            content_install_service::conservative_content_install_bytes(&manifest, backup)?;
+        return disk_service::check_disk_space(game_path, required).await;
+    }
     let archive = api.get_full_manifest().await?.archive;
     let required_bytes = archive
         .size

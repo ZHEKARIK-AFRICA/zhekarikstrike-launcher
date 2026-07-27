@@ -1,12 +1,12 @@
 use std::time::Duration;
 
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 
 use crate::constants::MODERN_API_BASE_URL;
 use crate::error::AppError;
 use crate::models::{
-    validate_game_path, GameManifest, GamePatchManifest, GamePatchManifestEntry,
+    validate_game_path, ContentManifest, GameManifest, GamePatchManifest, GamePatchManifestEntry,
     LauncherUpdateManifest,
 };
 
@@ -39,6 +39,16 @@ impl ApiClient {
         let manifest = self.fetch_manifest(Self::full_manifest_url()).await?;
         manifest.validate_complete()?;
         Ok(manifest)
+    }
+
+    pub async fn get_content_manifest(&self) -> Result<Option<ContentManifest>, AppError> {
+        let response = self
+            .metadata_get(Self::content_manifest_url())
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.bytes().await?;
+        parse_content_manifest_response(status, &body)
     }
 
     pub async fn get_additional_manifest(&self) -> Result<GameManifest, AppError> {
@@ -127,6 +137,10 @@ impl ApiClient {
         "https://api.zhekarik.africa/launcher/game/manifest"
     }
 
+    pub fn content_manifest_url() -> &'static str {
+        "https://api.zhekarik.africa/launcher/game/v2/manifest"
+    }
+
     pub fn additional_manifest_url() -> &'static str {
         "https://api.zhekarik.africa/launcher/game/additional"
     }
@@ -152,6 +166,24 @@ impl ApiClient {
     fn metadata_get(&self, url: &str) -> reqwest::RequestBuilder {
         self.http.get(url).timeout(METADATA_REQUEST_TIMEOUT)
     }
+}
+
+pub(crate) fn parse_content_manifest_response(
+    status: StatusCode,
+    body: &[u8],
+) -> Result<Option<ContentManifest>, AppError> {
+    if status == StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        return Err(AppError::Network(format!(
+            "content manifest request failed with HTTP {status}"
+        )));
+    }
+    let manifest: ContentManifest = serde_json::from_slice(body)
+        .map_err(|error| AppError::InvalidData(format!("invalid content manifest: {error}")))?;
+    manifest.validate()?;
+    Ok(Some(manifest))
 }
 
 fn url_encode_segment(value: &str) -> String {

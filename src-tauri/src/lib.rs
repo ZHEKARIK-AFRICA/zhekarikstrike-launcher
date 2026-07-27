@@ -13,6 +13,9 @@ mod services;
 mod state;
 mod utils;
 
+#[cfg(test)]
+mod content_tests;
+
 pub fn run() {
     app::run();
 }

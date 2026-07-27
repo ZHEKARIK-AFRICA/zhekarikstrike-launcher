@@ -305,7 +305,7 @@ async fn resumable_offset(part_path: &Path, expected_size: Option<u64>) -> Resul
     Ok(metadata.len())
 }
 
-fn validate_full_response(
+pub(crate) fn validate_full_response(
     response: &reqwest::Response,
     expected_size: Option<u64>,
 ) -> Result<(), AppError> {
@@ -315,7 +315,7 @@ fn validate_full_response(
     Ok(())
 }
 
-fn validate_partial_response(
+pub(crate) fn validate_partial_response(
     response: &reqwest::Response,
     offset: u64,
     expected_size: Option<u64>,

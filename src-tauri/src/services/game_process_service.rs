@@ -14,7 +14,8 @@ use crate::error::AppError;
 use crate::models::{GameProcessInfo, GameProcessStateKind};
 use crate::services::file_patch_service::{copy_files_and_track, delete_tracked_files};
 use crate::services::{
-    discord_rpc_service, elevation_service, game_patch_service, shutdown_service,
+    content_journal_service, discord_rpc_service, elevation_service, game_patch_service,
+    shutdown_service,
 };
 use crate::state::AppState;
 
@@ -26,6 +27,8 @@ pub async fn launch_game(
     if !elevation_service::is_elevated()? {
         return Err(AppError::AdminRequired);
     }
+
+    content_journal_service::recover_pending_content(&game_path).await?;
 
     let exe_path = game_path.join(REV_LOADER_EXE);
     if !tokio::fs::try_exists(&exe_path).await.unwrap_or(false) {
