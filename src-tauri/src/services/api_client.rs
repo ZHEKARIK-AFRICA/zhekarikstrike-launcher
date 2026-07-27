@@ -26,7 +26,10 @@ impl ApiClient {
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(120))
             .pool_idle_timeout(Duration::from_secs(90))
-            .user_agent("ZHEKARIK-STRIKE-Launcher/1.6.1")
+            .user_agent(concat!(
+                "ZHEKARIK-STRIKE-Launcher/",
+                env!("CARGO_PKG_VERSION")
+            ))
             .build()?;
 
         Ok(Self {

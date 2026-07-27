@@ -219,7 +219,6 @@ try {
     $installerAssetName = "ZHEKARIK-STRIKE_${Version}_windows-x86_64-setup.exe"
     $updateAsset = Join-Path $artifactDirectory $updateAssetName
     $installerAsset = Join-Path $artifactDirectory $installerAssetName
-    Copy-Item -LiteralPath $rawSource -Destination $updateAsset
     Copy-Item -LiteralPath $installer.FullName -Destination $installerAsset
 
     Invoke-NpmWithoutWorkspaces -Executable $npx -Arguments @(

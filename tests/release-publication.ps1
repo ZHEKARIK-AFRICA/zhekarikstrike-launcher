@@ -98,3 +98,26 @@ $releaseSource = Get-Content -LiteralPath "$PSScriptRoot\..\scripts\release.ps1"
 if ($releaseSource -match '(?i)--clobber') {
     throw 'Published launcher assets must never be overwritten with --clobber'
 }
+
+$tauriConfig = Get-Content -LiteralPath "$PSScriptRoot\..\src-tauri\tauri.conf.json" -Raw | ConvertFrom-Json
+$resourcesProperty = $tauriConfig.bundle.PSObject.Properties['resources']
+if ($null -ne $resourcesProperty -and $resourcesProperty.Value.Count -ne 0) {
+    throw 'Tauri release builds must not bundle launcher game patch directories'
+}
+
+$portableSource = Get-Content -LiteralPath "$PSScriptRoot\..\scripts\build-portable.ps1" -Raw
+if ($portableSource -match 'Compress-Archive|game_files|game_files_pure|portable\.zip') {
+    throw 'Portable release must be one EXE without copied patch directories or ZIP packaging'
+}
+if ($portableSource -notmatch 'ZHEKARIK-STRIKE_\$\{Version\}_windows-x86_64\.exe') {
+    throw 'Portable builder must produce the canonical launcher EXE name'
+}
+
+$portableBuild = $releaseSource.IndexOf("'--features', 'portable'", [StringComparison]::Ordinal)
+$portablePackaging = $releaseSource.IndexOf("'scripts\build-portable.ps1'", [StringComparison]::Ordinal)
+if ($portableBuild -lt 0 -or $portablePackaging -lt 0 -or $portableBuild -gt $portablePackaging) {
+    throw 'Canonical updater EXE must be packaged only after the portable-feature build'
+}
+if ($releaseSource -match 'portable\.zip') {
+    throw 'Release publication must not include a portable ZIP'
+}
