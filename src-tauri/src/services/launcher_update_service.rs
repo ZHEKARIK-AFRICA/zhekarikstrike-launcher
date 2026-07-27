@@ -63,17 +63,11 @@ pub async fn download_launcher_update(app: AppHandle) -> Result<VerifiedLauncher
             &staging_path,
             Some(progress.clone()),
             CancellationToken::new(),
-            None,
+            Some(platform.size),
             Some(&platform.sha256),
         )
         .await?;
-
-        if download.bytes != platform.size {
-            return Err(AppError::InvalidData(format!(
-                "launcher update size mismatch: expected {}, received {}",
-                platform.size, download.bytes
-            )));
-        }
+        debug_assert_eq!(download.bytes, platform.size);
 
         let actual = sha256_file(&download.path).await?;
         if actual != platform.sha256 {

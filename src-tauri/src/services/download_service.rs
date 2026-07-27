@@ -10,14 +10,14 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::AppError;
 use crate::models::{ProgressEmitter, ProgressPayload, ProgressStage};
-use crate::utils::hash_utils::{md5_file, sha256_file};
+use crate::utils::hash_utils::sha256_file;
 use crate::utils::time_utils::seconds_remaining;
 
 #[derive(Debug, Clone)]
 pub struct DownloadFileTask {
     pub url: String,
     pub relative_path: String,
-    pub expected_md5: Option<String>,
+    pub expected_size: Option<u64>,
     pub expected_sha256: Option<String>,
 }
 
@@ -33,7 +33,7 @@ pub async fn download_file(
     target_path: &Path,
     progress: Option<ProgressEmitter>,
     cancel: CancellationToken,
-    expected_md5: Option<&str>,
+    expected_size: Option<u64>,
     expected_sha256: Option<&str>,
 ) -> Result<DownloadResult, AppError> {
     let part_path = target_path.with_extension(
@@ -54,11 +54,39 @@ pub async fn download_file(
             return Err(AppError::Canceled);
         }
 
-        match try_download_file(client, url, &part_path, progress.clone(), cancel.clone()).await {
+        match try_download_file(
+            client,
+            url,
+            &part_path,
+            progress.clone(),
+            cancel.clone(),
+            expected_size,
+        )
+        .await
+        {
             Ok(bytes) => {
-                verify_download_hash(&part_path, expected_md5, expected_sha256).await?;
+                let verification = async {
+                    validate_download_size(bytes, expected_size)?;
+                    verify_download_hash(&part_path, expected_sha256).await
+                }
+                .await;
+                if let Err(error) = verification {
+                    last_error = Some(error);
+                    let _ = tokio::fs::remove_file(&part_path).await;
+                    if attempt < 3 {
+                        let delay_ms = 500_u64.saturating_mul(2_u64.saturating_pow(attempt));
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    }
+                    continue;
+                }
 
-                if tokio::fs::try_exists(target_path).await.unwrap_or(false) {
+                if let Ok(metadata) = tokio::fs::symlink_metadata(target_path).await {
+                    if metadata.is_dir() {
+                        return Err(AppError::InvalidData(format!(
+                            "download target is a directory: {}",
+                            target_path.display()
+                        )));
+                    }
                     tokio::fs::remove_file(target_path).await?;
                 }
                 tokio::fs::rename(&part_path, target_path).await?;
@@ -73,12 +101,16 @@ pub async fn download_file(
             }
             Err(error) => {
                 last_error = Some(error);
-                let delay_ms = 500_u64.saturating_mul(2_u64.saturating_pow(attempt));
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                let _ = tokio::fs::remove_file(&part_path).await;
+                if attempt < 3 {
+                    let delay_ms = 500_u64.saturating_mul(2_u64.saturating_pow(attempt));
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
             }
         }
     }
 
+    let _ = tokio::fs::remove_file(&part_path).await;
     Err(last_error.unwrap_or_else(|| AppError::Network("download failed".to_string())))
 }
 
@@ -88,9 +120,13 @@ async fn try_download_file(
     part_path: &Path,
     progress: Option<ProgressEmitter>,
     cancel: CancellationToken,
+    expected_size: Option<u64>,
 ) -> Result<u64, AppError> {
     let response = client.get(url).send().await?.error_for_status()?;
     let total = response.content_length();
+    if let (Some(actual), Some(expected)) = (total, expected_size) {
+        validate_download_size(actual, Some(expected))?;
+    }
     let mut stream = response.bytes_stream();
     let mut file = tokio::fs::File::create(part_path).await?;
     let mut downloaded = 0_u64;
@@ -122,9 +158,19 @@ async fn try_download_file(
     Ok(downloaded)
 }
 
+fn validate_download_size(actual: u64, expected: Option<u64>) -> Result<(), AppError> {
+    if let Some(expected) = expected {
+        if actual != expected {
+            return Err(AppError::InvalidData(format!(
+                "download size mismatch: expected {expected}, received {actual}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 async fn verify_download_hash(
     part_path: &Path,
-    expected_md5: Option<&str>,
     expected_sha256: Option<&str>,
 ) -> Result<(), AppError> {
     if let Some(expected) = expected_sha256 {
@@ -132,16 +178,6 @@ async fn verify_download_hash(
         if !actual.eq_ignore_ascii_case(expected) {
             return Err(AppError::InvalidData(format!(
                 "sha256 mismatch for {}",
-                part_path.display()
-            )));
-        }
-    }
-
-    if let Some(expected) = expected_md5 {
-        let actual = md5_file(part_path).await?;
-        if !actual.eq_ignore_ascii_case(expected) {
-            return Err(AppError::InvalidData(format!(
-                "md5 mismatch for {}",
                 part_path.display()
             )));
         }
@@ -179,7 +215,7 @@ pub async fn download_files_parallel(
                 &target,
                 None,
                 task_cancel,
-                task.expected_md5.as_deref(),
+                task.expected_size,
                 task.expected_sha256.as_deref(),
             )
             .await
@@ -213,4 +249,18 @@ pub async fn download_files_parallel(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_download_size;
+
+    #[test]
+    fn download_size_must_match_the_signed_manifest_value() {
+        validate_download_size(9_153_970_381, Some(9_153_970_381))
+            .expect("exact archive size should pass");
+        assert!(validate_download_size(9_153_970_380, Some(9_153_970_381)).is_err());
+        assert!(validate_download_size(9_153_970_382, Some(9_153_970_381)).is_err());
+        validate_download_size(123, None).expect("legacy unbounded callers should still work");
+    }
 }

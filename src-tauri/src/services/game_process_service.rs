@@ -51,43 +51,57 @@ pub async fn launch_game(
         }
     };
 
-    app.emit("game-starting", ())?;
-    {
-        let mut process_state = state.process_state.write().await;
-        process_state.kind = GameProcessStateKind::Starting;
-        process_state.pid = None;
+    let launch_result = async {
+        app.emit("game-starting", ())?;
+        {
+            let mut process_state = state.process_state.write().await;
+            process_state.kind = GameProcessStateKind::Starting;
+            process_state.pid = None;
+        }
+
+        let previous = std::mem::take(&mut *state.copied_pure_files.lock().await);
+        delete_tracked_files(previous).await?;
+
+        let pure_source = patch_roots.game_files_pure;
+        let copied_pure =
+            copy_files_and_track(pure_source, game_path.clone(), true, Some(patch_cancel)).await?;
+        *state.copied_pure_files.lock().await = copied_pure;
+
+        if let Err(error) = discord_rpc_service::start_rich_presence(app.clone(), state).await {
+            crate::logger::warn(&format!("Discord RPC start failed: {error}"));
+        }
+
+        Command::new(&exe_path)
+            .current_dir(&game_path)
+            .spawn()
+            .map_err(|error| AppError::Unknown(format!("failed to spawn game: {error}")))?;
+
+        let game_process = wait_for_process(
+            GAME_PROCESS_NAME,
+            Duration::from_millis(GAME_START_TIMEOUT_MS),
+        )
+        .await?;
+        {
+            let mut process_state = state.process_state.write().await;
+            process_state.kind = GameProcessStateKind::Running;
+            process_state.pid = Some(game_process.pid);
+        }
+
+        app.emit("game-started", game_process.clone())?;
+        monitor_game_process(app.clone(), state.clone(), game_process.pid);
+        Ok::<(), AppError>(())
+    }
+    .await;
+
+    if let Err(error) = launch_result {
+        if let Err(cleanup_error) = shutdown_service::cleanup_runtime(app, state).await {
+            crate::logger::warn(&format!(
+                "game launch failed ({error}) and cleanup also failed: {cleanup_error}"
+            ));
+        }
+        return Err(error);
     }
 
-    let previous = std::mem::take(&mut *state.copied_pure_files.lock().await);
-    delete_tracked_files(previous).await?;
-
-    let pure_source = patch_roots.game_files_pure;
-    let copied_pure =
-        copy_files_and_track(pure_source, game_path.clone(), true, Some(patch_cancel)).await?;
-    *state.copied_pure_files.lock().await = copied_pure;
-
-    if let Err(error) = discord_rpc_service::start_rich_presence(app.clone(), state).await {
-        eprintln!("Discord RPC start failed: {error}");
-    }
-
-    Command::new(&exe_path)
-        .current_dir(&game_path)
-        .spawn()
-        .map_err(|error| AppError::Unknown(format!("failed to spawn game: {error}")))?;
-
-    let game_process = wait_for_process(
-        GAME_PROCESS_NAME,
-        Duration::from_millis(GAME_START_TIMEOUT_MS),
-    )
-    .await?;
-    {
-        let mut process_state = state.process_state.write().await;
-        process_state.kind = GameProcessStateKind::Running;
-        process_state.pid = Some(game_process.pid);
-    }
-
-    app.emit("game-started", game_process.clone())?;
-    monitor_game_process(app, state.clone(), game_process.pid);
     Ok(())
 }
 

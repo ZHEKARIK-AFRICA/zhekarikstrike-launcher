@@ -188,19 +188,11 @@ pub async fn sync_manifest_cache(
             &target,
             None,
             cancel.clone(),
-            None,
+            Some(file.size),
             Some(&file.sha256),
         )
         .await?;
-        if result.bytes != file.size {
-            return Err(AppError::InvalidData(format!(
-                "launcher game patch size mismatch for {}/{}: expected {}, received {}",
-                file.layer.as_str(),
-                file.path,
-                file.size,
-                result.bytes
-            )));
-        }
+        debug_assert_eq!(result.bytes, file.size);
     }
 
     let remaining = plan_cache_sync(roots, manifest).await?;

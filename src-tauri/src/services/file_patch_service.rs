@@ -16,45 +16,58 @@ pub async fn copy_files_and_track(
 ) -> Result<Vec<PathBuf>, AppError> {
     let mut copied = Vec::new();
 
-    for entry in WalkDir::new(&source_root).into_iter() {
-        if let Some(cancel) = cancel.as_ref() {
-            if cancel.is_cancelled() {
-                return Err(AppError::Canceled);
+    let copy_result = async {
+        for entry in WalkDir::new(&source_root).sort_by_file_name().into_iter() {
+            if let Some(cancel) = cancel.as_ref() {
+                if cancel.is_cancelled() {
+                    return Err(AppError::Canceled);
+                }
+            }
+
+            let entry = entry.map_err(|error| AppError::FileSystem(error.to_string()))?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+
+            let relative = entry
+                .path()
+                .strip_prefix(&source_root)
+                .map_err(|error| AppError::FileSystem(error.to_string()))?;
+            let target = target_root.join(relative);
+            copy_one(entry.path(), &target).await?;
+            copied.push(target.clone());
+
+            if temporary_mode && is_temporary(relative) {
+                let replacement_source = source_root
+                    .to_string_lossy()
+                    .replace("game_files_pure", "game_files");
+                let replacement = PathBuf::from(replacement_source).join(relative);
+                let target_clone = target.clone();
+                let cancel = cancel.clone();
+                tokio::spawn(async move {
+                    if let Some(cancel) = cancel {
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_millis(25_000)) => {}
+                            _ = cancel.cancelled() => return,
+                        }
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(25_000)).await;
+                    }
+                    let _ = copy_one(&replacement, &target_clone).await;
+                });
             }
         }
+        Ok::<(), AppError>(())
+    }
+    .await;
 
-        let entry = entry.map_err(|error| AppError::FileSystem(error.to_string()))?;
-        if !entry.file_type().is_file() {
-            continue;
+    if let Err(error) = copy_result {
+        if let Err(cleanup_error) = delete_tracked_files(copied).await {
+            return Err(AppError::FileSystem(format!(
+                "layer activation failed ({error}) and rollback failed ({cleanup_error})"
+            )));
         }
-
-        let relative = entry
-            .path()
-            .strip_prefix(&source_root)
-            .map_err(|error| AppError::FileSystem(error.to_string()))?;
-        let target = target_root.join(relative);
-        copy_one(entry.path(), &target).await?;
-        copied.push(target.clone());
-
-        if temporary_mode && is_temporary(relative) {
-            let replacement_source = source_root
-                .to_string_lossy()
-                .replace("game_files_pure", "game_files");
-            let replacement = PathBuf::from(replacement_source).join(relative);
-            let target_clone = target.clone();
-            let cancel = cancel.clone();
-            tokio::spawn(async move {
-                if let Some(cancel) = cancel {
-                    tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_millis(25_000)) => {}
-                        _ = cancel.cancelled() => return,
-                    }
-                } else {
-                    tokio::time::sleep(Duration::from_millis(25_000)).await;
-                }
-                let _ = copy_one(&replacement, &target_clone).await;
-            });
-        }
+        return Err(error);
     }
 
     Ok(copied)
@@ -184,7 +197,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::restore_game_files;
+    use super::{copy_files_and_track, restore_game_files};
 
     #[tokio::test]
     async fn missing_cached_game_files_are_a_cleanup_noop() {
@@ -215,6 +228,25 @@ mod tests {
         assert_eq!(
             fs::read(target.join("csgo/base.bin")).expect("restored file should exist"),
             b"base"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_layer_activation_removes_files_copied_before_the_error() {
+        let directory = tempdir().expect("temporary directory should exist");
+        let source = directory.path().join("pure");
+        let target = directory.path().join("game");
+        fs::create_dir_all(&source).expect("source should exist");
+        fs::create_dir_all(target.join("b.bin")).expect("collision directory should exist");
+        fs::write(source.join("a.bin"), b"copied first").expect("first source should exist");
+        fs::write(source.join("b.bin"), b"must fail").expect("second source should exist");
+
+        assert!(copy_files_and_track(source, target.clone(), false, None)
+            .await
+            .is_err());
+        assert!(
+            !target.join("a.bin").exists(),
+            "a partially activated pure layer must be rolled back"
         );
     }
 }

@@ -55,7 +55,7 @@ pub async fn verify_game_files(
             files_to_download.push(DownloadFileTask {
                 url: file.url.clone(),
                 relative_path: file.path.clone(),
-                expected_md5: None,
+                expected_size: Some(file.size),
                 expected_sha256: Some(file.sha256.clone()),
             });
         }

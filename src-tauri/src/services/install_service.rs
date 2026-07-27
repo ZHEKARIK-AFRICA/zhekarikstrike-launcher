@@ -16,7 +16,12 @@ use crate::services::elevation_service;
 use crate::services::manifest_service::VerifyMode;
 use crate::services::shortcut_service;
 use crate::services::verify_service::verify_game_files;
-use crate::utils::hash_utils::sha256_file;
+
+fn required_install_bytes(archive_size: u64, unpacked_size: u64) -> Result<u64, AppError> {
+    archive_size
+        .checked_add(unpacked_size)
+        .ok_or_else(|| AppError::InvalidData("installation size overflow".to_string()))
+}
 
 pub async fn install_game(
     app: AppHandle,
@@ -34,7 +39,7 @@ pub async fn install_game(
     let api = ApiClient::new()?;
     let manifest = api.get_full_manifest().await?;
     let archive = manifest.archive;
-    let required_bytes = archive.size;
+    let required_bytes = required_install_bytes(archive.size, archive.unpacked_size)?;
 
     if !tokio::fs::try_exists(game_path.join(REV_LOADER_EXE))
         .await
@@ -50,18 +55,12 @@ pub async fn install_game(
             &archive_path,
             Some(progress.clone()),
             cancel.clone(),
-            None,
+            Some(archive.size),
             Some(&archive.sha256),
         )
         .await?;
 
-        let actual = sha256_file(&archive_path).await?;
-        if actual != archive.sha256 {
-            return Err(AppError::InvalidData("Archive sha256 mismatch".to_string()));
-        }
-
         progress.emit_stage(ProgressStage::Extract, Some(0.0), None)?;
-        ensure_disk_space(&game_path, ((required_bytes as f64) * 1.6) as u64)?;
         extract_zip(
             archive_path,
             game_path.clone(),
@@ -93,4 +92,15 @@ pub async fn install_game(
     shortcut_service::create_default_shortcuts().await?;
     progress.emit_stage(ProgressStage::Complete, Some(100.0), None)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::required_install_bytes;
+
+    #[test]
+    fn installation_reserves_archive_and_unpacked_bytes_at_the_same_time() {
+        assert_eq!(required_install_bytes(10, 25).unwrap(), 35);
+        assert!(required_install_bytes(u64::MAX, 1).is_err());
+    }
 }
