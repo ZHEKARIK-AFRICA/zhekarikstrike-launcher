@@ -194,6 +194,27 @@ pub(crate) fn is_observed_external_process(tracked_pid: Option<u32>, owned: bool
     tracked_pid.is_some() && !owned
 }
 
+async fn wait_for_process(name: &str, timeout: Duration) -> Result<GameProcessInfo, AppError> {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if let Some(process) = find_process_by_name(name).await {
+            return Ok(process);
+        }
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+    }
+
+    Err(AppError::Unknown(format!("Timed out waiting for {name}")))
+}
+
+async fn is_pid_running(pid: u32) -> bool {
+    let mut system = System::new_all();
+    system.refresh_all();
+    system
+        .processes()
+        .keys()
+        .any(|process_pid| process_pid.as_u32() == pid)
+}
+
 #[cfg(test)]
 mod release_1_6_11_tests {
     use super::{detected_process_state, is_observed_external_process};
@@ -219,25 +240,4 @@ mod release_1_6_11_tests {
         assert!(!is_observed_external_process(Some(42), true));
         assert!(!is_observed_external_process(None, false));
     }
-}
-
-async fn wait_for_process(name: &str, timeout: Duration) -> Result<GameProcessInfo, AppError> {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if let Some(process) = find_process_by_name(name).await {
-            return Ok(process);
-        }
-        tokio::time::sleep(Duration::from_millis(1_000)).await;
-    }
-
-    Err(AppError::Unknown(format!("Timed out waiting for {name}")))
-}
-
-async fn is_pid_running(pid: u32) -> bool {
-    let mut system = System::new_all();
-    system.refresh_all();
-    system
-        .processes()
-        .keys()
-        .any(|process_pid| process_pid.as_u32() == pid)
 }
