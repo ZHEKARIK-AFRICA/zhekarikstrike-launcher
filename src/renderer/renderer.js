@@ -3,6 +3,14 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 
 import { setupInputContextMenu } from './context-menu.js';
 
+async function runWindowAction(action, label) {
+    try {
+        await action();
+    } catch (error) {
+        console.error(`Failed to ${label} window:`, error);
+    }
+}
+
 document.addEventListener('DOMContentLoaded', () => {
     setupInputContextMenu();
 
@@ -18,10 +26,10 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     document.getElementById('close-window')?.addEventListener('click', () => {
-        getCurrentWindow().close();
+        void runWindowAction(() => getCurrentWindow().close(), 'close');
     });
     document.getElementById('minimize-window')?.addEventListener('click', () => {
-        getCurrentWindow().minimize();
+        void runWindowAction(() => getCurrentWindow().minimize(), 'minimize');
     });
 
     const settingsButton = document.getElementById('settings-button');

@@ -1,6 +1,6 @@
 [package]
 name = "zhekarikstrike_launcher"
-version = "1.6.7"
+version = "1.6.8"
 description = "ZHEKARIK STRIKE Launcher"
 authors = ["d3affy"]
 edition = "2021"
