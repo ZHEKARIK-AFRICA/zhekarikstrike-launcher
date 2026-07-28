@@ -10,15 +10,15 @@ This change does not add a metadata cache or a new quick-check mode. Pre-launch 
 
 `verify_service` currently walks the manifest and awaits `sha256_file` for every file in sequence. The current client is roughly 18.2 GiB across 3,596 manifest files; about 17.3 GiB is concentrated in 203 files of at least 8 MiB. Sequential hashing is appropriate for an HDD, but leaves SSD/NVMe queue depth and multiple CPU cores unused.
 
-## Storage-aware limits
+## Worker limits
 
-The launcher resolves the disk containing `game_path` using `sysinfo::Disks` and the longest matching mount point.
+The launcher does not classify the storage device. USB enclosures, RAID, virtual disks, and some drivers report media type unreliably, so concurrency is learned from measured throughput instead.
 
-- HDD: initial 1, maximum 1. It never trials parallel reads.
-- SSD: initial 2, maximum `clamp(logical_cpu_count / 2, 2, 6)`.
-- Unknown storage: initial 1, maximum 2. This permits a conservative trial for devices whose seek-penalty information is unavailable.
+- Every verification starts with one worker.
+- Maximum concurrency is `clamp(logical_cpu_count / 2, 1, 6)`.
+- The controller trials one additional worker at a time and keeps it only when measured throughput improves enough to justify the additional disk and CPU load.
 
-Failure to detect the disk is non-fatal and uses the Unknown profile. Detection and every controller limit change are written to the local launcher log.
+Every trial, accepted limit, rollback, and CPU-driven downshift is written to the local launcher log.
 
 ## Verification pipeline
 
@@ -40,15 +40,17 @@ Missing files and hash mismatches continue through the existing verified downloa
 
 ## Adaptive controller
 
-The controller samples every 10 seconds using aggregate verified bytes and `sysinfo` CPU usage.
+The controller samples every 5 seconds using aggregate verified bytes and `sysinfo` CPU usage. A window must process at least 64 MiB before it can change the limit; smaller windows are ignored so file-open noise does not drive decisions.
 
-- With stable throughput, CPU below 80%, and pending work, increase concurrency by one up to the storage/CPU cap.
-- After a trial increase, if throughput falls by more than 10%, return to the previous limit and enter a 30-second cooldown.
-- If CPU exceeds 90%, decrease concurrency by one and enter cooldown.
+- With CPU below 80% and pending work, trial one additional worker up to the CPU cap.
+- Accept a trial only when throughput improves by at least 5% over the preceding valid window.
+- If a trial improves throughput by less than 5% or reduces it, return to the previous limit. A reduction greater than 10% is logged as a regression.
+- If CPU exceeds 90%, decrease concurrency by one.
+- Every rollback or CPU-driven downshift starts a 30-second cooldown before another upward trial.
 - During cooldown no new trial increase is attempted.
-- Tiny checks that finish before a full observation window retain their initial limit.
+- Tiny checks that never produce two valid observation windows retain one worker.
 
-Throughput comparison is made only when both windows processed enough bytes to avoid reacting to file-open noise. The controller is a pure state machine so its boundaries can be tested without reading the full client.
+The controller compares only adjacent valid windows. It remains a pure state machine so its boundaries can be tested without reading the full client. It deliberately does not persist a learned value between operations because storage load and available CPU can change.
 
 ## Progress
 
@@ -58,19 +60,17 @@ ETA uses aggregate verified bytes per second. Download/repair progress continues
 
 ## Error handling and compatibility
 
-- Storage detection failure falls back to Unknown and never blocks verification.
 - Metadata/read/hash failures preserve the existing structured `AppError` behavior.
 - Excluded paths remain existence-checked but are not hashed, matching current behavior.
 - `AdditionalOnly` uses the same scheduler but normally finishes with its small manifest before adaptation matters.
-- The implementation is Windows-oriented, consistent with the launcher's supported platform, but storage classification is isolated behind a small function.
 - Because `1.6.7` is already published, the implementation prepares launcher version `1.6.8`; publication is a separate explicit action.
 
 ## Tests and verification
 
 Keep Rust coverage focused:
 
-- HDD/SSD/Unknown worker limits;
-- stable increase, regression rollback, CPU downshift, and cooldown;
+- CPU-derived maximum worker limits;
+- successful trial acceptance, insufficient-gain rollback, regression rollback, CPU downshift, minimum sample size, and cooldown;
 - bounded scheduler cancellation and mismatch collection using small temporary files.
 
 Run tests once after the implementation batch:
