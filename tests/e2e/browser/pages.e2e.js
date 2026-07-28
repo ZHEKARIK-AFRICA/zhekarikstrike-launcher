@@ -158,7 +158,7 @@ describe('Tauri renderer pages in browser mode', () => {
         await expectModalMessage('update unavailable');
     });
 
-    it('handles updater success and allows continuing after a damaged artifact', async () => {
+    it('handles updater success and acknowledges failure without bypassing the update', async () => {
         let mocks = await openWithMocks('launcher_update.html', {
             get_language: { value: 'en' },
             download_launcher_update: { value: null },
@@ -176,6 +176,10 @@ describe('Tauri renderer pages in browser mode', () => {
             }
         });
         await expectModalMessage('signature mismatch');
-        await expect($('#continue-without-update')).toBeDisplayed();
+        expect(await $('#continue-without-update').isExisting()).toBe(false);
+        await $('#error-modal-ok').click();
+        await browser.waitUntil(async () =>
+            (await $('#error-modal').getCSSProperty('display')).value === 'none'
+        );
     });
 });

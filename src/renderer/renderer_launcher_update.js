@@ -3,22 +3,10 @@ import { invoke } from '@tauri-apps/api/core';
 import { initializeLanguage, t } from '../localization/i18n.js';
 import { errorMessage } from './errors.js';
 import { waitForE2eReady } from './e2e.js';
-import { handleError, updateProgressBar, updateStatus } from './common.js';
+import { handleError, setupErrorModal, updateProgressBar, updateStatus } from './common.js';
 import { listenUntilPageHide } from './event-listener.js';
-import { navigateToPage } from './navigation.js';
 
-function ensureContinueButton() {
-    let button = document.getElementById('continue-without-update');
-    if (button) return button;
-    button = document.createElement('button');
-    button.id = 'continue-without-update';
-    button.className = 'modal-ok';
-    button.type = 'button';
-    button.textContent = 'продолжить без обновления';
-    button.addEventListener('click', () => navigateToPage('./public/intro.html'));
-    document.querySelector('footer')?.appendChild(button);
-    return button;
-}
+setupErrorModal();
 
 document.addEventListener('DOMContentLoaded', async () => {
     try {
@@ -29,7 +17,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         updateStatus('complete', 'progress-status');
         await invoke('apply_launcher_update');
     } catch (error) {
-        ensureContinueButton();
         handleError(null, `${t('stageMessages.error')}: ${errorMessage(error)}`);
     }
 });
