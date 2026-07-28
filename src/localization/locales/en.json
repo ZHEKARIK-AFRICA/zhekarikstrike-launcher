@@ -36,6 +36,7 @@
     "no_updates_available": "No updates available. Launching main window...",
     "stageMessages": {
         "checking": "checking...",
+        "install": "downloading and installing...",
         "update": "updating...",
         "extract": "installing...",
         "verify": "verifying...",

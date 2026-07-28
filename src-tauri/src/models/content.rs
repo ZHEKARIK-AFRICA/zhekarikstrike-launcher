@@ -69,6 +69,66 @@ pub struct ContentManifest {
     pub files: Vec<ContentFile>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentMirrorIndex {
+    pub schema_version: u8,
+    pub content_sha256: String,
+    pub source: String,
+    pub initial_concurrency: usize,
+    pub max_concurrency: usize,
+    pub chunks: HashMap<String, String>,
+}
+
+impl ContentMirrorIndex {
+    pub fn validate(&self, manifest: &ContentManifest) -> Result<(), AppError> {
+        if self.schema_version != 1
+            || self.source != "google_drive"
+            || self.content_sha256 != manifest.content_sha256
+            || !(1..=8).contains(&self.initial_concurrency)
+            || !(self.initial_concurrency..=8).contains(&self.max_concurrency)
+        {
+            return invalid("invalid Google Drive content mirror settings");
+        }
+
+        let expected = manifest
+            .chunks
+            .values()
+            .map(|chunk| chunk.compressed_sha256.as_str())
+            .collect::<HashSet<_>>();
+        if self.chunks.len() != expected.len()
+            || self
+                .chunks
+                .keys()
+                .any(|compressed_sha| !expected.contains(compressed_sha.as_str()))
+        {
+            return invalid("Google Drive content mirror closure is invalid");
+        }
+        for (compressed_sha, file_id) in &self.chunks {
+            validate_sha256(compressed_sha, "mirrored compressed chunk")?;
+            if !(10..=128).contains(&file_id.len())
+                || !file_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            {
+                return invalid("invalid Google Drive content file identifier");
+            }
+        }
+        Ok(())
+    }
+
+    pub fn chunk_url(&self, compressed_sha256: &str) -> Result<String, AppError> {
+        validate_sha256(compressed_sha256, "mirrored compressed chunk")?;
+        let file_id = self
+            .chunks
+            .get(compressed_sha256)
+            .ok_or_else(|| AppError::InvalidData("missing Google Drive content chunk".into()))?;
+        Ok(format!(
+            "https://drive.usercontent.google.com/download?id={file_id}&export=download"
+        ))
+    }
+}
+
 impl ContentManifest {
     pub fn validate(&self) -> Result<(), AppError> {
         if self.schema_version != 2 {

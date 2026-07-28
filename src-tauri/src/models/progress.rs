@@ -7,6 +7,7 @@ use crate::error::AppError;
 #[serde(rename_all = "kebab-case")]
 pub enum ProgressStage {
     Checking,
+    Install,
     Download,
     Extract,
     Verify,

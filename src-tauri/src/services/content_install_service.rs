@@ -1,23 +1,28 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use futures_util::{stream, StreamExt};
 use sha2::{Digest, Sha256};
+use sysinfo::System;
 use tauri::AppHandle;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::watch;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::models::{
-    ContentChunk, ContentFile, ContentManifest, ProgressEmitter, ProgressPayload, ProgressStage,
+    ContentChunk, ContentFile, ContentManifest, ContentMirrorIndex, ProgressEmitter,
+    ProgressPayload, ProgressStage,
 };
 use crate::services::api_client::ApiClient;
 use crate::services::config_service;
 use crate::services::content_download_service::{
-    decode_verified_chunk, download_content_chunk, read_verified_local_chunk,
-    verified_compressed_file,
+    decode_verified_chunk, download_content_chunk_with_fallback, read_verified_local_chunk,
+    verified_compressed_file, DriveCircuitBreaker,
 };
 use crate::services::content_journal_service::{
     atomic_json, backup_path, cleanup_transaction, content_root, journal_path,
@@ -30,7 +35,144 @@ use crate::utils::hash_utils::sha256_file;
 use crate::utils::path_utils::safe_join;
 
 const INSTALL_SAFETY_RESERVE: u64 = 2 * 1024 * 1024 * 1024;
-const MATERIALIZATION_CONCURRENCY: usize = 2;
+const DOWNLOAD_CONTROL_WINDOW: Duration = Duration::from_secs(10);
+const DOWNLOAD_READY_BACKLOG_LIMIT: u64 = 256 * 1024 * 1024;
+const MATERIALIZER_MEMORY_RESERVE: u64 = 1024 * 1024 * 1024;
+const MATERIALIZER_MEMORY_PER_WORKER: u64 = 256 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+pub(crate) enum ChunkReadiness {
+    Pending,
+    Ready,
+    Failed(String),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AdaptiveDownloadController {
+    current: usize,
+    max: usize,
+    trial_baseline: Option<f64>,
+    cooldown_windows: u8,
+}
+
+impl AdaptiveDownloadController {
+    pub(crate) fn new(initial: usize, max: usize) -> Self {
+        Self {
+            current: initial.clamp(1, max.max(1)),
+            max: max.max(1),
+            trial_baseline: None,
+            cooldown_windows: 0,
+        }
+    }
+
+    pub(crate) fn current(&self) -> usize {
+        self.current
+    }
+
+    pub(crate) fn observe_window(
+        &mut self,
+        throughput: f64,
+        had_error: bool,
+        throttled: bool,
+        ready_backlog: u64,
+    ) {
+        let previous = self.current;
+        if had_error || throttled {
+            self.current = (self.current / 2).max(1);
+            self.trial_baseline = None;
+            self.cooldown_windows = 3;
+        } else if self
+            .trial_baseline
+            .is_some_and(|baseline| throughput < baseline * 0.9)
+        {
+            self.current = self.current.saturating_sub(1).max(1);
+            self.trial_baseline = None;
+            self.cooldown_windows = 3;
+        } else if self.cooldown_windows > 0 {
+            self.cooldown_windows -= 1;
+            self.trial_baseline = None;
+        } else if self.current < self.max && ready_backlog < DOWNLOAD_READY_BACKLOG_LIMIT {
+            self.trial_baseline = Some(throughput);
+            self.current += 1;
+        } else {
+            self.trial_baseline = None;
+        }
+        if previous != self.current {
+            crate::logger::info(&format!(
+                "content download concurrency changed from {previous} to {}",
+                self.current
+            ));
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AdaptiveMaterializerController {
+    current: usize,
+    max: usize,
+    trial_baseline: Option<f64>,
+    cooldown_windows: u8,
+}
+
+impl AdaptiveMaterializerController {
+    fn new(initial: usize, max: usize) -> Self {
+        Self {
+            current: initial.clamp(1, max.max(1)),
+            max: max.max(1),
+            trial_baseline: None,
+            cooldown_windows: 0,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        throughput: f64,
+        cpu_percent: f32,
+        available_memory: u64,
+        wait_ratio: f64,
+    ) {
+        let previous = self.current;
+        if cpu_percent > 90.0 || available_memory < 512 * 1024 * 1024 {
+            self.current = self.current.saturating_sub(1).max(1);
+            self.trial_baseline = None;
+            self.cooldown_windows = 3;
+        } else if self
+            .trial_baseline
+            .is_some_and(|baseline| throughput < baseline * 0.9)
+        {
+            self.current = self.current.saturating_sub(1).max(1);
+            self.trial_baseline = None;
+            self.cooldown_windows = 3;
+        } else if self.cooldown_windows > 0 {
+            self.cooldown_windows -= 1;
+        } else if self.current < self.max
+            && wait_ratio < 0.2
+            && cpu_percent < 80.0
+            && available_memory > MATERIALIZER_MEMORY_RESERVE
+        {
+            self.trial_baseline = Some(throughput);
+            self.current += 1;
+        }
+        if previous != self.current {
+            crate::logger::info(&format!(
+                "content materializer concurrency changed from {previous} to {}",
+                self.current
+            ));
+        }
+    }
+}
+
+pub(crate) fn materializer_worker_limits(
+    logical_cpu_count: usize,
+    available_memory: u64,
+) -> (usize, usize) {
+    let cpu_cap = (logical_cpu_count / 2).clamp(1, 6);
+    let memory_cap = (available_memory.saturating_sub(MATERIALIZER_MEMORY_RESERVE)
+        / MATERIALIZER_MEMORY_PER_WORKER)
+        .clamp(1, 6) as usize;
+    let maximum = cpu_cap.min(memory_cap).max(1);
+    (2.min(maximum), maximum)
+}
 
 #[derive(Clone)]
 struct LocalChunkSource {
@@ -43,6 +185,93 @@ struct PreparedFile {
     file: ContentFile,
     had_original: bool,
     original_size: u64,
+}
+
+struct PipelineProgressState {
+    started: Instant,
+    downloaded: u64,
+    materialized: u64,
+    last_progress: f64,
+}
+
+#[derive(Clone)]
+struct PipelineProgress {
+    emitter: ProgressEmitter,
+    download_total: u64,
+    materialize_total: u64,
+    state: Arc<Mutex<PipelineProgressState>>,
+}
+
+impl PipelineProgress {
+    fn new(emitter: ProgressEmitter, download_total: u64, materialize_total: u64) -> Self {
+        Self {
+            emitter,
+            download_total,
+            materialize_total,
+            state: Arc::new(Mutex::new(PipelineProgressState {
+                started: Instant::now(),
+                downloaded: 0,
+                materialized: 0,
+                last_progress: 0.0,
+            })),
+        }
+    }
+
+    fn add_downloaded(&self, bytes: u64) -> Result<(), AppError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("content progress mutex should not be poisoned");
+        state.downloaded = state.downloaded.saturating_add(bytes);
+        self.emit_locked(&mut state, None)
+    }
+
+    fn add_materialized(&self, bytes: u64, current_file: &str) -> Result<(), AppError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("content progress mutex should not be poisoned");
+        state.materialized = state.materialized.saturating_add(bytes);
+        self.emit_locked(&mut state, Some(current_file.to_string()))
+    }
+
+    fn emit_locked(
+        &self,
+        state: &mut PipelineProgressState,
+        current_file: Option<String>,
+    ) -> Result<(), AppError> {
+        let work_total = self
+            .download_total
+            .saturating_add(self.materialize_total)
+            .max(1);
+        let completed = state.downloaded.saturating_add(state.materialized);
+        let calculated = completed as f64 / work_total as f64 * 100.0;
+        state.last_progress = state.last_progress.max(calculated).min(99.9);
+        let elapsed = state.started.elapsed().as_secs_f64().max(0.001);
+        let network_speed = state.downloaded as f64 / elapsed;
+        let materialize_speed = state.materialized as f64 / elapsed;
+        let network_eta = if network_speed > 0.0 {
+            self.download_total.saturating_sub(state.downloaded) as f64 / network_speed
+        } else {
+            0.0
+        };
+        let materialize_eta = if materialize_speed > 0.0 {
+            self.materialize_total.saturating_sub(state.materialized) as f64 / materialize_speed
+        } else {
+            0.0
+        };
+        let mut payload = ProgressPayload::new(
+            self.emitter.operation_id().to_string(),
+            ProgressStage::Install,
+        );
+        payload.progress = Some(state.last_progress);
+        payload.current_file = current_file;
+        payload.downloaded_bytes = Some(state.downloaded);
+        payload.total_bytes = Some(self.download_total);
+        payload.speed_bytes_per_sec = Some(network_speed);
+        payload.time_remaining_sec = Some(network_eta.max(materialize_eta));
+        self.emitter.emit(payload)
+    }
 }
 
 pub fn required_content_install_bytes(
@@ -115,6 +344,15 @@ pub async fn install_or_update_content(
     operation_id: String,
 ) -> Result<(), AppError> {
     manifest.validate()?;
+    let mirror = match api.get_content_drive_mirror(&manifest).await {
+        Ok(mirror) => mirror,
+        Err(error) => {
+            crate::logger::warn(&format!(
+                "optional Google Drive content mirror is unavailable; using Oracle ({error})"
+            ));
+            None
+        }
+    };
     recover_pending_content(&game_path).await?;
     tokio::fs::create_dir_all(&game_path).await?;
 
@@ -192,17 +430,6 @@ pub async fn install_or_update_content(
     )?;
     ensure_disk_space(&game_path, required_bytes)?;
 
-    download_missing_chunks(
-        &api,
-        &manifest,
-        &required_raw,
-        &available,
-        &chunk_directory,
-        &progress,
-        cancel.clone(),
-    )
-    .await?;
-
     let transaction_id = Uuid::new_v4().to_string();
     let entries = prepared
         .iter()
@@ -222,9 +449,13 @@ pub async fn install_or_update_content(
     write_journal(&game_path, &journal).await?;
 
     let staging = staging_path(&game_path, &transaction_id);
-    let materialize_result = materialize_files(
+    let pipeline_result = run_content_pipeline(
+        &api,
         prepared.clone(),
         Arc::new(manifest.clone()),
+        mirror.map(Arc::new),
+        required_raw,
+        available,
         Arc::new(local_sources),
         chunk_directory.clone(),
         staging.clone(),
@@ -232,7 +463,7 @@ pub async fn install_or_update_content(
         cancel.clone(),
     )
     .await;
-    if let Err(error) = materialize_result {
+    if let Err(error) = pipeline_result {
         cleanup_transaction(&game_path, &transaction_id).await.ok();
         remove_file_if_exists(&journal_path(&game_path)).await.ok();
         return Err(error);
@@ -412,151 +643,371 @@ fn add_manifest_sources(
     Ok(())
 }
 
-async fn download_missing_chunks(
+#[allow(clippy::too_many_arguments)]
+async fn run_content_pipeline(
     api: &ApiClient,
-    manifest: &ContentManifest,
-    required_raw: &HashSet<String>,
-    available: &HashSet<String>,
-    chunk_directory: &Path,
-    progress: &ProgressEmitter,
-    cancel: CancellationToken,
-) -> Result<(), AppError> {
-    let tasks = required_raw
-        .iter()
-        .filter(|raw_sha| !available.contains(*raw_sha))
-        .map(|raw_sha| {
-            let chunk = manifest
-                .chunks
-                .get(raw_sha)
-                .expect("validated manifest contains every chunk")
-                .clone();
-            (raw_sha.clone(), chunk)
-        })
-        .collect::<Vec<_>>();
-    if tasks.is_empty() {
-        return Ok(());
-    }
-    progress.emit_stage(ProgressStage::Download, Some(0.0), None)?;
-    let total = tasks
-        .iter()
-        .map(|(_, chunk)| chunk.compressed_size)
-        .sum::<u64>();
-    let batch_cancel = cancel.child_token();
-    let client = api.http().clone();
-    let base = manifest.delivery.chunk_base_url.clone();
-    let concurrency = manifest.delivery.recommended_concurrency;
-    let directory = chunk_directory.to_path_buf();
-    let mut downloads = stream::iter(tasks.into_iter().map(|(_, chunk)| {
-        let client = client.clone();
-        let url = format!("{base}/{}.zst", chunk.compressed_sha256);
-        let target = compressed_chunk_path(&directory, &chunk);
-        let token = batch_cancel.clone();
-        async move {
-            let size = chunk.compressed_size;
-            (
-                size,
-                download_content_chunk(&client, &url, &target, &chunk, token).await,
-            )
-        }
-    }))
-    .buffer_unordered(concurrency);
-    let mut completed = 0_u64;
-    let mut first_error = None;
-    while let Some((size, result)) = downloads.next().await {
-        match result {
-            Ok(()) if first_error.is_none() => {
-                completed = completed.saturating_add(size);
-                let mut payload = ProgressPayload::new(
-                    progress.operation_id().to_string(),
-                    ProgressStage::Download,
-                );
-                payload.downloaded_bytes = Some(completed);
-                payload.total_bytes = Some(total);
-                payload.progress = Some(completed as f64 / total.max(1) as f64 * 100.0);
-                progress.emit(payload)?;
-            }
-            Err(error) if first_error.is_none() => {
-                batch_cancel.cancel();
-                first_error = Some(error);
-            }
-            _ => {}
-        }
-    }
-    if cancel.is_cancelled() {
-        return Err(AppError::Canceled);
-    }
-    if let Some(error) = first_error {
-        return Err(error);
-    }
-    Ok(())
-}
-
-async fn materialize_files(
     prepared: Vec<PreparedFile>,
     manifest: Arc<ContentManifest>,
+    mirror: Option<Arc<ContentMirrorIndex>>,
+    required_raw: HashSet<String>,
+    available: HashSet<String>,
     local_sources: Arc<HashMap<String, LocalChunkSource>>,
     chunk_directory: PathBuf,
     staging: PathBuf,
-    progress: ProgressEmitter,
+    emitter: ProgressEmitter,
     cancel: CancellationToken,
 ) -> Result<(), AppError> {
-    progress.emit_stage(ProgressStage::Extract, Some(0.0), None)?;
-    let total = prepared.len().max(1);
-    let batch_cancel = cancel.child_token();
-    let mut work = stream::iter(prepared.into_iter().map(|prepared| {
-        let manifest = manifest.clone();
-        let sources = local_sources.clone();
-        let chunks = chunk_directory.clone();
-        let staging = staging.clone();
-        let token = batch_cancel.clone();
-        async move {
-            let path = prepared.file.path.clone();
-            let result = materialize_file(
-                &prepared.file,
-                &manifest,
-                &sources,
-                &chunks,
-                &staging,
-                token,
-            )
-            .await;
-            (path, result)
-        }
-    }))
-    .buffer_unordered(MATERIALIZATION_CONCURRENCY);
-    let mut completed = 0_usize;
-    let mut first_error = None;
-    while let Some((path, result)) = work.next().await {
-        match result {
-            Ok(()) if first_error.is_none() => {
-                completed += 1;
-                progress.emit_stage(
-                    ProgressStage::Extract,
-                    Some(completed as f64 / total as f64 * 100.0),
-                    Some(path),
-                )?;
+    let downloads = ordered_missing_chunks(&prepared, &manifest, &available)?;
+    let download_total = downloads
+        .iter()
+        .map(|(_, chunk)| chunk.compressed_size)
+        .sum::<u64>();
+    let materialize_total = prepared.iter().try_fold(0_u64, |total, prepared| {
+        total
+            .checked_add(prepared.file.size)
+            .ok_or_else(|| AppError::InvalidData("content pipeline size overflow".into()))
+    })?;
+    emitter.emit_stage(ProgressStage::Install, Some(0.0), None)?;
+    let progress = PipelineProgress::new(emitter, download_total, materialize_total);
+
+    let mut readiness = HashMap::new();
+    for raw_sha in required_raw {
+        let state = if available.contains(&raw_sha) {
+            ChunkReadiness::Ready
+        } else {
+            ChunkReadiness::Pending
+        };
+        let (sender, _) = watch::channel(state);
+        readiness.insert(raw_sha, sender);
+    }
+    let readiness = Arc::new(readiness);
+    let ready_backlog = Arc::new(AtomicU64::new(0));
+    let consumed_chunks = Arc::new(Mutex::new(HashSet::new()));
+    let pipeline_cancel = cancel.child_token();
+
+    let download_future = download_pipeline(
+        api.clone(),
+        downloads,
+        manifest.clone(),
+        mirror,
+        chunk_directory.clone(),
+        readiness.clone(),
+        ready_backlog.clone(),
+        progress.clone(),
+        pipeline_cancel.clone(),
+    );
+    let materialize_future = materialize_pipeline(
+        prepared,
+        manifest,
+        local_sources,
+        chunk_directory,
+        staging,
+        readiness,
+        ready_backlog,
+        consumed_chunks,
+        progress,
+        pipeline_cancel.clone(),
+    );
+    let (download_result, materialize_result) = tokio::join!(download_future, materialize_future);
+    if cancel.is_cancelled() {
+        return Err(AppError::Canceled);
+    }
+    match (download_result, materialize_result) {
+        (Err(error), _) if !matches!(error, AppError::Canceled) => Err(error),
+        (_, Err(error)) if !matches!(error, AppError::Canceled) => Err(error),
+        (Err(error), _) => Err(error),
+        (_, result) => result,
+    }
+}
+
+fn ordered_missing_chunks(
+    prepared: &[PreparedFile],
+    manifest: &ContentManifest,
+    available: &HashSet<String>,
+) -> Result<Vec<(String, ContentChunk)>, AppError> {
+    let mut seen = HashSet::new();
+    let mut ordered = Vec::new();
+    for prepared in prepared {
+        for raw_sha in &prepared.file.chunks {
+            if available.contains(raw_sha) || !seen.insert(raw_sha.clone()) {
+                continue;
             }
-            Err(error) if first_error.is_none() => {
-                batch_cancel.cancel();
-                first_error = Some(error);
-            }
-            _ => {}
+            let chunk = manifest
+                .chunks
+                .get(raw_sha)
+                .ok_or_else(|| AppError::InvalidData("content chunk closure changed".into()))?;
+            ordered.push((raw_sha.clone(), chunk.clone()));
         }
     }
-    if cancel.is_cancelled() {
+    Ok(ordered)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn download_pipeline(
+    api: ApiClient,
+    downloads: Vec<(String, ContentChunk)>,
+    manifest: Arc<ContentManifest>,
+    mirror: Option<Arc<ContentMirrorIndex>>,
+    chunk_directory: PathBuf,
+    readiness: Arc<HashMap<String, watch::Sender<ChunkReadiness>>>,
+    ready_backlog: Arc<AtomicU64>,
+    progress: PipelineProgress,
+    cancel: CancellationToken,
+) -> Result<(), AppError> {
+    let (initial, maximum) = mirror.as_ref().map_or(
+        (
+            manifest.delivery.recommended_concurrency,
+            manifest.delivery.recommended_concurrency,
+        ),
+        |mirror| (mirror.initial_concurrency, mirror.max_concurrency),
+    );
+    let mut controller = AdaptiveDownloadController::new(initial, maximum);
+    let circuit = DriveCircuitBreaker::default();
+    let mut pending = VecDeque::from(downloads);
+    let mut running = JoinSet::new();
+    let mut first_error = None;
+    let mut window_started = Instant::now();
+    let mut window_bytes = 0_u64;
+    let mut window_had_error = false;
+    let mut window_throttled = false;
+
+    loop {
+        while first_error.is_none() && running.len() < controller.current() {
+            let Some((raw_sha, chunk)) = pending.pop_front() else {
+                break;
+            };
+            let drive_url = mirror
+                .as_ref()
+                .map(|mirror| mirror.chunk_url(&chunk.compressed_sha256))
+                .transpose()?;
+            let oracle_url = format!(
+                "{}/{}.zst",
+                manifest.delivery.chunk_base_url, chunk.compressed_sha256
+            );
+            let target = compressed_chunk_path(&chunk_directory, &chunk);
+            let task_api = api.clone();
+            let task_circuit = circuit.clone();
+            let task_cancel = cancel.clone();
+            running.spawn(async move {
+                let result = download_content_chunk_with_fallback(
+                    task_api.direct_http(),
+                    task_api.http(),
+                    drive_url.as_deref(),
+                    &oracle_url,
+                    &target,
+                    &chunk,
+                    &task_circuit,
+                    task_cancel,
+                )
+                .await;
+                (raw_sha, chunk, result)
+            });
+        }
+        if running.is_empty() {
+            break;
+        }
+        let joined = if first_error.is_some() {
+            running.join_next().await
+        } else {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    first_error = Some(AppError::Canceled);
+                    pending.clear();
+                    running.join_next().await
+                }
+                joined = running.join_next() => joined,
+            }
+        };
+        let Some(joined) = joined else {
+            break;
+        };
+        let (raw_sha, chunk, result) = joined
+            .map_err(|error| AppError::Unknown(format!("content download task failed: {error}")))?;
+        match result {
+            Ok(report) if first_error.is_none() => {
+                ready_backlog.fetch_add(chunk.compressed_size, Ordering::Relaxed);
+                readiness
+                    .get(&raw_sha)
+                    .ok_or_else(|| AppError::InvalidData("missing chunk readiness state".into()))?
+                    .send_replace(ChunkReadiness::Ready);
+                progress.add_downloaded(report.network_bytes)?;
+                window_bytes = window_bytes.saturating_add(report.network_bytes);
+                window_had_error |= report.drive_failed;
+                window_throttled |= report.drive_throttled;
+                if report.drive_throttled {
+                    let elapsed = window_started.elapsed().as_secs_f64().max(0.001);
+                    controller.observe_window(
+                        window_bytes as f64 / elapsed,
+                        true,
+                        true,
+                        ready_backlog.load(Ordering::Relaxed),
+                    );
+                    window_started = Instant::now();
+                    window_bytes = 0;
+                    window_had_error = false;
+                    window_throttled = false;
+                }
+            }
+            Ok(_) => {}
+            Err(error) if first_error.is_none() => {
+                if let Some(sender) = readiness.get(&raw_sha) {
+                    sender.send_replace(ChunkReadiness::Failed(error.to_string()));
+                }
+                first_error = Some(error);
+                pending.clear();
+                cancel.cancel();
+            }
+            Err(_) => {}
+        }
+        if window_started.elapsed() >= DOWNLOAD_CONTROL_WINDOW {
+            let elapsed = window_started.elapsed().as_secs_f64().max(0.001);
+            controller.observe_window(
+                window_bytes as f64 / elapsed,
+                window_had_error,
+                window_throttled,
+                ready_backlog.load(Ordering::Relaxed),
+            );
+            window_started = Instant::now();
+            window_bytes = 0;
+            window_had_error = false;
+            window_throttled = false;
+        }
+    }
+    if cancel.is_cancelled() && first_error.is_none() {
         return Err(AppError::Canceled);
     }
     first_error.map_or(Ok(()), Err)
 }
 
+struct MaterializeReport {
+    bytes: u64,
+    waited: Duration,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn materialize_pipeline(
+    prepared: Vec<PreparedFile>,
+    manifest: Arc<ContentManifest>,
+    local_sources: Arc<HashMap<String, LocalChunkSource>>,
+    chunk_directory: PathBuf,
+    staging: PathBuf,
+    readiness: Arc<HashMap<String, watch::Sender<ChunkReadiness>>>,
+    ready_backlog: Arc<AtomicU64>,
+    consumed_chunks: Arc<Mutex<HashSet<String>>>,
+    progress: PipelineProgress,
+    cancel: CancellationToken,
+) -> Result<(), AppError> {
+    let logical_cpus = std::thread::available_parallelism().map_or(1, usize::from);
+    let mut system = System::new_all();
+    let (initial, maximum) = materializer_worker_limits(logical_cpus, system.available_memory());
+    let mut controller = AdaptiveMaterializerController::new(initial, maximum);
+    let mut pending = VecDeque::from(prepared);
+    let mut running = JoinSet::new();
+    let mut first_error = None;
+    let mut window_started = Instant::now();
+    let mut window_bytes = 0_u64;
+    let mut window_waited = Duration::ZERO;
+
+    loop {
+        while first_error.is_none() && running.len() < controller.current {
+            let Some(prepared) = pending.pop_front() else {
+                break;
+            };
+            let task_manifest = manifest.clone();
+            let task_sources = local_sources.clone();
+            let task_chunks = chunk_directory.clone();
+            let task_staging = staging.clone();
+            let task_readiness = readiness.clone();
+            let task_backlog = ready_backlog.clone();
+            let task_consumed = consumed_chunks.clone();
+            let task_progress = progress.clone();
+            let task_cancel = cancel.clone();
+            running.spawn(async move {
+                let path = prepared.file.path.clone();
+                let result = materialize_file(
+                    &prepared.file,
+                    &task_manifest,
+                    &task_sources,
+                    &task_chunks,
+                    &task_staging,
+                    &task_readiness,
+                    &task_backlog,
+                    &task_consumed,
+                    &task_progress,
+                    task_cancel,
+                )
+                .await;
+                (path, result)
+            });
+        }
+        if running.is_empty() {
+            break;
+        }
+        let joined = if first_error.is_some() {
+            running.join_next().await
+        } else {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    first_error = Some(AppError::Canceled);
+                    pending.clear();
+                    running.join_next().await
+                }
+                joined = running.join_next() => joined,
+            }
+        };
+        let Some(joined) = joined else {
+            break;
+        };
+        let (_, result) = joined.map_err(|error| {
+            AppError::Unknown(format!("content materializer task failed: {error}"))
+        })?;
+        match result {
+            Ok(report) if first_error.is_none() => {
+                window_bytes = window_bytes.saturating_add(report.bytes);
+                window_waited = window_waited.saturating_add(report.waited);
+            }
+            Ok(_) => {}
+            Err(error) if first_error.is_none() => {
+                first_error = Some(error);
+                pending.clear();
+                cancel.cancel();
+            }
+            Err(_) => {}
+        }
+        if window_started.elapsed() >= DOWNLOAD_CONTROL_WINDOW {
+            let elapsed = window_started.elapsed().as_secs_f64().max(0.001);
+            system.refresh_cpu_usage();
+            system.refresh_memory();
+            controller.observe(
+                window_bytes as f64 / elapsed,
+                system.global_cpu_usage(),
+                system.available_memory(),
+                (window_waited.as_secs_f64() / elapsed / controller.current as f64).min(1.0),
+            );
+            window_started = Instant::now();
+            window_bytes = 0;
+            window_waited = Duration::ZERO;
+        }
+    }
+    if cancel.is_cancelled() && first_error.is_none() {
+        return Err(AppError::Canceled);
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn materialize_file(
     file: &ContentFile,
     manifest: &ContentManifest,
     local_sources: &HashMap<String, LocalChunkSource>,
     chunk_directory: &Path,
     staging: &Path,
+    readiness: &HashMap<String, watch::Sender<ChunkReadiness>>,
+    ready_backlog: &AtomicU64,
+    consumed_chunks: &Mutex<HashSet<String>>,
+    progress: &PipelineProgress,
     cancel: CancellationToken,
-) -> Result<(), AppError> {
+) -> Result<MaterializeReport, AppError> {
     let target = safe_join(staging, &file.path)?;
     if let Some(parent) = target.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -564,6 +1015,7 @@ async fn materialize_file(
     let mut output = tokio::fs::File::create(&target).await?;
     let mut hasher = Sha256::new();
     let mut written = 0_u64;
+    let mut waited = Duration::ZERO;
     for raw_sha in &file.chunks {
         if cancel.is_cancelled() {
             return Err(AppError::Canceled);
@@ -577,14 +1029,45 @@ async fn materialize_file(
                 .await?
                 .ok_or_else(|| AppError::InvalidData("reused local content chunk changed".into()))?
         } else {
+            waited = waited.saturating_add(
+                wait_until_chunk_ready(
+                    readiness
+                        .get(raw_sha)
+                        .ok_or_else(|| {
+                            AppError::InvalidData("missing chunk readiness state".into())
+                        })?
+                        .subscribe(),
+                    &cancel,
+                )
+                .await?,
+            );
+            let first_consumer = consumed_chunks
+                .lock()
+                .expect("consumed chunk mutex should not be poisoned")
+                .insert(raw_sha.clone());
+            if first_consumer {
+                ready_backlog.fetch_sub(
+                    chunk
+                        .compressed_size
+                        .min(ready_backlog.load(Ordering::Relaxed)),
+                    Ordering::Relaxed,
+                );
+            }
             let compressed = tokio::fs::read(compressed_chunk_path(chunk_directory, chunk)).await?;
-            decode_verified_chunk(&compressed, raw_sha, chunk)?
+            let expected_raw = raw_sha.clone();
+            let owned_chunk = chunk.clone();
+            tokio::task::spawn_blocking(move || {
+                decode_verified_chunk(&compressed, &expected_raw, &owned_chunk)
+            })
+            .await
+            .map_err(|error| AppError::Unknown(format!("zstd worker failed: {error}")))??
         };
         output.write_all(&raw).await?;
         hasher.update(&raw);
         written = written
             .checked_add(raw.len() as u64)
             .ok_or_else(|| AppError::InvalidData("materialized content size overflow".into()))?;
+        progress.add_materialized(raw.len() as u64, &file.path)?;
     }
     output.flush().await?;
     output.sync_all().await?;
@@ -594,7 +1077,32 @@ async fn materialize_file(
             file.path
         )));
     }
-    Ok(())
+    Ok(MaterializeReport {
+        bytes: written,
+        waited,
+    })
+}
+
+pub(crate) async fn wait_until_chunk_ready(
+    mut readiness: watch::Receiver<ChunkReadiness>,
+    cancel: &CancellationToken,
+) -> Result<Duration, AppError> {
+    let started = Instant::now();
+    loop {
+        match readiness.borrow().clone() {
+            ChunkReadiness::Ready => return Ok(started.elapsed()),
+            ChunkReadiness::Failed(message) => return Err(AppError::Network(message)),
+            ChunkReadiness::Pending => {}
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => return Err(AppError::Canceled),
+            changed = readiness.changed() => {
+                changed.map_err(|_| AppError::Network(
+                    "content chunk readiness channel closed".into(),
+                ))?;
+            }
+        }
+    }
 }
 
 async fn commit_staged_files(

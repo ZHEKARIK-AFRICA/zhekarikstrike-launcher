@@ -6,8 +6,8 @@ use serde::Deserialize;
 use crate::constants::MODERN_API_BASE_URL;
 use crate::error::AppError;
 use crate::models::{
-    validate_game_path, ContentManifest, GameManifest, GamePatchManifest, GamePatchManifestEntry,
-    LauncherUpdateManifest,
+    validate_game_path, ContentManifest, ContentMirrorIndex, GameManifest, GamePatchManifest,
+    GamePatchManifestEntry, LauncherUpdateManifest,
 };
 
 const METADATA_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -15,6 +15,7 @@ const METADATA_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 #[derive(Clone)]
 pub struct ApiClient {
     http: Client,
+    direct_http: Client,
 }
 
 impl ApiClient {
@@ -28,11 +29,25 @@ impl ApiClient {
             ))
             .build()?;
 
-        Ok(Self { http })
+        let direct_http = Client::builder()
+            .connect_timeout(Duration::from_secs(15))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent(concat!(
+                "ZHEKARIK-STRIKE-Launcher/",
+                env!("CARGO_PKG_VERSION")
+            ))
+            .build()?;
+
+        Ok(Self { http, direct_http })
     }
 
     pub fn http(&self) -> &Client {
         &self.http
+    }
+
+    pub fn direct_http(&self) -> &Client {
+        &self.direct_http
     }
 
     pub async fn get_full_manifest(&self) -> Result<GameManifest, AppError> {
@@ -49,6 +64,19 @@ impl ApiClient {
         let status = response.status();
         let body = response.bytes().await?;
         parse_content_manifest_response(status, &body)
+    }
+
+    pub async fn get_content_drive_mirror(
+        &self,
+        manifest: &ContentManifest,
+    ) -> Result<Option<ContentMirrorIndex>, AppError> {
+        let response = self
+            .metadata_get(&Self::content_drive_mirror_url(&manifest.content_sha256))
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.bytes().await?;
+        parse_content_mirror_response(status, &body, manifest)
     }
 
     pub async fn get_additional_manifest(&self) -> Result<GameManifest, AppError> {
@@ -141,6 +169,12 @@ impl ApiClient {
         "https://api.zhekarik.africa/launcher/game/v2/manifest"
     }
 
+    pub fn content_drive_mirror_url(content_sha256: &str) -> String {
+        format!(
+            "https://api.zhekarik.africa/launcher/game/v2/mirrors/google-drive/{content_sha256}"
+        )
+    }
+
     pub fn additional_manifest_url() -> &'static str {
         "https://api.zhekarik.africa/launcher/game/additional"
     }
@@ -166,6 +200,25 @@ impl ApiClient {
     fn metadata_get(&self, url: &str) -> reqwest::RequestBuilder {
         self.http.get(url).timeout(METADATA_REQUEST_TIMEOUT)
     }
+}
+
+pub(crate) fn parse_content_mirror_response(
+    status: StatusCode,
+    body: &[u8],
+    manifest: &ContentManifest,
+) -> Result<Option<ContentMirrorIndex>, AppError> {
+    if status == StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        return Err(AppError::Network(format!(
+            "content mirror request failed with HTTP {status}"
+        )));
+    }
+    let mirror: ContentMirrorIndex = serde_json::from_slice(body)
+        .map_err(|error| AppError::InvalidData(format!("invalid content mirror: {error}")))?;
+    mirror.validate(manifest)?;
+    Ok(Some(mirror))
 }
 
 pub(crate) fn parse_content_manifest_response(

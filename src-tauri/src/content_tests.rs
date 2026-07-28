@@ -9,12 +9,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
-use crate::models::{ContentChunk, ContentManifest};
-use crate::services::api_client::parse_content_manifest_response;
+use crate::models::{ContentChunk, ContentManifest, ContentMirrorIndex};
+use crate::services::api_client::{parse_content_manifest_response, parse_content_mirror_response};
 use crate::services::content_download_service::{
-    decode_verified_chunk, download_content_chunk, read_verified_local_chunk,
+    decode_verified_chunk, download_content_chunk, read_verified_local_chunk, DriveCircuitBreaker,
 };
-use crate::services::content_install_service::required_content_install_bytes;
+use crate::services::content_install_service::{
+    materializer_worker_limits, required_content_install_bytes, wait_until_chunk_ready,
+    AdaptiveDownloadController, ChunkReadiness,
+};
 use crate::services::content_journal_service::{
     recover_interrupted_commit, ContentJournal, ContentJournalEntry, ContentJournalPhase,
 };
@@ -87,6 +90,84 @@ fn content_manifest_and_http_fallback_are_strict() {
     unsafe_document["files"][0]["path"] = json!("../outside.exe");
     let unsafe_manifest: ContentManifest = serde_json::from_value(unsafe_document).unwrap();
     assert!(unsafe_manifest.validate().is_err());
+}
+
+#[test]
+fn content_drive_mirror_requires_exact_chunk_closure_and_builds_only_the_fixed_host() {
+    let raw = b"loader";
+    let compressed = encoded(raw);
+    let manifest: ContentManifest =
+        serde_json::from_value(manifest_json(raw, &compressed)).unwrap();
+    let compressed_sha = sha256(&compressed);
+    let mirror: ContentMirrorIndex = serde_json::from_value(json!({
+        "schema_version": 1,
+        "content_sha256": manifest.content_sha256,
+        "source": "google_drive",
+        "initial_concurrency": 2,
+        "max_concurrency": 8,
+        "chunks": { compressed_sha.clone(): "1O6eniBjd9dd1ES-j1OKuVRXmKL6ke4vE" }
+    }))
+    .unwrap();
+
+    mirror.validate(&manifest).unwrap();
+    assert_eq!(
+        mirror.chunk_url(&compressed_sha).unwrap(),
+        "https://drive.usercontent.google.com/download?id=1O6eniBjd9dd1ES-j1OKuVRXmKL6ke4vE&export=download"
+    );
+
+    let mut incomplete = mirror.clone();
+    incomplete.chunks.clear();
+    assert!(incomplete.validate(&manifest).is_err());
+    let mut invalid_id = mirror;
+    invalid_id
+        .chunks
+        .insert(compressed_sha, "https://attacker.invalid/chunk".into());
+    assert!(invalid_id.validate(&manifest).is_err());
+
+    assert!(
+        parse_content_mirror_response(StatusCode::NOT_FOUND, b"", &manifest)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        parse_content_mirror_response(StatusCode::SERVICE_UNAVAILABLE, b"{}", &manifest).is_err()
+    );
+}
+
+#[test]
+fn content_adaptive_worker_bounds_are_deterministic() {
+    assert_eq!(materializer_worker_limits(1, 256 * 1024 * 1024), (1, 1));
+    assert_eq!(
+        materializer_worker_limits(16, 8 * 1024 * 1024 * 1024),
+        (2, 6)
+    );
+
+    let mut controller = AdaptiveDownloadController::new(2, 8);
+    assert_eq!(controller.current(), 2);
+    controller.observe_window(100.0, false, false, 0);
+    assert_eq!(controller.current(), 3);
+    controller.observe_window(80.0, false, false, 0);
+    assert_eq!(controller.current(), 2);
+    controller.observe_window(80.0, true, true, 0);
+    assert_eq!(controller.current(), 1);
+
+    let circuit = DriveCircuitBreaker::default();
+    assert!(circuit.is_enabled());
+    assert!(!circuit.register_failed_chunk());
+    assert!(!circuit.register_failed_chunk());
+    assert!(circuit.register_failed_chunk());
+    assert!(!circuit.is_enabled());
+}
+
+#[tokio::test]
+async fn content_materializer_waits_only_for_its_next_chunk() {
+    let (sender, receiver) = tokio::sync::watch::channel(ChunkReadiness::Pending);
+    let cancel = CancellationToken::new();
+    let waiter = tokio::spawn(async move { wait_until_chunk_ready(receiver, &cancel).await });
+    tokio::task::yield_now().await;
+    assert!(!waiter.is_finished());
+    sender.send(ChunkReadiness::Ready).unwrap();
+    waiter.await.unwrap().unwrap();
 }
 
 #[tokio::test]
