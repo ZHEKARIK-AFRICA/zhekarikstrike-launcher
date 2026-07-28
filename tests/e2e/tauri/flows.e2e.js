@@ -53,10 +53,17 @@ describe('Windows Tauri E2E build', () => {
         await expect($('#error-message')).toHaveText(expect.stringContaining('native launch fixture failed'));
     });
 
-    it('shows updater failure and continue UI', async () => {
+    it('shows and acknowledges updater failure without a bypass', async () => {
         await navigate('launcher_update.html');
         await ready();
-        await expect($('#continue-without-update')).toBeDisplayed();
+        await browser.waitUntil(async () =>
+            (await $('#error-modal').getCSSProperty('display')).value === 'block'
+        );
         await expect($('#error-message')).toHaveText(expect.stringContaining('tampered native artifact'));
+        await expect($('#continue-without-update')).not.toBeExisting();
+        await $('#error-modal-ok').click();
+        await browser.waitUntil(async () =>
+            (await $('#error-modal').getCSSProperty('display')).value === 'none'
+        );
     });
 });
