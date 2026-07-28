@@ -132,14 +132,10 @@ impl AdaptiveMaterializerController {
         wait_ratio: f64,
     ) {
         let previous = self.current;
-        if cpu_percent > 90.0 || available_memory < 512 * 1024 * 1024 {
-            self.current = self.current.saturating_sub(1).max(1);
-            self.trial_baseline = None;
-            self.cooldown_windows = 3;
-        } else if self
+        let trial_regressed = self
             .trial_baseline
-            .is_some_and(|baseline| throughput < baseline * 0.9)
-        {
+            .is_some_and(|baseline| throughput < baseline * 0.9);
+        if cpu_percent > 90.0 || available_memory < 512 * 1024 * 1024 || trial_regressed {
             self.current = self.current.saturating_sub(1).max(1);
             self.trial_baseline = None;
             self.cooldown_windows = 3;

@@ -148,6 +148,7 @@ pub async fn read_verified_local_chunk(
     Ok(Some(bytes))
 }
 
+#[cfg(test)]
 pub async fn download_content_chunk(
     client: &Client,
     url: &str,
