@@ -119,6 +119,9 @@ if ($releaseSource -match '(?i)--clobber') {
 }
 
 $tauriConfig = Get-Content -LiteralPath "$PSScriptRoot\..\src-tauri\tauri.conf.json" -Raw | ConvertFrom-Json
+if ($tauriConfig.app.windows[0].resizable -ne $true) {
+    throw 'Production launcher window must support proportional resizing.'
+}
 $resourcesProperty = $tauriConfig.bundle.PSObject.Properties['resources']
 if ($null -ne $resourcesProperty -and $resourcesProperty.Value.Count -ne 0) {
     throw 'Tauri release builds must not bundle launcher game patch directories'

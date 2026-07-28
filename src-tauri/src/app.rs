@@ -1,15 +1,15 @@
 use std::time::Duration;
 
-use tauri::{Emitter, Manager, Size};
+use tauri::{Emitter, Manager};
 
 use crate::commands::*;
 use crate::error::AppError;
 use crate::logger;
-use crate::services::{elevation_service, launcher_update_service};
+use crate::services::{
+    elevation_service, launcher_update_service,
+    window_resize_service::{self, MAIN_WINDOW_LAYOUT, UPDATE_WINDOW_LAYOUT},
+};
 use crate::state::AppState;
-
-const MAIN_WINDOW_SIZE: (f64, f64) = (892.0, 496.0);
-const UPDATE_WINDOW_SIZE: (f64, f64) = (788.0, 272.0);
 
 #[derive(Debug, PartialEq, Eq)]
 enum StartupElevationAction {
@@ -131,17 +131,14 @@ pub fn run() {
 
             let handle = app.handle().clone();
             if let Some(window) = app.get_webview_window("main") {
-                if show_update {
-                    window.set_size(Size::Logical(tauri::LogicalSize {
-                        width: UPDATE_WINDOW_SIZE.0,
-                        height: UPDATE_WINDOW_SIZE.1,
-                    }))?;
-                    window.eval("window.location.replace('launcher_update.html')")?;
+                let layout = if show_update {
+                    UPDATE_WINDOW_LAYOUT
                 } else {
-                    window.set_size(Size::Logical(tauri::LogicalSize {
-                        width: MAIN_WINDOW_SIZE.0,
-                        height: MAIN_WINDOW_SIZE.1,
-                    }))?;
+                    MAIN_WINDOW_LAYOUT
+                };
+                window_resize_service::initialize(&window, layout)?;
+                if show_update {
+                    window.eval("window.location.replace('launcher_update.html')")?;
                 }
                 window.show()?;
                 window.set_focus()?;
