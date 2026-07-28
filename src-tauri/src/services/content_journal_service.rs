@@ -158,11 +158,15 @@ pub async fn cleanup_transaction(game_path: &Path, transaction_id: &str) -> Resu
 }
 
 pub async fn atomic_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<(), AppError> {
+    let bytes = serde_json::to_vec(value)?;
+    atomic_bytes(path, &bytes).await
+}
+
+pub async fn atomic_bytes(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
     let temporary = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
-    let bytes = serde_json::to_vec(value)?;
     let result = async {
         let mut file = tokio::fs::OpenOptions::new()
             .write(true)
@@ -170,7 +174,7 @@ pub async fn atomic_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Resul
             .open(&temporary)
             .await?;
         use tokio::io::AsyncWriteExt;
-        file.write_all(&bytes).await?;
+        file.write_all(bytes).await?;
         file.flush().await?;
         file.sync_all().await?;
         drop(file);

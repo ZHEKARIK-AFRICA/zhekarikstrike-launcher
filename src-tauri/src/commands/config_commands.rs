@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use tauri::State;
+use tauri::{AppHandle, State};
 
 use crate::error::AppError;
 use crate::models::{GameExistenceStatus, LauncherConfig, StartupState};
@@ -68,9 +68,18 @@ pub async fn get_startup_state() -> Result<StartupState, AppError> {
 
 #[tauri::command]
 pub async fn get_game_process_state(
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<crate::models::GameProcessState, AppError> {
-    Ok(state.process_state.read().await.clone())
+    #[cfg(feature = "e2e")]
+    {
+        let _ = app;
+        Ok(state.process_state.read().await.clone())
+    }
+    #[cfg(not(feature = "e2e"))]
+    {
+        crate::services::game_process_service::sync_game_process(app, state.inner()).await
+    }
 }
 
 async fn check_game_exists_inner() -> Result<GameExistenceStatus, AppError> {

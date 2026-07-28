@@ -1,6 +1,6 @@
 [package]
 name = "zhekarikstrike_launcher"
-version = "1.6.10"
+version = "1.6.11"
 description = "ZHEKARIK STRIKE Launcher"
 authors = ["d3affy"]
 edition = "2021"
@@ -24,6 +24,7 @@ tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-log = "2"
 tauri-plugin-opener = "2"
+tauri-plugin-single-instance = "2.4.3"
 tauri-plugin-wdio = { version = "1", optional = true }
 tauri-plugin-wdio-webdriver = { version = "1", optional = true }
 

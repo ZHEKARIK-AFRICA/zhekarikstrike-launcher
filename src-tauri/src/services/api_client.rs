@@ -66,6 +66,38 @@ impl ApiClient {
         parse_content_manifest_response(status, &body)
     }
 
+    pub async fn get_compatible_content_manifest(
+        &self,
+    ) -> Result<Option<ContentManifest>, AppError> {
+        let Some(manifest) = self.get_content_manifest().await? else {
+            return Ok(None);
+        };
+
+        match self.get_updates_from(&manifest.game_version).await {
+            Ok(canonical)
+                if content_version_matches_canonical(
+                    &manifest.game_version,
+                    &canonical.game_version,
+                ) =>
+            {
+                Ok(Some(manifest))
+            }
+            Ok(canonical) => {
+                crate::logger::warn(&format!(
+                    "content v2 game version {} does not match canonical v1 version {}; using v1",
+                    manifest.game_version, canonical.game_version
+                ));
+                Ok(None)
+            }
+            Err(error) => {
+                crate::logger::warn(&format!(
+                    "content v2 compatibility could not be verified; using v1 ({error})"
+                ));
+                Ok(None)
+            }
+        }
+    }
+
     pub async fn get_content_drive_mirror(
         &self,
         manifest: &ContentManifest,
@@ -202,6 +234,10 @@ impl ApiClient {
     }
 }
 
+fn content_version_matches_canonical(content_version: &str, canonical_version: &str) -> bool {
+    content_version == canonical_version
+}
+
 pub(crate) fn parse_content_mirror_response(
     status: StatusCode,
     body: &[u8],
@@ -253,7 +289,7 @@ fn url_encode_segment(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::ApiClient;
+    use super::{content_version_matches_canonical, ApiClient};
     use crate::models::{GamePatchLayer, GamePatchManifestEntry};
 
     #[test]
@@ -289,5 +325,11 @@ mod tests {
             ApiClient::excludes_url(),
             "https://api.zhekarik.africa/launcher/game/excludes"
         );
+    }
+
+    #[test]
+    fn release_1_6_11_v2_requires_the_canonical_v1_game_version() {
+        assert!(content_version_matches_canonical("1.0.3.4", "1.0.3.4"));
+        assert!(!content_version_matches_canonical("1.0.3.4", "1.0.3.16"));
     }
 }

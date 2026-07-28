@@ -11,7 +11,7 @@ use crate::constants::{
     GAME_PROCESS_NAME, GAME_START_TIMEOUT_MS, PROCESS_POLL_INTERVAL_MS, REV_LOADER_EXE,
 };
 use crate::error::AppError;
-use crate::models::{GameProcessInfo, GameProcessStateKind};
+use crate::models::{GameProcessInfo, GameProcessState, GameProcessStateKind};
 use crate::services::file_patch_service::{copy_files_and_track, delete_tracked_files};
 use crate::services::{
     content_journal_service, discord_rpc_service, elevation_service, game_patch_service,
@@ -89,6 +89,7 @@ pub async fn launch_game(
             process_state.kind = GameProcessStateKind::Running;
             process_state.pid = Some(game_process.pid);
         }
+        *state.owned_game_pid.write().await = Some(game_process.pid);
 
         app.emit("game-started", game_process.clone())?;
         monitor_game_process(app.clone(), state.clone(), game_process.pid);
@@ -106,6 +107,36 @@ pub async fn launch_game(
     }
 
     Ok(())
+}
+
+pub async fn game_is_running(state: &AppState) -> bool {
+    if let Some(pid) = state.process_state.read().await.pid {
+        if is_pid_running(pid).await {
+            return true;
+        }
+    }
+    find_process_by_name(GAME_PROCESS_NAME).await.is_some()
+}
+
+pub async fn sync_game_process(
+    app: AppHandle,
+    state: &AppState,
+) -> Result<GameProcessState, AppError> {
+    let current = state.process_state.read().await.clone();
+    if let Some(pid) = current.pid {
+        if is_pid_running(pid).await {
+            return Ok(current);
+        }
+        shutdown_service::cleanup_runtime(app.clone(), state).await?;
+    }
+
+    let synchronized = detected_process_state(find_process_by_name(GAME_PROCESS_NAME).await);
+    *state.owned_game_pid.write().await = None;
+    *state.process_state.write().await = synchronized.clone();
+    if let Some(pid) = synchronized.pid {
+        monitor_game_process(app, state.clone(), pid);
+    }
+    Ok(synchronized)
 }
 
 pub fn monitor_game_process(app: AppHandle, state: AppState, pid: u32) {
@@ -146,6 +177,51 @@ pub async fn find_process_by_name(name: &str) -> Option<GameProcessInfo> {
             None
         }
     })
+}
+
+fn detected_process_state(process: Option<GameProcessInfo>) -> GameProcessState {
+    match process {
+        Some(process) => GameProcessState {
+            kind: GameProcessStateKind::Running,
+            pid: Some(process.pid),
+        },
+        None => GameProcessState::default(),
+    }
+}
+
+pub(crate) fn is_observed_external_process(
+    tracked_pid: Option<u32>,
+    owned_pid: Option<u32>,
+) -> bool {
+    tracked_pid.is_some() && tracked_pid != owned_pid
+}
+
+#[cfg(test)]
+mod release_1_6_11_tests {
+    use super::{detected_process_state, is_observed_external_process};
+    use crate::models::{GameProcessInfo, GameProcessStateKind};
+
+    #[test]
+    fn release_1_6_11_detected_game_process_becomes_running_state() {
+        let state = detected_process_state(Some(GameProcessInfo {
+            pid: 42,
+            name: "zhekarikstrike.exe".to_string(),
+        }));
+        assert!(matches!(state.kind, GameProcessStateKind::Running));
+        assert_eq!(state.pid, Some(42));
+
+        let stopped = detected_process_state(None);
+        assert!(matches!(stopped.kind, GameProcessStateKind::Stopped));
+        assert_eq!(stopped.pid, None);
+    }
+
+    #[test]
+    fn release_1_6_11_external_game_is_observed_but_not_owned() {
+        assert!(is_observed_external_process(Some(42), None));
+        assert!(is_observed_external_process(Some(42), Some(7)));
+        assert!(!is_observed_external_process(Some(42), Some(42)));
+        assert!(!is_observed_external_process(None, None));
+    }
 }
 
 async fn wait_for_process(name: &str, timeout: Duration) -> Result<GameProcessInfo, AppError> {

@@ -31,7 +31,9 @@ use crate::services::content_journal_service::{
     ContentCompletionState, ContentJournal, ContentJournalEntry, ContentJournalPhase,
 };
 use crate::services::disk_service::ensure_disk_space;
-use crate::utils::hash_utils::sha256_file;
+use crate::services::verify_hash_service::{
+    find_content_hash_mismatches, ContentHashTask, VerifyHashProgress,
+};
 use crate::utils::path_utils::safe_join;
 
 const INSTALL_SAFETY_RESERVE: u64 = 2 * 1024 * 1024 * 1024;
@@ -355,8 +357,14 @@ pub async fn install_or_update_content(
     let progress = ProgressEmitter::new(app, event_name, operation_id);
     progress.emit_stage(ProgressStage::Checking, Some(0.0), None)?;
     let previous = load_previous_manifest(&game_path).await?;
-    let prepared =
-        files_requiring_materialization(&game_path, &manifest, previous.as_ref(), &cancel).await?;
+    let prepared = files_requiring_materialization(
+        &game_path,
+        &manifest,
+        previous.as_ref(),
+        &progress,
+        &cancel,
+    )
+    .await?;
     let required_raw = prepared
         .iter()
         .flat_map(|prepared| prepared.file.chunks.iter().cloned())
@@ -445,20 +453,24 @@ pub async fn install_or_update_content(
     write_journal(&game_path, &journal).await?;
 
     let staging = staging_path(&game_path, &transaction_id);
-    let pipeline_result = run_content_pipeline(
-        &api,
-        prepared.clone(),
-        Arc::new(manifest.clone()),
-        mirror.map(Arc::new),
-        required_raw,
-        available,
-        Arc::new(local_sources),
-        chunk_directory.clone(),
-        staging.clone(),
-        progress.clone(),
-        cancel.clone(),
-    )
-    .await;
+    let pipeline_result = if prepared.is_empty() {
+        Ok(())
+    } else {
+        run_content_pipeline(
+            &api,
+            prepared.clone(),
+            Arc::new(manifest.clone()),
+            mirror.map(Arc::new),
+            required_raw,
+            available,
+            Arc::new(local_sources),
+            chunk_directory.clone(),
+            staging.clone(),
+            progress.clone(),
+            cancel.clone(),
+        )
+        .await
+    };
     if let Err(error) = pipeline_result {
         cleanup_transaction(&game_path, &transaction_id).await.ok();
         remove_file_if_exists(&journal_path(&game_path)).await.ok();
@@ -496,6 +508,9 @@ pub async fn install_or_update_content(
     cleanup_transaction(&game_path, &transaction_id).await.ok();
     remove_directory_if_exists(&chunk_directory).await.ok();
     remove_file_if_exists(&journal_path(&game_path)).await.ok();
+    if !prepared.is_empty() {
+        progress.emit_stage(ProgressStage::Install, Some(100.0), None)?;
+    }
     progress.emit_stage(ProgressStage::Complete, Some(100.0), None)?;
     Ok(())
 }
@@ -547,8 +562,15 @@ async fn files_requiring_materialization(
     game_path: &Path,
     manifest: &ContentManifest,
     previous: Option<&ContentManifest>,
+    progress: &ProgressEmitter,
     cancel: &CancellationToken,
 ) -> Result<Vec<PreparedFile>, AppError> {
+    enum Disposition {
+        Ready,
+        Materialize(PreparedFile),
+        Hash(PreparedFile),
+    }
+
     let previous_files = previous
         .map(|previous| {
             previous
@@ -558,8 +580,10 @@ async fn files_requiring_materialization(
                 .collect::<HashMap<_, _>>()
         })
         .unwrap_or_default();
-    let mut prepared = Vec::new();
-    for file in &manifest.files {
+    let total_files = manifest.files.len().max(1);
+    let mut dispositions = Vec::with_capacity(manifest.files.len());
+    let mut hash_tasks = Vec::new();
+    for (index, file) in manifest.files.iter().enumerate() {
         if cancel.is_cancelled() {
             return Err(AppError::Canceled);
         }
@@ -576,26 +600,88 @@ async fn files_requiring_materialization(
         }
         let had_original = metadata.is_some();
         let original_size = metadata.as_ref().map_or(0, |metadata| metadata.len());
+        emit_content_check_progress(
+            progress,
+            ((index + 1) as f64 / total_files as f64) * 5.0,
+            None,
+            None,
+        )?;
         if had_original && (file.excluded_from_hash_check || file.temporary) {
+            dispositions.push(Disposition::Ready);
             continue;
         }
         let known_unchanged = previous_files
             .get(&file.path.to_ascii_lowercase())
             .is_some_and(|old| old.size == file.size && old.sha256 == file.sha256);
         if had_original && original_size == file.size && known_unchanged {
+            dispositions.push(Disposition::Ready);
             continue;
         }
-        if had_original && original_size == file.size && sha256_file(&target).await? == file.sha256
-        {
-            continue;
-        }
-        prepared.push(PreparedFile {
+        let prepared = PreparedFile {
             file: file.clone(),
             had_original,
             original_size,
-        });
+        };
+        if had_original && original_size == file.size {
+            hash_tasks.push(ContentHashTask {
+                path: file.path.clone(),
+                size: file.size,
+                expected_sha256: file.sha256.clone(),
+                local_path: target,
+            });
+            dispositions.push(Disposition::Hash(prepared));
+        } else {
+            dispositions.push(Disposition::Materialize(prepared));
+        }
     }
-    Ok(prepared)
+
+    let hash_progress_emitter = progress.clone();
+    let hash_progress = Arc::new(move |update: VerifyHashProgress| {
+        let ratio = if update.total_bytes == 0 {
+            1.0
+        } else {
+            update.completed_bytes as f64 / update.total_bytes as f64
+        };
+        if let Err(error) = emit_content_check_progress(
+            &hash_progress_emitter,
+            5.0 + ratio.clamp(0.0, 1.0) * 95.0,
+            Some(update.speed_bytes_per_sec),
+            update.time_remaining_sec,
+        ) {
+            crate::logger::warn(&format!("failed to emit content scan progress: {error}"));
+        }
+    });
+    let mismatches = find_content_hash_mismatches(hash_tasks, cancel.clone(), hash_progress)
+        .await?
+        .into_iter()
+        .collect::<HashSet<_>>();
+
+    progress.emit_stage(ProgressStage::Checking, Some(100.0), None)?;
+    Ok(dispositions
+        .into_iter()
+        .filter_map(|disposition| match disposition {
+            Disposition::Ready => None,
+            Disposition::Materialize(prepared) => Some(prepared),
+            Disposition::Hash(prepared) if mismatches.contains(&prepared.file.path) => {
+                Some(prepared)
+            }
+            Disposition::Hash(_) => None,
+        })
+        .collect())
+}
+
+fn emit_content_check_progress(
+    progress: &ProgressEmitter,
+    percentage: f64,
+    speed_bytes_per_sec: Option<f64>,
+    time_remaining_sec: Option<f64>,
+) -> Result<(), AppError> {
+    let mut payload =
+        ProgressPayload::new(progress.operation_id().to_string(), ProgressStage::Checking);
+    payload.progress = Some(percentage.clamp(0.0, 100.0));
+    payload.speed_bytes_per_sec = speed_bytes_per_sec;
+    payload.time_remaining_sec = time_remaining_sec;
+    progress.emit(payload)
 }
 
 fn local_chunk_candidates(

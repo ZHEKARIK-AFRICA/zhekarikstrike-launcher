@@ -44,6 +44,9 @@ const mainStartup = {
     },
     get_current_state: {
         value: { processInProgress: false, verificationInProgress: false, operation: 'idle' }
+    },
+    get_game_process_state: {
+        value: { kind: 'stopped', pid: null }
     }
 };
 

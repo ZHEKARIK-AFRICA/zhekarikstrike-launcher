@@ -29,6 +29,9 @@ pub enum AppError {
     #[error("Game executable not found: {0}")]
     GameExecutableNotFound(String),
 
+    #[error("ZHEKARIK STRIKE is already running")]
+    GameAlreadyRunning,
+
     #[error("Operation already in progress: {0}")]
     OperationInProgress(String),
 
@@ -54,6 +57,7 @@ impl AppError {
             AppError::InsufficientDiskSpace { .. } => "insufficient-disk-space",
             AppError::GamePathNotSet => "game-path-not-set",
             AppError::GameExecutableNotFound(_) => "game-executable-not-found",
+            AppError::GameAlreadyRunning => "game_already_running",
             AppError::OperationInProgress(_) => "operation-in-progress",
             AppError::Canceled => "canceled",
             AppError::AdminRequired => "admin-required",
@@ -116,5 +120,17 @@ impl From<zip::result::ZipError> for AppError {
 impl From<tauri::Error> for AppError {
     fn from(value: tauri::Error) -> Self {
         AppError::Unknown(value.to_string())
+    }
+}
+
+#[cfg(test)]
+mod release_1_6_11_tests {
+    use super::AppError;
+
+    #[test]
+    fn release_1_6_11_game_already_running_has_a_stable_frontend_code() {
+        let error = AppError::GameAlreadyRunning;
+        assert_eq!(error.code(), "game_already_running");
+        assert_eq!(error.frontend_error().details, None);
     }
 }

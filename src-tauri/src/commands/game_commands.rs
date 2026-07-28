@@ -6,6 +6,10 @@ use crate::state::{AppState, OperationKind};
 
 #[tauri::command]
 pub async fn launch_game(app: AppHandle, state: State<'_, AppState>) -> Result<(), AppError> {
+    #[cfg(not(feature = "e2e"))]
+    if game_process_service::game_is_running(state.inner()).await {
+        return Err(AppError::GameAlreadyRunning);
+    }
     let _lease = state.begin_operation(OperationKind::LaunchingGame, None)?;
 
     #[cfg(feature = "e2e")]

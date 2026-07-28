@@ -33,7 +33,32 @@ fn startup_elevation_action(
 }
 
 pub fn run() {
-    let builder = tauri::Builder::default()
+    let debug_build = cfg!(debug_assertions);
+    let elevated = elevation_service::is_elevated().unwrap_or(false);
+    if !debug_build
+        && !elevated
+        && use_existing_instance_before_elevation(
+            debug_build,
+            elevated,
+            focus_existing_main_window(),
+        )
+    {
+        return;
+    }
+
+    let builder = tauri::Builder::default();
+    let builder = if single_instance_enabled(debug_build, elevated) {
+        builder.plugin(tauri_plugin_single_instance::init(|app, _, _| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
+    } else {
+        builder
+    };
+    let builder = builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_log::Builder::new().build())
         .plugin(tauri_plugin_opener::init());
@@ -185,6 +210,121 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+fn single_instance_enabled(debug_build: bool, elevated: bool) -> bool {
+    debug_build || elevated
+}
+
+fn use_existing_instance_before_elevation(
+    debug_build: bool,
+    elevated: bool,
+    existing_window_focused: bool,
+) -> bool {
+    !debug_build && !elevated && existing_window_focused
+}
+
+fn launcher_executable_matches(existing: &str, current: &str) -> bool {
+    existing
+        .replace('/', "\\")
+        .eq_ignore_ascii_case(&current.replace('/', "\\"))
+}
+
+#[cfg(target_os = "windows")]
+fn focus_existing_main_window() -> bool {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows::core::{PCWSTR, PWSTR};
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, GetWindowThreadProcessId, SetForegroundWindow, ShowWindow, SW_RESTORE,
+    };
+
+    let title = std::ffi::OsStr::new(crate::constants::PRODUCT_NAME)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let Ok(window) = (unsafe { FindWindowW(PCWSTR::null(), PCWSTR(title.as_ptr())) }) else {
+        return false;
+    };
+
+    let mut pid = 0_u32;
+    unsafe { GetWindowThreadProcessId(window, Some(&mut pid)) };
+    let Ok(process) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) })
+    else {
+        return false;
+    };
+    let mut image_path = vec![0_u16; 32_768];
+    let mut image_path_len = image_path.len() as u32;
+    let query_result = unsafe {
+        QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(image_path.as_mut_ptr()),
+            &mut image_path_len,
+        )
+    };
+    let _ = unsafe { CloseHandle(process) };
+    if query_result.is_err() {
+        return false;
+    }
+    let existing_executable = String::from_utf16_lossy(&image_path[..image_path_len as usize]);
+    let Ok(current_executable) = std::env::current_exe() else {
+        return false;
+    };
+    if !launcher_executable_matches(&existing_executable, &current_executable.to_string_lossy()) {
+        return false;
+    }
+
+    unsafe {
+        let _ = ShowWindow(window, SW_RESTORE);
+        let _ = SetForegroundWindow(window);
+    }
+    true
+}
+
+#[cfg(not(target_os = "windows"))]
+fn focus_existing_main_window() -> bool {
+    false
+}
+
+#[cfg(test)]
+mod release_1_6_11_tests {
+    use super::{
+        launcher_executable_matches, single_instance_enabled,
+        use_existing_instance_before_elevation,
+    };
+
+    #[test]
+    fn release_1_6_11_single_instance_waits_until_release_process_is_elevated() {
+        assert!(single_instance_enabled(true, false));
+        assert!(single_instance_enabled(false, true));
+        assert!(!single_instance_enabled(false, false));
+    }
+
+    #[test]
+    fn release_1_6_11_second_release_launch_uses_existing_window_without_uac() {
+        assert!(use_existing_instance_before_elevation(false, false, true));
+        assert!(!use_existing_instance_before_elevation(false, false, false));
+        assert!(!use_existing_instance_before_elevation(false, true, true));
+        assert!(!use_existing_instance_before_elevation(true, false, true));
+    }
+
+    #[test]
+    fn release_1_6_11_pre_elevation_focus_requires_the_same_launcher_executable() {
+        assert!(launcher_executable_matches(
+            r"D:\Games\ZHEKARIK STRIKE.exe",
+            r"d:/games/zhekarik strike.exe"
+        ));
+        assert!(!launcher_executable_matches(
+            r"D:\Games\zhekarikstrike.exe",
+            r"D:\Games\ZHEKARIK STRIKE.exe"
+        ));
+    }
 }
 
 #[cfg(test)]

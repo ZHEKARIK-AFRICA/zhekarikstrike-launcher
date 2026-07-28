@@ -11,10 +11,17 @@ setupErrorModal();
 const playButton = document.getElementById('play-button');
 const checkFilesButton = document.getElementById('check-files');
 let verificationInProgress = false;
+let gameRunning = false;
 
 function updateUIBasedOnState() {
     if (checkFilesButton) checkFilesButton.textContent = t(verificationInProgress ? 'cancel' : 'check_files');
-    if (playButton) playButton.disabled = verificationInProgress;
+    if (playButton) playButton.disabled = verificationInProgress || gameRunning;
+    if (checkFilesButton) checkFilesButton.disabled = gameRunning;
+}
+
+function setGameRunning(running) {
+    gameRunning = running;
+    updateUIBasedOnState();
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
@@ -34,6 +41,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         const state = await invoke('get_current_state');
         verificationInProgress = state.verificationInProgress;
+        const gameState = await invoke('get_game_process_state');
+        gameRunning = gameState.kind === 'starting' || gameState.kind === 'running';
         updateUIBasedOnState();
         document.body.classList.add('fade-in');
     } catch (error) {
@@ -42,7 +51,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 });
 
 playButton?.addEventListener('click', async () => {
-    if (verificationInProgress) return;
+    if (verificationInProgress || gameRunning) return;
     verificationInProgress = true;
     updateUIBasedOnState();
     if (checkFilesButton) checkFilesButton.disabled = true;
@@ -68,6 +77,7 @@ playButton?.addEventListener('click', async () => {
 });
 
 checkFilesButton?.addEventListener('click', async () => {
+    if (gameRunning) return;
     if (verificationInProgress) {
         await invoke('cancel_verify');
         return;
@@ -97,3 +107,7 @@ listenUntilPageHide('verify-progress', ({ payload }) => {
         'progress-bar', 'launcher-status', 'progress-info'
     );
 });
+
+listenUntilPageHide('game-starting', () => setGameRunning(true));
+listenUntilPageHide('game-started', () => setGameRunning(true));
+listenUntilPageHide('game-closed', () => setGameRunning(false));

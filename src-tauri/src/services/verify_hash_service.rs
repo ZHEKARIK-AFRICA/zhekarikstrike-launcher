@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -25,6 +25,20 @@ const CPU_SHRINK_LIMIT: f32 = 90.0;
 pub(crate) struct VerifyHashTask {
     pub(crate) file: GameFileManifestEntry,
     pub(crate) local_path: PathBuf,
+}
+
+pub(crate) struct ContentHashTask {
+    pub(crate) path: String,
+    pub(crate) size: u64,
+    pub(crate) expected_sha256: String,
+    pub(crate) local_path: PathBuf,
+}
+
+struct HashTask {
+    key: String,
+    size: u64,
+    expected_sha256: String,
+    local_path: PathBuf,
 }
 
 pub(crate) struct VerifyHashProgress {
@@ -165,7 +179,7 @@ fn verify_worker_limit(logical_cpu_count: usize) -> usize {
 }
 
 struct VerifyHashResult {
-    file: GameFileManifestEntry,
+    key: String,
     matches: bool,
 }
 
@@ -174,13 +188,58 @@ pub(crate) async fn find_hash_mismatches(
     cancel: CancellationToken,
     on_progress: VerifyProgressCallback,
 ) -> Result<Vec<GameFileManifestEntry>, AppError> {
+    let mut files = HashMap::new();
+    let generic = tasks
+        .into_iter()
+        .map(|task| {
+            let key = task.file.path.clone();
+            let size = task.file.size;
+            let expected_sha256 = task.file.sha256.clone();
+            files.insert(key.clone(), task.file);
+            HashTask {
+                key,
+                size,
+                expected_sha256,
+                local_path: task.local_path,
+            }
+        })
+        .collect();
+    let mismatches = run_hash_checks(generic, cancel, on_progress).await?;
+    Ok(mismatches
+        .into_iter()
+        .filter_map(|path| files.remove(&path))
+        .collect())
+}
+
+pub(crate) async fn find_content_hash_mismatches(
+    tasks: Vec<ContentHashTask>,
+    cancel: CancellationToken,
+    on_progress: VerifyProgressCallback,
+) -> Result<Vec<String>, AppError> {
+    let generic = tasks
+        .into_iter()
+        .map(|task| HashTask {
+            key: task.path,
+            size: task.size,
+            expected_sha256: task.expected_sha256,
+            local_path: task.local_path,
+        })
+        .collect();
+    run_hash_checks(generic, cancel, on_progress).await
+}
+
+async fn run_hash_checks(
+    tasks: Vec<HashTask>,
+    cancel: CancellationToken,
+    on_progress: VerifyProgressCallback,
+) -> Result<Vec<String>, AppError> {
     if cancel.is_cancelled() {
         return Err(AppError::Canceled);
     }
 
     let total_bytes = tasks.iter().try_fold(0_u64, |total, task| {
         total
-            .checked_add(task.file.size)
+            .checked_add(task.size)
             .ok_or_else(|| AppError::InvalidData("verification byte count overflow".to_string()))
     })?;
     let logical_cpus = std::thread::available_parallelism().map_or(1, usize::from);
@@ -217,8 +276,8 @@ pub(crate) async fn find_hash_mismatches(
                     sha256_file_tracked(&task.local_path, &task_cancel, task_completed.as_ref())
                         .await?;
                 Ok(VerifyHashResult {
-                    matches: actual_hash == task.file.sha256,
-                    file: task.file,
+                    matches: actual_hash == task.expected_sha256,
+                    key: task.key,
                 })
             });
         }
@@ -239,9 +298,9 @@ pub(crate) async fn find_hash_mismatches(
                 };
                 match joined {
                     Ok(Ok(result)) => {
-                        last_file = Some(result.file.path.clone());
+                        last_file = Some(result.key.clone());
                         if !result.matches {
-                            mismatches.push(result.file);
+                            mismatches.push(result.key);
                         }
                     }
                     Ok(Err(error)) => {
@@ -343,18 +402,56 @@ fn log_controller_decision(decision: VerifyControllerDecision) {
 
 #[cfg(test)]
 mod tests {
+    use sha2::{Digest, Sha256};
     use std::sync::Arc;
 
     use tempfile::tempdir;
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        find_hash_mismatches, verify_worker_limit, AdaptiveVerifyController, VerifyHashTask,
+        find_content_hash_mismatches, find_hash_mismatches, verify_worker_limit,
+        AdaptiveVerifyController, ContentHashTask, VerifyHashTask,
     };
     use crate::error::AppError;
     use crate::models::GameFileManifestEntry;
 
     const VALID_WINDOW: u64 = 64 * 1024 * 1024;
+
+    #[tokio::test]
+    async fn release_1_6_11_content_hashing_reports_progress_and_only_returns_mismatches() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let correct_path = directory.path().join("correct.bin");
+        let corrupt_path = directory.path().join("corrupt.bin");
+        tokio::fs::write(&correct_path, b"correct").await.unwrap();
+        tokio::fs::write(&corrupt_path, b"corrupt").await.unwrap();
+        let correct_hash = hex::encode(Sha256::digest(b"correct"));
+        let updates = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = updates.clone();
+
+        let mismatches = find_content_hash_mismatches(
+            vec![
+                ContentHashTask {
+                    path: "correct.bin".to_string(),
+                    size: 7,
+                    expected_sha256: correct_hash.clone(),
+                    local_path: correct_path,
+                },
+                ContentHashTask {
+                    path: "corrupt.bin".to_string(),
+                    size: 7,
+                    expected_sha256: correct_hash,
+                    local_path: corrupt_path,
+                },
+            ],
+            CancellationToken::new(),
+            Arc::new(move |progress| captured.lock().unwrap().push(progress.completed_bytes)),
+        )
+        .await
+        .expect("content hashes should be checked");
+
+        assert_eq!(mismatches, vec!["corrupt.bin"]);
+        assert_eq!(updates.lock().unwrap().last().copied(), Some(14));
+    }
 
     fn manifest_file(path: &str, size: u64, sha256: &str) -> GameFileManifestEntry {
         GameFileManifestEntry {

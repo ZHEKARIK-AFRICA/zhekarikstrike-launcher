@@ -18,12 +18,22 @@ pub async fn shutdown(app: AppHandle, state: &AppState) -> Result<(), AppError> 
 pub async fn cleanup_runtime(app: AppHandle, state: &AppState) -> Result<(), AppError> {
     let _guard = state.cleanup_lock.lock().await;
 
+    let tracked_pid = state.process_state.read().await.pid;
+    let owned_pid = *state.owned_game_pid.read().await;
+    if game_process_service::is_observed_external_process(tracked_pid, owned_pid) {
+        let mut process_state = state.process_state.write().await;
+        process_state.kind = GameProcessStateKind::Stopped;
+        process_state.pid = None;
+        drop(process_state);
+        let _ = app.emit("game-closed", ());
+        return Ok(());
+    }
+
     if let Some(token) = state.file_patch_cancel_token.lock().await.take() {
         token.cancel();
     }
 
-    let pid = state.process_state.read().await.pid;
-    if let Some(pid) = pid {
+    if let Some(pid) = owned_pid {
         if let Err(error) = game_process_service::stop_game_process(pid).await {
             crate::logger::warn(&format!("failed to stop game process {pid}: {error}"));
         }
@@ -55,6 +65,7 @@ pub async fn cleanup_runtime(app: AppHandle, state: &AppState) -> Result<(), App
         process_state.kind = GameProcessStateKind::Stopped;
         process_state.pid = None;
     }
+    *state.owned_game_pid.write().await = None;
 
     let _ = app.emit("game-closed", ());
     Ok(())

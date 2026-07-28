@@ -31,6 +31,9 @@ pub async fn verify_files(
 
     #[cfg(not(feature = "e2e"))]
     {
+        if crate::services::game_process_service::game_is_running(state.inner()).await {
+            return Err(AppError::GameAlreadyRunning);
+        }
         let mode = if check_all_files {
             VerifyMode::Full
         } else {
@@ -52,6 +55,9 @@ pub async fn update_game(app: AppHandle, state: State<'_, AppState>) -> Result<(
 
     #[cfg(not(feature = "e2e"))]
     {
+        if crate::services::game_process_service::game_is_running(state.inner()).await {
+            return Err(AppError::GameAlreadyRunning);
+        }
         let lease =
             state.begin_operation(OperationKind::UpdatingGame, Some(CancellationSlot::Verify))?;
         let cancel = lease
@@ -61,7 +67,7 @@ pub async fn update_game(app: AppHandle, state: State<'_, AppState>) -> Result<(
             .await?
             .ok_or(AppError::GamePathNotSet)?;
         let api = ApiClient::new()?;
-        if let Some(manifest) = api.get_content_manifest().await? {
+        if let Some(manifest) = api.get_compatible_content_manifest().await? {
             return content_install_service::install_or_update_content(
                 app,
                 game_path,

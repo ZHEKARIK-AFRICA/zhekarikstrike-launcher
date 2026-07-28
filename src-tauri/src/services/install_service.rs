@@ -37,7 +37,7 @@ pub async fn install_game(
 
     let operation_id = Uuid::new_v4().to_string();
     let api = ApiClient::new()?;
-    if let Some(manifest) = api.get_content_manifest().await? {
+    if let Some(manifest) = api.get_compatible_content_manifest().await? {
         content_install_service::install_or_update_content(
             app,
             game_path.clone(),
