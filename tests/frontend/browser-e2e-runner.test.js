@@ -15,14 +15,19 @@ try {
 }
 
 describe('runBrowserE2e', () => {
-  it('closes the Vite server after successful browser tests', async () => {
+  it('builds first and closes the Vite preview server after browser tests', async () => {
     expect(typeof runBrowserE2e).toBe('function');
 
     const events = [];
     const exitCode = await runBrowserE2e({
-      createServer: async () => ({
-        listen: async () => events.push('listen'),
-        close: async () => events.push('close'),
+      build: async () => events.push('build'),
+      createPreview: async () => ({
+        httpServer: {
+          close: (callback) => {
+            events.push('close');
+            callback();
+          },
+        },
       }),
       runTests: async () => {
         events.push('test');
@@ -31,7 +36,7 @@ describe('runBrowserE2e', () => {
     });
 
     expect({ events, exitCode }).toEqual({
-      events: ['listen', 'test', 'close'],
+      events: ['build', 'test', 'close'],
       exitCode: 0,
     });
   });

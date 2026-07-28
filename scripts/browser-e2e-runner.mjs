@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
-import { createServer as createViteServer } from 'vite';
+import { build as buildVite, preview as previewVite } from 'vite';
 
 function runWdio() {
   const isWindows = process.platform === 'win32';
@@ -29,23 +29,26 @@ function runWdio() {
 }
 
 export async function runBrowserE2e({
-  createServer = createViteServer,
+  build = buildVite,
+  createPreview = previewVite,
   runTests = runWdio,
 } = {}) {
-  const server = await createServer({
+  await build({ clearScreen: false });
+  const server = await createPreview({
     clearScreen: false,
-    server: {
+    preview: {
       host: '127.0.0.1',
       port: 5173,
       strictPort: true,
     },
   });
 
-  await server.listen();
   try {
     return await runTests();
   } finally {
-    await server.close();
+    await new Promise((resolve, reject) => {
+      server.httpServer.close((error) => error ? reject(error) : resolve());
+    });
   }
 }
 
