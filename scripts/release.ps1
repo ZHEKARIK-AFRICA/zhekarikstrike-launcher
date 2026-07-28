@@ -261,7 +261,10 @@ try {
     Invoke-MinisignWithPassword $minisign @('-S', '-s', $secretKeyPath, '-m', $updateAsset, '-x', $signaturePath) $signingPassword
     $signatureText = Read-ReleaseTextFile -Path $signaturePath
     Assert-StreamingMinisignSignature -SignatureText $signatureText
-    Invoke-Native $minisign @('-Vm', '-H', $updateAsset, '-P', $publicKeyBase64, '-x', $signaturePath)
+    Invoke-Native $minisign (Get-StreamingMinisignVerifyArguments `
+        -MessagePath $updateAsset `
+        -PublicKey $publicKeyBase64 `
+        -SignaturePath $signaturePath)
 
     $repository = $env:GITHUB_REPOSITORY
     if ([string]::IsNullOrWhiteSpace($repository)) {
@@ -378,11 +381,10 @@ try {
                         [string]$existingPlatform.signature,
                         [Text.UTF8Encoding]::new($false)
                     )
-                    Invoke-Native $minisign @(
-                        '-Vm', '-H', $existingUpdateAsset,
-                        '-P', $publicKeyBase64,
-                        '-x', $existingSignaturePath
-                    )
+                    Invoke-Native $minisign (Get-StreamingMinisignVerifyArguments `
+                        -MessagePath $existingUpdateAsset `
+                        -PublicKey $publicKeyBase64 `
+                        -SignaturePath $existingSignaturePath)
                     $manifestJson = $existingManifestJson
                 } finally {
                     if (Test-Path -LiteralPath $existingReleaseDirectory) {

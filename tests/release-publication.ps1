@@ -24,6 +24,19 @@ function New-TestMinisignText([string]$Algorithm) {
 
 Assert-StreamingMinisignSignature -SignatureText (New-TestMinisignText 'ED')
 
+$verifyArguments = @(Get-StreamingMinisignVerifyArguments `
+    -MessagePath 'launcher.exe' `
+    -PublicKey 'RWQtest' `
+    -SignaturePath 'launcher.exe.minisig')
+$expectedVerifyArguments = @(
+    '-V', '-H', '-m', 'launcher.exe',
+    '-P', 'RWQtest',
+    '-x', 'launcher.exe.minisig'
+)
+if (($verifyArguments -join "`n") -cne ($expectedVerifyArguments -join "`n")) {
+    throw "Streaming minisign verification arguments are malformed: $($verifyArguments -join ' ')"
+}
+
 $legacyRejected = $false
 try {
     Assert-StreamingMinisignSignature -SignatureText (New-TestMinisignText 'Ed')

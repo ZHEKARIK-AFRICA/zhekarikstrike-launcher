@@ -40,6 +40,20 @@ function Assert-StreamingMinisignSignature {
     }
 }
 
+function Get-StreamingMinisignVerifyArguments {
+    param(
+        [Parameter(Mandatory = $true)][string]$MessagePath,
+        [Parameter(Mandatory = $true)][string]$PublicKey,
+        [Parameter(Mandatory = $true)][string]$SignaturePath
+    )
+
+    return @(
+        '-V', '-H', '-m', $MessagePath,
+        '-P', $PublicKey,
+        '-x', $SignaturePath
+    )
+}
+
 function Invoke-NpmWithoutWorkspaces {
     param(
         [Parameter(Mandatory = $true)][string]$Executable,
