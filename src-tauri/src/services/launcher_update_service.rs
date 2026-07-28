@@ -1,5 +1,7 @@
 use std::env;
 use std::io::Read;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::Path;
 
 use chrono::DateTime;
@@ -16,6 +18,42 @@ use crate::models::{LauncherUpdateStatus, ProgressEmitter, ProgressStage, Verifi
 use crate::services::api_client::ApiClient;
 use crate::services::download_service::download_file;
 use crate::utils::hash_utils::sha256_file;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+const UPDATE_HELPER_SCRIPT: &str = concat!(
+    "@echo off\r\n",
+    "setlocal\r\n",
+    "set \"EXIT_CODE=0\"\r\n",
+    "if not exist \"%ZHEKARIK_UPDATE_NEW%\" (set \"EXIT_CODE=10\" & goto cleanup)\r\n",
+    "if exist \"%ZHEKARIK_UPDATE_OLD%\" del /F /Q \"%ZHEKARIK_UPDATE_OLD%\" >NUL 2>NUL\r\n",
+    "set \"MOVE_ATTEMPTS=0\"\r\n",
+    ":wait_for_launcher_exit\r\n",
+    "move /Y \"%ZHEKARIK_UPDATE_CURRENT%\" \"%ZHEKARIK_UPDATE_OLD%\" >NUL 2>NUL\r\n",
+    "if not errorlevel 1 goto install_update\r\n",
+    "set /A MOVE_ATTEMPTS+=1 >NUL\r\n",
+    "if %MOVE_ATTEMPTS% GEQ 30 (set \"EXIT_CODE=20\" & goto cleanup)\r\n",
+    "ping 127.0.0.1 -n 2 >NUL\r\n",
+    "goto wait_for_launcher_exit\r\n",
+    ":install_update\r\n",
+    "move /Y \"%ZHEKARIK_UPDATE_NEW%\" \"%ZHEKARIK_UPDATE_CURRENT%\" >NUL\r\n",
+    "if errorlevel 1 (\r\n",
+    "  if exist \"%ZHEKARIK_UPDATE_OLD%\" move /Y \"%ZHEKARIK_UPDATE_OLD%\" \"%ZHEKARIK_UPDATE_CURRENT%\" >NUL\r\n",
+    "  set \"EXIT_CODE=30\"\r\n",
+    "  goto cleanup\r\n",
+    ")\r\n",
+    "start \"\" \"%ZHEKARIK_UPDATE_CURRENT%\"\r\n",
+    "if errorlevel 1 (\r\n",
+    "  del /F /Q \"%ZHEKARIK_UPDATE_CURRENT%\" >NUL 2>NUL\r\n",
+    "  if exist \"%ZHEKARIK_UPDATE_OLD%\" move /Y \"%ZHEKARIK_UPDATE_OLD%\" \"%ZHEKARIK_UPDATE_CURRENT%\" >NUL\r\n",
+    "  start \"\" \"%ZHEKARIK_UPDATE_CURRENT%\"\r\n",
+    "  set \"EXIT_CODE=40\"\r\n",
+    ")\r\n",
+    ":cleanup\r\n",
+    "del /F /Q \"%~f0\" >NUL 2>NUL\r\n",
+    "exit /b %EXIT_CODE%\r\n",
+);
 
 pub async fn check_launcher_update(
     current_version: &str,
@@ -107,20 +145,36 @@ pub async fn apply_launcher_update(
         AppError::FileSystem("launcher executable has no parent directory".to_string())
     })?;
     let script = script_directory.join(format!(".zhekarik-launcher-update-{}.cmd", Uuid::new_v4()));
-    let commands = "@echo off\r\nsetlocal\r\nset \"EXIT_CODE=0\"\r\ntimeout /t 2 /nobreak >NUL\r\nif not exist \"%ZHEKARIK_UPDATE_NEW%\" (set \"EXIT_CODE=10\" & goto cleanup)\r\nif exist \"%ZHEKARIK_UPDATE_OLD%\" del /F /Q \"%ZHEKARIK_UPDATE_OLD%\" >NUL 2>NUL\r\nmove /Y \"%ZHEKARIK_UPDATE_CURRENT%\" \"%ZHEKARIK_UPDATE_OLD%\" >NUL\r\nif errorlevel 1 (set \"EXIT_CODE=20\" & goto cleanup)\r\nmove /Y \"%ZHEKARIK_UPDATE_NEW%\" \"%ZHEKARIK_UPDATE_CURRENT%\" >NUL\r\nif errorlevel 1 (\r\n  if exist \"%ZHEKARIK_UPDATE_OLD%\" move /Y \"%ZHEKARIK_UPDATE_OLD%\" \"%ZHEKARIK_UPDATE_CURRENT%\" >NUL\r\n  set \"EXIT_CODE=30\"\r\n  goto cleanup\r\n)\r\nstart \"\" \"%ZHEKARIK_UPDATE_CURRENT%\"\r\nif errorlevel 1 (\r\n  del /F /Q \"%ZHEKARIK_UPDATE_CURRENT%\" >NUL 2>NUL\r\n  if exist \"%ZHEKARIK_UPDATE_OLD%\" move /Y \"%ZHEKARIK_UPDATE_OLD%\" \"%ZHEKARIK_UPDATE_CURRENT%\" >NUL\r\n  start \"\" \"%ZHEKARIK_UPDATE_CURRENT%\"\r\n  set \"EXIT_CODE=40\"\r\n)\r\n:cleanup\r\ndel /F /Q \"%~f0\" >NUL 2>NUL\r\nexit /b %EXIT_CODE%\r\n";
-
-    tokio::fs::write(&script, commands).await?;
-    let script_arg = format!("\"{}\"", script.display());
-    Command::new("cmd")
-        .args(["/D", "/S", "/C", &script_arg])
-        .env("ZHEKARIK_UPDATE_CURRENT", &current)
-        .env("ZHEKARIK_UPDATE_NEW", &update.path)
-        .env("ZHEKARIK_UPDATE_OLD", &old)
-        .spawn()
+    tokio::fs::write(&script, UPDATE_HELPER_SCRIPT).await?;
+    spawn_update_script(&script, &current, &update.path, &old)
         .map_err(|error| AppError::Unknown(error.to_string()))?;
 
     app.exit(0);
     Ok(())
+}
+
+fn spawn_update_script(
+    script: &Path,
+    current: &Path,
+    new: &Path,
+    old: &Path,
+) -> std::io::Result<tokio::process::Child> {
+    let mut command = Command::new("cmd.exe");
+    command
+        .args(["/D", "/S", "/C"])
+        .env("ZHEKARIK_UPDATE_CURRENT", current)
+        .env("ZHEKARIK_UPDATE_NEW", new)
+        .env("ZHEKARIK_UPDATE_OLD", old);
+    #[cfg(windows)]
+    {
+        command
+            .as_std_mut()
+            .raw_arg(format!("\"\"{}\"\"", script.display()));
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    command.arg(script);
+    command.spawn()
 }
 
 async fn validate_update_artifact(update: &VerifiedLauncherUpdate) -> Result<(), AppError> {
@@ -297,8 +351,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        extract_public_key_base64, validate_update_artifact_with_key, validate_update_manifest,
-        verify_minisign_signature_with_key,
+        extract_public_key_base64, spawn_update_script, validate_update_artifact_with_key,
+        validate_update_manifest, verify_minisign_signature_with_key, UPDATE_HELPER_SCRIPT,
     };
     use crate::models::LauncherUpdateManifest;
 
@@ -446,5 +500,40 @@ mod tests {
         )
         .await
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn updater_script_replaces_relaunches_and_cleans_up() {
+        let directory = tempdir().expect("temp directory should be created");
+        let script = directory.path().join("update helper.cmd");
+        let current = directory.path().join("launcher with spaces.exe");
+        let new = directory.path().join("downloaded launcher.exe");
+        let old = directory.path().join("launcher with spaces.old.exe");
+        let system32 = std::path::PathBuf::from(
+            std::env::var_os("WINDIR").expect("WINDIR should be available"),
+        )
+        .join("System32");
+        fs::copy(system32.join("where.exe"), &current)
+            .expect("old executable fixture should be copied");
+        fs::copy(system32.join("rundll32.exe"), &new)
+            .expect("new executable fixture should be copied");
+        let expected_old = fs::read(&current).expect("old fixture should be readable");
+        let expected_current = fs::read(&new).expect("new fixture should be readable");
+        fs::write(&script, UPDATE_HELPER_SCRIPT).expect("helper fixture should be written");
+
+        let mut child =
+            spawn_update_script(&script, &current, &new, &old).expect("helper should spawn");
+        child.wait().await.expect("helper should exit");
+
+        assert_eq!(
+            fs::read(&current).expect("new launcher should be installed"),
+            expected_current
+        );
+        assert_eq!(
+            fs::read(&old).expect("old launcher should be retained"),
+            expected_old
+        );
+        assert!(!new.exists());
+        assert!(!script.exists());
     }
 }
