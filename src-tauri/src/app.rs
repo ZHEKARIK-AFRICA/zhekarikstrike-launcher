@@ -234,30 +234,61 @@ fn launcher_executable_matches(existing: &str, current: &str) -> bool {
 fn focus_existing_main_window() -> bool {
     use std::os::windows::ffi::OsStrExt;
 
-    use windows::core::{PCWSTR, PWSTR};
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-        PROCESS_QUERY_LIMITED_INFORMATION,
-    };
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
-        FindWindowW, GetWindowThreadProcessId, SetForegroundWindow, ShowWindow, SW_RESTORE,
+        FindWindowExW, SetForegroundWindow, ShowWindow, SW_RESTORE,
     };
 
     let title = std::ffi::OsStr::new(crate::constants::PRODUCT_NAME)
         .encode_wide()
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
-    let Ok(window) = (unsafe { FindWindowW(PCWSTR::null(), PCWSTR(title.as_ptr())) }) else {
+    let Ok(current_executable) = std::env::current_exe() else {
         return false;
     };
+    let mut previous = HWND::default();
+    loop {
+        let Ok(window) = (unsafe {
+            FindWindowExW(
+                HWND::default(),
+                previous,
+                PCWSTR::null(),
+                PCWSTR(title.as_ptr()),
+            )
+        }) else {
+            return false;
+        };
+        previous = window;
+        let Some(existing_executable) = window_process_executable(window) else {
+            continue;
+        };
+        if !launcher_executable_matches(&existing_executable, &current_executable.to_string_lossy())
+        {
+            continue;
+        }
+
+        unsafe {
+            let _ = ShowWindow(window, SW_RESTORE);
+            let _ = SetForegroundWindow(window);
+        }
+        return true;
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn window_process_executable(window: windows::Win32::Foundation::HWND) -> Option<String> {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
 
     let mut pid = 0_u32;
     unsafe { GetWindowThreadProcessId(window, Some(&mut pid)) };
-    let Ok(process) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) })
-    else {
-        return false;
-    };
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
     let mut image_path = vec![0_u16; 32_768];
     let mut image_path_len = image_path.len() as u32;
     let query_result = unsafe {
@@ -269,22 +300,10 @@ fn focus_existing_main_window() -> bool {
         )
     };
     let _ = unsafe { CloseHandle(process) };
-    if query_result.is_err() {
-        return false;
-    }
-    let existing_executable = String::from_utf16_lossy(&image_path[..image_path_len as usize]);
-    let Ok(current_executable) = std::env::current_exe() else {
-        return false;
-    };
-    if !launcher_executable_matches(&existing_executable, &current_executable.to_string_lossy()) {
-        return false;
-    }
-
-    unsafe {
-        let _ = ShowWindow(window, SW_RESTORE);
-        let _ = SetForegroundWindow(window);
-    }
-    true
+    query_result.ok()?;
+    Some(String::from_utf16_lossy(
+        &image_path[..image_path_len as usize],
+    ))
 }
 
 #[cfg(not(target_os = "windows"))]

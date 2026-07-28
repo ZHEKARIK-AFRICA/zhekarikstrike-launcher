@@ -1,4 +1,6 @@
-use tauri::{AppHandle, Emitter, State};
+#[cfg(feature = "e2e")]
+use tauri::Emitter;
+use tauri::{AppHandle, State};
 
 use crate::error::AppError;
 use crate::services::{config_service, game_process_service};
@@ -30,10 +32,10 @@ pub async fn launch_game(app: AppHandle, state: State<'_, AppState>) -> Result<(
 
 #[tauri::command]
 pub async fn stop_game(app: AppHandle, state: State<'_, AppState>) -> Result<(), AppError> {
-    let pid = state.process_state.read().await.pid;
-    if let Some(pid) = pid {
+    let process = state.process_state.read().await.clone();
+    if let Some(pid) = process.pid.filter(|_| process.owned) {
         game_process_service::stop_game_process(pid).await?;
-        app.emit("game-closed", ())?;
     }
+    let _ = app;
     Ok(())
 }

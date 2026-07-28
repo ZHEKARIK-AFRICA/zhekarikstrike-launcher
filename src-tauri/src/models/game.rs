@@ -39,4 +39,6 @@ pub enum GameProcessStateKind {
 pub struct GameProcessState {
     pub kind: GameProcessStateKind,
     pub pid: Option<u32>,
+    #[serde(skip)]
+    pub owned: bool,
 }

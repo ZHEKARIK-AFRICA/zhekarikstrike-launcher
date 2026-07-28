@@ -60,6 +60,7 @@ pub async fn launch_game(
             let mut process_state = state.process_state.write().await;
             process_state.kind = GameProcessStateKind::Starting;
             process_state.pid = None;
+            process_state.owned = true;
         }
 
         let previous = std::mem::take(&mut *state.copied_pure_files.lock().await);
@@ -88,8 +89,8 @@ pub async fn launch_game(
             let mut process_state = state.process_state.write().await;
             process_state.kind = GameProcessStateKind::Running;
             process_state.pid = Some(game_process.pid);
+            process_state.owned = true;
         }
-        *state.owned_game_pid.write().await = Some(game_process.pid);
 
         app.emit("game-started", game_process.clone())?;
         monitor_game_process(app.clone(), state.clone(), game_process.pid);
@@ -127,11 +128,10 @@ pub async fn sync_game_process(
         if is_pid_running(pid).await {
             return Ok(current);
         }
-        shutdown_service::cleanup_runtime(app.clone(), state).await?;
+        shutdown_service::cleanup_runtime_for_process(app.clone(), state, pid).await?;
     }
 
     let synchronized = detected_process_state(find_process_by_name(GAME_PROCESS_NAME).await);
-    *state.owned_game_pid.write().await = None;
     *state.process_state.write().await = synchronized.clone();
     if let Some(pid) = synchronized.pid {
         monitor_game_process(app, state.clone(), pid);
@@ -148,7 +148,7 @@ pub fn monitor_game_process(app: AppHandle, state: AppState, pid: u32) {
             }
         }
 
-        let _ = shutdown_service::cleanup_runtime(app.clone(), &state).await;
+        let _ = shutdown_service::cleanup_runtime_for_process(app.clone(), &state, pid).await;
     });
 }
 
@@ -184,16 +184,14 @@ fn detected_process_state(process: Option<GameProcessInfo>) -> GameProcessState 
         Some(process) => GameProcessState {
             kind: GameProcessStateKind::Running,
             pid: Some(process.pid),
+            owned: false,
         },
         None => GameProcessState::default(),
     }
 }
 
-pub(crate) fn is_observed_external_process(
-    tracked_pid: Option<u32>,
-    owned_pid: Option<u32>,
-) -> bool {
-    tracked_pid.is_some() && tracked_pid != owned_pid
+pub(crate) fn is_observed_external_process(tracked_pid: Option<u32>, owned: bool) -> bool {
+    tracked_pid.is_some() && !owned
 }
 
 #[cfg(test)]
@@ -217,10 +215,9 @@ mod release_1_6_11_tests {
 
     #[test]
     fn release_1_6_11_external_game_is_observed_but_not_owned() {
-        assert!(is_observed_external_process(Some(42), None));
-        assert!(is_observed_external_process(Some(42), Some(7)));
-        assert!(!is_observed_external_process(Some(42), Some(42)));
-        assert!(!is_observed_external_process(None, None));
+        assert!(is_observed_external_process(Some(42), false));
+        assert!(!is_observed_external_process(Some(42), true));
+        assert!(!is_observed_external_process(None, false));
     }
 }
 
