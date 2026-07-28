@@ -217,7 +217,7 @@ pub fn apply_layout(window: &WebviewWindow, layout: WindowLayout) -> Result<(), 
 
 #[cfg(windows)]
 mod platform {
-    use std::collections::HashMap;
+    use std::collections::{hash_map::Entry, HashMap};
     use std::sync::{Mutex, OnceLock};
 
     use tauri::WebviewWindow;
@@ -280,11 +280,15 @@ mod platform {
             let mut active = layouts().lock().map_err(|_| {
                 AppError::Unknown("window aspect-ratio state is poisoned".to_string())
             })?;
-            if active.contains_key(&key(hwnd)) {
-                active.insert(key(hwnd), layout);
-                return Ok(());
+            match active.entry(key(hwnd)) {
+                Entry::Occupied(mut entry) => {
+                    entry.insert(layout);
+                    return Ok(());
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(layout);
+                }
             }
-            active.insert(key(hwnd), layout);
         }
 
         let installed = unsafe {
