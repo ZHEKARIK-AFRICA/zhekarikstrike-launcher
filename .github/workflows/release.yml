@@ -32,7 +32,25 @@ jobs:
 
       - name: Install minisign
         shell: powershell
-        run: choco install minisign --yes --no-progress
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $uri = 'https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-win64.zip'
+          $archive = Join-Path $env:RUNNER_TEMP 'minisign-0.12-win64.zip'
+          $destination = Join-Path $env:RUNNER_TEMP 'minisign-0.12'
+          Invoke-WebRequest -UseBasicParsing -Uri $uri -OutFile $archive
+          $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expected = '37b600344e20c19314b2e82813db2bfdcc408b77b876f7727889dbd46d539479'
+          if ($actual -ne $expected) {
+            throw "minisign archive SHA-256 mismatch: $actual"
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $destination
+          $bin = Join-Path $destination 'minisign-win64\x86_64'
+          [IO.File]::AppendAllText(
+            $env:GITHUB_PATH,
+            "$bin`n",
+            [Text.UTF8Encoding]::new($false)
+          )
+          & (Join-Path $bin 'minisign.exe') -v
 
       - name: Build, test, sign, and publish
         shell: powershell

@@ -15,6 +15,25 @@ try {
     Remove-Item -LiteralPath $signaturePath -Force -ErrorAction SilentlyContinue
 }
 
+function New-TestMinisignText([string]$Algorithm) {
+    $record = [byte[]]::new(74)
+    $record[0] = [byte][char]$Algorithm[0]
+    $record[1] = [byte][char]$Algorithm[1]
+    return "untrusted comment: test`n$([Convert]::ToBase64String($record))`ntrusted comment: test`n$([Convert]::ToBase64String([byte[]]::new(64)))`n"
+}
+
+Assert-StreamingMinisignSignature -SignatureText (New-TestMinisignText 'ED')
+
+$legacyRejected = $false
+try {
+    Assert-StreamingMinisignSignature -SignatureText (New-TestMinisignText 'Ed')
+} catch {
+    $legacyRejected = $_.Exception.Message -match 'streaming ED'
+}
+if (-not $legacyRejected) {
+    throw 'Legacy Ed launcher signature was accepted by the release pipeline.'
+}
+
 function New-LauncherManifest {
     param(
         [string]$Version = '1.6.1',

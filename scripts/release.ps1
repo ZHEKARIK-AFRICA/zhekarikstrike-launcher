@@ -100,6 +100,13 @@ try {
     $git = Get-RequiredCommand 'git.exe'
     $minisign = Get-RequiredCommand 'minisign.exe'
 
+    $minisignVersionOutput = @(& $minisign -v 2>&1)
+    $minisignVersionExitCode = $LASTEXITCODE
+    $minisignVersion = (($minisignVersionOutput | ForEach-Object { [string]$_ }) -join "`n").Trim()
+    if ($minisignVersionExitCode -ne 0 -or $minisignVersion -cne 'minisign 0.12') {
+        throw "Launcher releases require minisign 0.12; got '$minisignVersion'."
+    }
+
     $package = Get-Content -LiteralPath (Join-Path $repoRoot 'package.json') -Raw | ConvertFrom-Json
     $packageLockText = Get-Content -LiteralPath (Join-Path $repoRoot 'package-lock.json') -Raw
     $packageLockMatch = [regex]::Match($packageLockText, '(?m)^\s*"version"\s*:\s*"([^"]+)"')
@@ -252,7 +259,9 @@ try {
 
     $signaturePath = "$updateAsset.minisig"
     Invoke-MinisignWithPassword $minisign @('-S', '-s', $secretKeyPath, '-m', $updateAsset, '-x', $signaturePath) $signingPassword
-    Invoke-Native $minisign @('-Vm', $updateAsset, '-P', $publicKeyBase64, '-x', $signaturePath)
+    $signatureText = Read-ReleaseTextFile -Path $signaturePath
+    Assert-StreamingMinisignSignature -SignatureText $signatureText
+    Invoke-Native $minisign @('-Vm', '-H', $updateAsset, '-P', $publicKeyBase64, '-x', $signaturePath)
 
     $repository = $env:GITHUB_REPOSITORY
     if ([string]::IsNullOrWhiteSpace($repository)) {
@@ -363,13 +372,14 @@ try {
                         throw "Existing GitHub updater asset hash does not match its manifest."
                     }
                     $existingSignaturePath = Join-Path $existingReleaseDirectory "$updateAssetName.minisig"
+                    Assert-StreamingMinisignSignature -SignatureText ([string]$existingPlatform.signature)
                     [IO.File]::WriteAllText(
                         $existingSignaturePath,
                         [string]$existingPlatform.signature,
                         [Text.UTF8Encoding]::new($false)
                     )
                     Invoke-Native $minisign @(
-                        '-Vm', $existingUpdateAsset,
+                        '-Vm', '-H', $existingUpdateAsset,
                         '-P', $publicKeyBase64,
                         '-x', $existingSignaturePath
                     )

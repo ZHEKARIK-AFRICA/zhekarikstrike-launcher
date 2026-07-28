@@ -13,6 +13,33 @@ function Read-ReleaseTextFile {
     return [IO.File]::ReadAllText($resolvedPath)
 }
 
+function Get-MinisignSignatureAlgorithm {
+    param([Parameter(Mandatory = $true)][string]$SignatureText)
+
+    $lines = @($SignatureText -split "`r?`n")
+    if ($lines.Count -lt 2) {
+        throw 'Minisign signature is incomplete.'
+    }
+    try {
+        $record = [Convert]::FromBase64String($lines[1])
+    } catch {
+        throw 'Minisign signature record is not valid base64.'
+    }
+    if ($record.Length -ne 74) {
+        throw 'Minisign signature record must be 74 bytes.'
+    }
+    return [Text.Encoding]::ASCII.GetString($record, 0, 2)
+}
+
+function Assert-StreamingMinisignSignature {
+    param([Parameter(Mandatory = $true)][string]$SignatureText)
+
+    $algorithm = Get-MinisignSignatureAlgorithm -SignatureText $SignatureText
+    if ($algorithm -cne 'ED') {
+        throw "Launcher updates require a streaming ED minisign signature; got $algorithm."
+    }
+}
+
 function Invoke-NpmWithoutWorkspaces {
     param(
         [Parameter(Mandatory = $true)][string]$Executable,
