@@ -27,13 +27,23 @@ async function expectModalMessage(text) {
     await expect($('#error-message')).toHaveText(expect.stringContaining(text));
 }
 
+async function expectTechnicalDetails(text) {
+    await browser.waitUntil(async () => {
+        const content = await $('#error-technical-message').getProperty('textContent');
+        return String(content).includes(text);
+    });
+}
+
 const installStartup = {
     get_language: { value: 'en' },
+    get_current_state: { value: { operation: 'idle' } },
+    recover_pending_install: { value: { recovered: false } },
     get_game_path: { value: 'D:\\Games\\ZHEKARIKSTRIKE' }
 };
 
 const mainStartup = {
     get_language: { value: 'en' },
+    recover_pending_install: { value: { recovered: false } },
     get_game_data: {
         value: {
             nickname: 'Player',
@@ -81,7 +91,10 @@ describe('Tauri renderer pages in browser mode', () => {
         await $('#start-install').click();
         await browser.waitUntil(async () => (await browser.getUrl()).endsWith('/public/index.html'));
         const args = await browser.execute(() => JSON.parse(localStorage.getItem('lastInstallArgs')));
-        expect(args).toEqual({ gamePath: 'D:\\Games\\ZHEKARIKSTRIKE' });
+        expect(args).toEqual(expect.objectContaining({
+            gamePath: 'D:\\Games\\ZHEKARIKSTRIKE',
+            operationId: expect.any(String)
+        }));
     });
 
     it('renders install errors and cancellation without terminal events', async () => {
@@ -90,7 +103,8 @@ describe('Tauri renderer pages in browser mode', () => {
             install_game: { reject: { code: 'network', message: 'offline' } }
         });
         await $('#start-install').click();
-        await expectModalMessage('offline');
+        await expectModalMessage('installation was not completed');
+        await expectTechnicalDetails('offline');
 
         await openWithMocks('install.html', {
             ...installStartup,
@@ -98,7 +112,7 @@ describe('Tauri renderer pages in browser mode', () => {
             cancel_install: { value: null }
         });
         await $('#start-install').click();
-        await expect($('#install-status')).toHaveText('cancel');
+        await expect($('#install-status')).toHaveText('installation canceled');
         await $('#cancel-install').click();
     });
 
@@ -109,7 +123,9 @@ describe('Tauri renderer pages in browser mode', () => {
         });
         await $('#check-files').click();
         await mocks.verify_files.update();
-        expect(mocks.verify_files.mock.calls[0][0]).toEqual({ checkAllFiles: true });
+        expect(mocks.verify_files.mock.calls[0][0]).toEqual(expect.objectContaining({
+            checkAllFiles: true, operationId: expect.any(String)
+        }));
         await expect($('#launcher-status')).toHaveText('files are good!');
 
         await openWithMocks('index.html', {
@@ -117,7 +133,8 @@ describe('Tauri renderer pages in browser mode', () => {
             verify_files: { reject: { code: 'network', message: 'verify failed' } }
         });
         await $('#check-files').click();
-        await expectModalMessage('verify failed');
+        await expectModalMessage('file verification failed');
+        await expectTechnicalDetails('verify failed');
 
         mocks = await openWithMocks('index.html', {
             ...mainStartup,
@@ -144,7 +161,9 @@ describe('Tauri renderer pages in browser mode', () => {
         });
         await mocks.verify_files.update();
         await mocks.update_rev_ini.update();
-        expect(mocks.verify_files.mock.calls[0][0]).toEqual({ checkAllFiles: false });
+        expect(mocks.verify_files.mock.calls[0][0]).toEqual(expect.objectContaining({
+            checkAllFiles: false, operationId: expect.any(String)
+        }));
         expect(mocks.update_rev_ini.mock.calls[0][0]).toEqual({
             launchParams: '-novid',
             clanTag: 'ZS',
@@ -158,12 +177,14 @@ describe('Tauri renderer pages in browser mode', () => {
             update_game: { reject: { code: 'network', message: 'update unavailable' } }
         });
         await $('#play-button').click();
-        await expectModalMessage('update unavailable');
+        await expectModalMessage('failed to check game updates');
+        await expectTechnicalDetails('update unavailable');
     });
 
     it('handles updater success and acknowledges failure without bypassing the update', async () => {
         let mocks = await openWithMocks('launcher_update.html', {
             get_language: { value: 'en' },
+            get_current_state: { value: { operation: 'idle', launcherUpdateReady: false } },
             download_launcher_update: { value: null },
             apply_launcher_update: { value: null }
         });
@@ -174,15 +195,32 @@ describe('Tauri renderer pages in browser mode', () => {
 
         await openWithMocks('launcher_update.html', {
             get_language: { value: 'en' },
+            get_current_state: { value: { operation: 'idle', launcherUpdateReady: false } },
             download_launcher_update: {
                 reject: { code: 'invalid-data', message: 'signature mismatch' }
             }
         });
-        await expectModalMessage('signature mismatch');
+        await expectModalMessage('launcher update failed');
+        await expectTechnicalDetails('signature mismatch');
         expect(await $('#continue-without-update').isExisting()).toBe(false);
         await $('#error-modal-ok').click();
         await browser.waitUntil(async () =>
             (await $('#error-modal').getCSSProperty('display')).value === 'none'
         );
+    });
+
+    it('reuses a verified updater artifact after the update page reloads', async () => {
+        const mocks = await openWithMocks('launcher_update.html', {
+            get_language: { value: 'en' },
+            get_current_state: { value: { operation: 'idle', launcherUpdateReady: true } },
+            download_launcher_update: { value: null },
+            apply_launcher_update: { value: null }
+        });
+        await browser.waitUntil(async () => {
+            await mocks.apply_launcher_update.update();
+            return mocks.apply_launcher_update.mock.calls.length === 1;
+        });
+        await mocks.download_launcher_update.update();
+        expect(mocks.download_launcher_update.mock.calls).toHaveLength(0);
     });
 });

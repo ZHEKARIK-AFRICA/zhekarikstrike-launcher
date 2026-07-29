@@ -28,7 +28,21 @@
         <div id="error-modal-content" class="modal-content">
             <h2 id="error-modal-title">ашибка...</h2>
             <p id="error-message">произошла ошибка.</p>
+            <details id="error-technical" hidden>
+                <summary>технические подробности</summary>
+                <pre id="error-technical-message"></pre>
+            </details>
             <button id="error-modal-ok" class="modal-ok">понял</button>
+        </div>
+    </div>
+    <div id="close-confirmation-modal" class="modal">
+        <div class="modal-content close-confirmation-content">
+            <h2 id="close-confirmation-title">закрыть лаунчер?</h2>
+            <p id="close-confirmation-message"></p>
+            <div class="modal-actions">
+                <button id="close-confirmation-cancel" class="modal-button">остаться</button>
+                <button id="close-confirmation-confirm" class="modal-ok">закрыть лаунчер</button>
+            </div>
         </div>
     </div>
     <div id="settings-modal" class="modal">
@@ -40,7 +54,7 @@
             <button id="close-settings" class="modal-ok">закрыть</button>
         </div>
     </div>
-    <div class="launcher-container">
+    <div class="launcher-container" aria-busy="true">
         <!-- Блок настроек -->
         <div class="settings">
             <h1 id="zhekarik-strike-title">ЖЕКАРИК СТРАЙК</h1>
@@ -58,11 +72,11 @@
                 </div>
             </div>
 
-            <button id="play-button" class="main-action-button">ИГРАТЬ</button>
+            <button id="play-button" class="main-action-button" disabled>ИГРАТЬ</button>
 
             <div class="bottom-controls">
-                <button id="check-files">проверить целостность файлов</button>
-                <p id="launcher-status">готов к запуску!</p>
+                <button id="check-files" disabled>проверить целостность файлов</button>
+                <p id="launcher-status" role="status" aria-live="polite">загружаем данные...</p>
             </div>
         </div>
 

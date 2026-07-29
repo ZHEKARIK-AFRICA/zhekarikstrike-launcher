@@ -82,3 +82,60 @@
     background-color: var(--black-color-hover);
     cursor: pointer;
 }
+
+.modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    gap: 1.5vh;
+    z-index: 1;
+}
+
+.modal-actions .modal-ok {
+    align-self: auto;
+    padding-inline: 5vh;
+}
+
+.modal-actions button:disabled {
+    cursor: wait;
+    filter: brightness(0.55);
+}
+
+#error-technical {
+    z-index: 1;
+    color: var(--grey-color);
+    font-size: calc(var(--main-font-size) * 0.85);
+    max-width: 100%;
+}
+
+#error-technical summary {
+    cursor: pointer;
+    user-select: none;
+}
+
+#error-technical-message {
+    max-height: 18vh;
+    overflow: auto;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    user-select: text;
+}
+
+[data-status-kind="error"] {
+    color: #d98585 !important;
+}
+
+[data-status-kind="success"],
+[data-status-kind="running"] {
+    color: #91b69a !important;
+}
+
+#progress-bar.indeterminate {
+    width: 35% !important;
+    animation: status-indeterminate 1.2s ease-in-out infinite;
+}
+
+@keyframes status-indeterminate {
+    0% { transform: translateX(-110%); }
+    100% { transform: translateX(300%); }
+}

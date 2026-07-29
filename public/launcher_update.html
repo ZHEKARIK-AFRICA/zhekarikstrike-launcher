@@ -27,15 +27,29 @@
         <div id="error-modal-content" class="modal-content">
             <h2>ашибка...</h2>
             <p id="error-message">произошла ошибка.</p>
+            <details id="error-technical" hidden>
+                <summary>технические подробности</summary>
+                <pre id="error-technical-message"></pre>
+            </details>
             <button id="error-modal-ok" class="modal-ok">понял</button>
         </div>
     </div>
-    <div class="launcher-container update-container">
+    <div id="close-confirmation-modal" class="modal">
+        <div class="modal-content close-confirmation-content">
+            <h2 id="close-confirmation-title">закрыть лаунчер?</h2>
+            <p id="close-confirmation-message"></p>
+            <div class="modal-actions">
+                <button id="close-confirmation-cancel" class="modal-button">остаться</button>
+                <button id="close-confirmation-confirm" class="modal-ok">закрыть лаунчер</button>
+            </div>
+        </div>
+    </div>
+    <div class="launcher-container update-container" aria-busy="true">
         <h1>ТВОЙ ЛАУНЧЕР - <br />УСТАРЕВШАЯ Х*****Я</h1>
     </div>
     <footer>
         <div class="footer-down">
-            <p id="progress-status">скачиваю новую версию...</p>
+            <p id="progress-status" role="status" aria-live="polite">скачиваю новую версию...</p>
             <p id="progress-info"></p>
         </div>
         <div id="progress-container">
@@ -46,6 +60,6 @@
     <script src="../src/localization/localization_update.js" type="module" defer></script>
     <script src="../src/renderer/common.js" type="module"></script>
     <script src="../src/renderer/renderer.js" type="module"></script>
-    <script src="../src/renderer/renderer_launcher_update.js" type="module"></script> <!-- Add this line -->
+    <script src="../src/renderer/renderer_launcher_update.js" type="module"></script>
 </body>
 </html>

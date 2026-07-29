@@ -22,7 +22,11 @@ function renderMainPage() {
         <div id="progress-bar"></div>
         <div id="launcher-status"></div>
         <div id="progress-info"></div>
-        <div id="error-modal"><span id="error-message"></span><button id="error-modal-ok"></button></div>
+        <div id="error-modal">
+            <span id="error-message"></span>
+            <details id="error-technical"><pre id="error-technical-message"></pre></details>
+            <button id="error-modal-ok"></button>
+        </div>
     `;
 }
 
@@ -48,7 +52,7 @@ describe('main renderer Tauri command contracts', () => {
                 return { nickname: '', clanTag: '', launchParams: '', gamePath: 'C:\\Game' };
             }
             if (command === 'get_current_state') {
-                return { processInProgress: false, verificationInProgress: false };
+                return { processInProgress: false, verificationInProgress: false, operation: 'idle' };
             }
             if (command === 'get_game_process_state') {
                 return { kind: 'stopped', pid: null };
@@ -63,7 +67,10 @@ describe('main renderer Tauri command contracts', () => {
         document.getElementById('check-files').click();
 
         await vi.waitFor(() => {
-            expect(invoke).toHaveBeenCalledWith('verify_files', { checkAllFiles: true });
+            expect(invoke).toHaveBeenCalledWith('verify_files', expect.objectContaining({
+                checkAllFiles: true,
+                operationId: expect.any(String)
+            }));
         });
     });
 
@@ -73,7 +80,42 @@ describe('main renderer Tauri command contracts', () => {
         document.getElementById('play-button').click();
 
         await vi.waitFor(() => {
-            expect(invoke).toHaveBeenCalledWith('verify_files', { checkAllFiles: false });
+            expect(invoke).toHaveBeenCalledWith('verify_files', expect.objectContaining({
+                checkAllFiles: false,
+                operationId: expect.any(String)
+            }));
+        });
+    });
+
+    it('release_1_6_12_replaces_searching_updates_with_a_terminal_network_error', async () => {
+        invoke.mockImplementation(async (command) => {
+            if (command === 'get_language') return 'en';
+            if (command === 'get_game_data') {
+                return { nickname: '', clanTag: '', launchParams: '', gamePath: 'C:\\Game' };
+            }
+            if (command === 'get_current_state') {
+                return { processInProgress: false, verificationInProgress: false, operation: 'idle' };
+            }
+            if (command === 'get_game_process_state') return { kind: 'stopped', pid: null };
+            if (command === 'recover_pending_install') return { recovered: false };
+            if (command === 'update_game') {
+                throw {
+                    code: 'network',
+                    message: 'error sending request for url (https://api.zhekarik.africa/launcher/game/v2/manifest)'
+                };
+            }
+            return null;
+        });
+        await loadRenderer();
+
+        document.getElementById('play-button').click();
+
+        await vi.waitFor(() => {
+            expect(document.getElementById('launcher-status').textContent)
+                .toBe('failed to check game updates');
+            expect(document.getElementById('progress-bar').style.width).toBe('0%');
+            expect(document.getElementById('error-technical-message').textContent)
+                .toContain('https://api.zhekarik.africa/launcher/game/v2/manifest');
         });
     });
 

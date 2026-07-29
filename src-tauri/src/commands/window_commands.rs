@@ -2,7 +2,7 @@ use tauri::{AppHandle, Manager, State};
 
 use crate::error::AppError;
 use crate::services::{
-    shutdown_service,
+    close_service,
     window_resize_service::{self, MAIN_WINDOW_LAYOUT, UPDATE_WINDOW_LAYOUT},
 };
 use crate::state::AppState;
@@ -17,13 +17,20 @@ pub async fn minimize_window(app: AppHandle) -> Result<(), AppError> {
 
 #[tauri::command]
 pub async fn close_window(app: AppHandle, state: State<'_, AppState>) -> Result<(), AppError> {
-    let cleanup_result = if state.begin_shutdown() {
-        shutdown_service::shutdown(app.clone(), state.inner()).await
-    } else {
-        Ok(())
-    };
-    app.exit(0);
-    cleanup_result
+    close_service::request_close(app, state.inner()).await
+}
+
+#[tauri::command]
+pub async fn confirm_close_window(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), AppError> {
+    close_service::confirm_close(app, state.inner()).await
+}
+
+#[tauri::command]
+pub fn cancel_close_window(state: State<'_, AppState>) -> Result<bool, AppError> {
+    Ok(close_service::cancel_close(state.inner()))
 }
 
 #[tauri::command]

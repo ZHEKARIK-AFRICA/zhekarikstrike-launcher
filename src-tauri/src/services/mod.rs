@@ -1,6 +1,7 @@
 pub mod api_client;
 pub mod archive_service;
 pub mod avatar_service;
+pub mod close_service;
 pub mod config_service;
 pub mod content_download_service;
 pub mod content_install_service;

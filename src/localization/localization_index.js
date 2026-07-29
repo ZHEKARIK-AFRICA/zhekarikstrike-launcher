@@ -11,15 +11,13 @@ function applyTranslations() {
     setText('#zhekarik-strike-title', 'zhekarik_strike_title');
     setText('label[for="game-path"]', 'game_path');
     setText('#close-settings', 'close');
-    setText('#play-button', 'play');
     setText('label[for="launch-params"]', 'launch_params');
     setText('label[for="clan-tag"]', 'clan_tag');
     setText('label[for="nickname"]', 'nickname');
-    setText('#check-files', 'check_files');
-    setText('#launcher-status', 'status_ready');
     setText('#error-message', 'error_message');
     setText('#error-modal-title', 'error_title');
     setText('#error-modal-ok', 'error_modal_ok');
+    setText('#error-technical summary', 'technical_details');
     setText('a[href="https://zhekarik.africa/strike/stream"]', 'links.stream');
     setText('a[href="https://zhekarik.africa/strike/vip"]', 'links.vip');
     setText('a[href="https://zhekarik.africa/strike/demos"]', 'links.demos');

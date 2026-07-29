@@ -37,6 +37,10 @@ pub struct ContentJournal {
 #[serde(deny_unknown_fields)]
 pub struct ContentCompletionState {
     pub schema_version: u8,
+    /// Absent in v1 state files written before transactional completion was tracked.
+    /// Those files remain readable, but can never complete a newer journal transaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transaction_id: Option<String>,
     pub content_sha256: String,
     pub release_id: String,
     pub game_version: String,
@@ -86,10 +90,10 @@ pub async fn write_journal(game_path: &Path, journal: &ContentJournal) -> Result
     atomic_json(&journal_path(game_path), journal).await
 }
 
-pub async fn recover_pending_content(game_path: &Path) -> Result<(), AppError> {
+pub async fn recover_pending_content(game_path: &Path) -> Result<bool, AppError> {
     let path = journal_path(game_path);
     if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
-        return Ok(());
+        return Ok(false);
     }
     let bytes = tokio::fs::read(&path).await?;
     let journal: ContentJournal = serde_json::from_slice(&bytes)
@@ -101,6 +105,7 @@ pub async fn recover_pending_content(game_path: &Path) -> Result<(), AppError> {
         .flatten()
         .is_some_and(|state| {
             state.schema_version == 1
+                && state.transaction_id.as_deref() == Some(journal.transaction_id.as_str())
                 && state.content_sha256 == journal.content_sha256
                 && state.release_id == journal.release_id
         });
@@ -109,7 +114,7 @@ pub async fn recover_pending_content(game_path: &Path) -> Result<(), AppError> {
     }
     cleanup_transaction(game_path, &journal.transaction_id).await?;
     remove_file_if_exists(&path).await?;
-    Ok(())
+    Ok(true)
 }
 
 pub async fn load_completion_state(

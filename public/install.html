@@ -26,26 +26,40 @@
         <div id="error-modal-content" class="modal-content">
             <h2 id="error-modal-title">ашибка...</h2>
             <p id="error-message">произошла ошибка.</p>
+            <details id="error-technical" hidden>
+                <summary>технические подробности</summary>
+                <pre id="error-technical-message"></pre>
+            </details>
             <button id="error-modal-ok" class="modal-ok">понял</button>
         </div>
     </div>
-    <div class="launcher-container install-container">
+    <div id="close-confirmation-modal" class="modal">
+        <div class="modal-content close-confirmation-content">
+            <h2 id="close-confirmation-title">закрыть лаунчер?</h2>
+            <p id="close-confirmation-message"></p>
+            <div class="modal-actions">
+                <button id="close-confirmation-cancel" class="modal-button">остаться</button>
+                <button id="close-confirmation-confirm" class="modal-ok">закрыть лаунчер</button>
+            </div>
+        </div>
+    </div>
+    <div class="launcher-container install-container" aria-busy="true">
         <h1 id="zhekarik-strike-title">ЖЕКАРИК СТРАЙК</h1>
         <div class="installing-menu">
             <div class="choose-path">
                 <label for="install-path" id="install-path-label" spellcheck="false">куда установить игру?</label>
                 <div class="choose-path-input">
-                    <input type="text" id="install-path" class="input" placeholder="путь к жекарик страйку">
-                    <button id="choose-folder" class="choose-folder-button">
+                    <input type="text" id="install-path" class="input" placeholder="путь к жекарик страйку" disabled>
+                    <button id="choose-folder" class="choose-folder-button" disabled>
                         <img src="assets/img/browse-button-icon.svg" alt="Выбрать папку">
                     </button>
                 </div>
             </div>
             <div class="install-buttons">
-                <button id="start-install" class="main-action-button">НАЧАТЬ УСТАНОВКУ</button>
+                <button id="start-install" class="main-action-button" disabled>НАЧАТЬ УСТАНОВКУ</button>
                 <div class="main-actions">
-                    <button id="cancel-install">отмена</button>
-                    <p id="install-status">ожидание...</p>
+                    <button id="cancel-install" disabled>отмена</button>
+                    <p id="install-status" role="status" aria-live="polite">загружаем данные...</p>
                 </div>
             </div>
         </div>

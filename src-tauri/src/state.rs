@@ -20,6 +20,7 @@ pub enum OperationKind {
     UpdatingGame,
     LaunchingGame,
     UpdatingLauncher,
+    RecoveringContent,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -42,12 +43,15 @@ pub struct CurrentState {
     #[serde(rename = "verificationInProgress")]
     pub verification_in_progress: bool,
     pub operation: OperationKind,
+    #[serde(rename = "launcherUpdateReady")]
+    pub launcher_update_ready: bool,
 }
 
 #[derive(Clone)]
 pub struct AppState {
     install_cancel_token: Arc<StdMutex<Option<CancellationToken>>>,
     verify_cancel_token: Arc<StdMutex<Option<CancellationToken>>>,
+    launcher_update_cancel_token: Arc<StdMutex<Option<CancellationToken>>>,
     launcher_update: Arc<StdMutex<Option<VerifiedLauncherUpdate>>>,
     pub file_patch_cancel_token: Arc<Mutex<Option<CancellationToken>>>,
     pub process_state: Arc<RwLock<GameProcessState>>,
@@ -57,6 +61,7 @@ pub struct AppState {
     operation_lock: Arc<StdMutex<OperationState>>,
     pub cleanup_lock: Arc<Mutex<()>>,
     shutdown_started: Arc<AtomicBool>,
+    close_confirmation_pending: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -64,6 +69,7 @@ impl AppState {
         Self {
             install_cancel_token: Arc::new(StdMutex::new(None)),
             verify_cancel_token: Arc::new(StdMutex::new(None)),
+            launcher_update_cancel_token: Arc::new(StdMutex::new(None)),
             launcher_update: Arc::new(StdMutex::new(None)),
             file_patch_cancel_token: Arc::new(Mutex::new(None)),
             process_state: Arc::new(RwLock::new(GameProcessState::default())),
@@ -73,6 +79,7 @@ impl AppState {
             operation_lock: Arc::new(StdMutex::new(OperationState::default())),
             cleanup_lock: Arc::new(Mutex::new(())),
             shutdown_started: Arc::new(AtomicBool::new(false)),
+            close_confirmation_pending: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -91,6 +98,7 @@ impl AppState {
         let cancel_slot = cancellation_slot.map(|slot| match slot {
             CancellationSlot::Install => self.install_cancel_token.clone(),
             CancellationSlot::Verify => self.verify_cancel_token.clone(),
+            CancellationSlot::LauncherUpdate => self.launcher_update_cancel_token.clone(),
         });
         let cancellation_token = cancel_slot.as_ref().map(|slot| {
             let token = CancellationToken::new();
@@ -113,9 +121,25 @@ impl AppState {
         cancel_slot(&self.verify_cancel_token)
     }
 
+    pub fn cancel_launcher_update(&self) -> bool {
+        cancel_slot(&self.launcher_update_cancel_token)
+    }
+
+    pub fn cancel_active_operation(&self) -> bool {
+        match self.current_state().operation {
+            OperationKind::Installing => self.cancel_install(),
+            OperationKind::Verifying | OperationKind::UpdatingGame => self.cancel_verify(),
+            OperationKind::UpdatingLauncher => self.cancel_launcher_update(),
+            OperationKind::Idle
+            | OperationKind::LaunchingGame
+            | OperationKind::RecoveringContent => false,
+        }
+    }
+
     pub fn current_state(&self) -> CurrentState {
         let operation = lock_unpoisoned(&self.operation_lock).kind;
         let process_in_progress = operation != OperationKind::Idle;
+        let launcher_update_ready = lock_unpoisoned(&self.launcher_update).is_some();
         CurrentState {
             process_in_progress_legacy: process_in_progress,
             process_in_progress,
@@ -124,6 +148,7 @@ impl AppState {
                 OperationKind::Verifying | OperationKind::UpdatingGame
             ),
             operation,
+            launcher_update_ready,
         }
     }
 
@@ -144,12 +169,46 @@ impl AppState {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
+
+    pub fn shutdown_started(&self) -> bool {
+        self.shutdown_started.load(Ordering::Acquire)
+    }
+
+    pub fn begin_close_confirmation(&self) -> bool {
+        if self.shutdown_started() {
+            return false;
+        }
+        self.close_confirmation_pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub fn cancel_close_confirmation(&self) -> bool {
+        self.close_confirmation_pending
+            .swap(false, Ordering::AcqRel)
+    }
+
+    pub fn close_confirmation_pending(&self) -> bool {
+        self.close_confirmation_pending.load(Ordering::Acquire)
+    }
+
+    pub fn confirm_close(&self) -> bool {
+        if self
+            .close_confirmation_pending
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        self.begin_shutdown()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum CancellationSlot {
     Install,
     Verify,
+    LauncherUpdate,
 }
 
 #[derive(Debug)]
@@ -254,5 +313,35 @@ mod tests {
         let state = AppState::new();
         assert!(state.begin_shutdown());
         assert!(!state.begin_shutdown());
+    }
+
+    #[test]
+    fn release_1_6_12_close_confirmation_is_one_shot_and_cancelable() {
+        let state = AppState::new();
+        assert!(state.begin_close_confirmation());
+        assert!(!state.begin_close_confirmation());
+        assert!(state.cancel_close_confirmation());
+        assert!(state.begin_close_confirmation());
+        assert!(state.close_confirmation_pending());
+        assert!(state.confirm_close());
+        assert!(!state.close_confirmation_pending());
+        assert!(!state.confirm_close());
+    }
+
+    #[test]
+    fn release_1_6_12_shutdown_cancels_launcher_updates() {
+        let state = AppState::new();
+        let lease = state
+            .begin_operation(
+                OperationKind::UpdatingLauncher,
+                Some(CancellationSlot::LauncherUpdate),
+            )
+            .expect("launcher update should start");
+        let token = lease
+            .cancellation_token()
+            .expect("launcher update should expose a token");
+
+        assert!(state.cancel_active_operation());
+        assert!(token.is_cancelled());
     }
 }

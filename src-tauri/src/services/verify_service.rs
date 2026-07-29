@@ -32,10 +32,9 @@ pub async fn verify_game_files(
 
     let progress = ProgressEmitter::new(app, event_name, operation_id);
     progress.emit_stage(ProgressStage::Checking, Some(0.0), None)?;
-    let progress_stage = match mode {
-        VerifyMode::UpdateFromVersion(_) => ProgressStage::Update,
-        _ => ProgressStage::Verify,
-    };
+    // Classification and hashing are a complete integrity check.  Downloads use
+    // their own Download stage below, so the UI can restart at 0% for repair.
+    let progress_stage = ProgressStage::Checking;
 
     let api = ApiClient::new()?;
     let manifest = load_manifest(&api, mode).await?;

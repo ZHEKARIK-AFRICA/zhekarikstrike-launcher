@@ -1,7 +1,17 @@
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
+use uuid::Uuid;
 
 use crate::error::AppError;
+
+pub fn validated_operation_id(operation_id: Option<String>) -> Result<String, AppError> {
+    match operation_id {
+        Some(value) => Uuid::parse_str(&value)
+            .map(|uuid| uuid.to_string())
+            .map_err(|_| AppError::InvalidData("invalid operation id".to_string())),
+        None => Ok(Uuid::new_v4().to_string()),
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -11,7 +21,7 @@ pub enum ProgressStage {
     Download,
     Extract,
     Verify,
-    Update,
+    Cleanup,
     Complete,
 }
 

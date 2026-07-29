@@ -19,7 +19,9 @@ use crate::services::content_install_service::{
     AdaptiveDownloadController, ChunkReadiness,
 };
 use crate::services::content_journal_service::{
-    recover_interrupted_commit, ContentJournal, ContentJournalEntry, ContentJournalPhase,
+    atomic_json, backup_path, content_root, journal_path, recover_pending_content, staging_path,
+    state_path, write_journal, ContentCompletionState, ContentJournal, ContentJournalEntry,
+    ContentJournalPhase,
 };
 
 fn sha256(data: &[u8]) -> String {
@@ -263,10 +265,61 @@ async fn content_download_resumes_an_existing_part_with_range() {
 }
 
 #[tokio::test]
-async fn content_journal_rolls_back_an_interrupted_commit() {
+async fn release_1_6_12_recovery_preserves_chunks_and_parts_but_cleans_transaction_data() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let game = directory.path();
+    let transaction_id = uuid::Uuid::new_v4().to_string();
+    let journal = ContentJournal {
+        schema_version: 1,
+        transaction_id: transaction_id.clone(),
+        release_id: "release-1".to_string(),
+        content_sha256: "a".repeat(64),
+        phase: ContentJournalPhase::Materialize,
+        files: Vec::new(),
+    };
+    write_journal(game, &journal)
+        .await
+        .expect("journal should be written");
+    let chunk = content_root(game).join("chunks/sha256/aa/chunk.zst");
+    let part = content_root(game).join("chunks/sha256/bb/chunk.zst.part");
+    let staging = staging_path(game, &transaction_id).join("pending.bin");
+    for path in [&chunk, &part, &staging] {
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(path, b"fixture").await.unwrap();
+    }
+
+    let recovered = recover_pending_content(game)
+        .await
+        .expect("valid journal should recover");
+
+    assert!(recovered);
+    assert!(chunk.exists());
+    assert!(part.exists());
+    assert!(!staging_path(game, &transaction_id).exists());
+    assert!(!journal_path(game).exists());
+}
+
+#[tokio::test]
+async fn release_1_6_12_corrupt_journal_blocks_recovery_without_deleting_it() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = journal_path(directory.path());
+    tokio::fs::create_dir_all(path.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::write(&path, b"not-json").await.unwrap();
+
+    assert!(recover_pending_content(directory.path()).await.is_err());
+    assert!(path.exists());
+}
+
+#[tokio::test]
+async fn release_1_6_12_recovery_rolls_back_an_interrupted_commit() {
     let directory = tempdir().unwrap();
     let game = directory.path();
-    let backup = game.join(".zhekarik/content/backup/tx/csgo/game.bin");
+    let transaction_id = uuid::Uuid::new_v4().to_string();
+    let backup = backup_path(game, &transaction_id).join("csgo/game.bin");
     let target = game.join("csgo/game.bin");
     tokio::fs::create_dir_all(backup.parent().unwrap())
         .await
@@ -280,7 +333,7 @@ async fn content_journal_rolls_back_an_interrupted_commit() {
     tokio::fs::write(&added, b"new").await.unwrap();
     let journal = ContentJournal {
         schema_version: 1,
-        transaction_id: "tx".to_string(),
+        transaction_id,
         release_id: "1.0.3.4-r1".to_string(),
         content_sha256: "a".repeat(64),
         phase: ContentJournalPhase::Commit,
@@ -296,9 +349,103 @@ async fn content_journal_rolls_back_an_interrupted_commit() {
         ],
     };
 
-    recover_interrupted_commit(game, &journal).await.unwrap();
+    write_journal(game, &journal).await.unwrap();
+    assert!(recover_pending_content(game).await.unwrap());
     assert_eq!(tokio::fs::read(target).await.unwrap(), b"old");
     assert!(!tokio::fs::try_exists(added).await.unwrap());
+}
+
+#[tokio::test]
+async fn release_1_6_12_completed_commit_keeps_files_and_only_cleans_transaction() {
+    let directory = tempdir().unwrap();
+    let game = directory.path();
+    let transaction_id = uuid::Uuid::new_v4().to_string();
+    let target = game.join("csgo/game.bin");
+    let backup = backup_path(game, &transaction_id).join("csgo/game.bin");
+    tokio::fs::create_dir_all(target.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(backup.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::write(&target, b"committed").await.unwrap();
+    tokio::fs::write(&backup, b"old").await.unwrap();
+    let journal = ContentJournal {
+        schema_version: 1,
+        transaction_id: transaction_id.clone(),
+        release_id: "release-1".to_string(),
+        content_sha256: "b".repeat(64),
+        phase: ContentJournalPhase::Commit,
+        files: vec![ContentJournalEntry {
+            path: "csgo/game.bin".to_string(),
+            had_original: true,
+        }],
+    };
+    write_journal(game, &journal).await.unwrap();
+    atomic_json(
+        &state_path(game),
+        &ContentCompletionState {
+            schema_version: 1,
+            transaction_id: Some(transaction_id.clone()),
+            content_sha256: journal.content_sha256.clone(),
+            release_id: journal.release_id.clone(),
+            game_version: "1.0.3.4".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(recover_pending_content(game).await.unwrap());
+    assert_eq!(tokio::fs::read(target).await.unwrap(), b"committed");
+    assert!(!backup_path(game, &transaction_id).exists());
+    assert!(!journal_path(game).exists());
+}
+
+#[tokio::test]
+async fn release_1_6_12_old_matching_state_does_not_complete_a_new_transaction() {
+    let directory = tempdir().unwrap();
+    let game = directory.path();
+    let previous_transaction = uuid::Uuid::new_v4().to_string();
+    let transaction_id = uuid::Uuid::new_v4().to_string();
+    let target = game.join("csgo/game.bin");
+    let backup = backup_path(game, &transaction_id).join("csgo/game.bin");
+    tokio::fs::create_dir_all(target.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(backup.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::write(&target, b"partially-committed")
+        .await
+        .unwrap();
+    tokio::fs::write(&backup, b"old").await.unwrap();
+    let journal = ContentJournal {
+        schema_version: 1,
+        transaction_id: transaction_id.clone(),
+        release_id: "release-1".to_string(),
+        content_sha256: "c".repeat(64),
+        phase: ContentJournalPhase::Commit,
+        files: vec![ContentJournalEntry {
+            path: "csgo/game.bin".to_string(),
+            had_original: true,
+        }],
+    };
+    write_journal(game, &journal).await.unwrap();
+    atomic_json(
+        &state_path(game),
+        &ContentCompletionState {
+            schema_version: 1,
+            transaction_id: Some(previous_transaction),
+            content_sha256: journal.content_sha256.clone(),
+            release_id: journal.release_id.clone(),
+            game_version: "1.0.3.4".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(recover_pending_content(game).await.unwrap());
+    assert_eq!(tokio::fs::read(target).await.unwrap(), b"old");
 }
 
 #[test]

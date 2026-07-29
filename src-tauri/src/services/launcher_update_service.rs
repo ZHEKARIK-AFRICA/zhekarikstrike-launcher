@@ -63,7 +63,11 @@ pub async fn check_launcher_update(
     validate_update_manifest(&manifest, current_version, LAUNCHER_UPDATE_PUBLIC_KEY)
 }
 
-pub async fn download_launcher_update(app: AppHandle) -> Result<VerifiedLauncherUpdate, AppError> {
+pub async fn download_launcher_update(
+    app: AppHandle,
+    cancel: CancellationToken,
+    operation_id: String,
+) -> Result<VerifiedLauncherUpdate, AppError> {
     let api = ApiClient::new()?;
     let current_version = env!("CARGO_PKG_VERSION");
     let manifest = api.get_launcher_update(current_version).await?;
@@ -92,22 +96,32 @@ pub async fn download_launcher_update(app: AppHandle) -> Result<VerifiedLauncher
         Uuid::new_v4()
     ));
     let staging_path = verified_path.with_extension("exe.part");
-    let progress =
-        ProgressEmitter::new(app, "launcher-update-progress", Uuid::new_v4().to_string());
+    let progress = ProgressEmitter::new(app, "launcher-update-progress", operation_id);
     let result = async {
         let download = download_file(
             api.http(),
             &platform.url,
             &staging_path,
             Some(progress.clone()),
-            CancellationToken::new(),
+            cancel.clone(),
             Some(platform.size),
             Some(&platform.sha256),
         )
         .await?;
         debug_assert_eq!(download.bytes, platform.size);
+        if cancel.is_cancelled() {
+            return Err(AppError::Canceled);
+        }
 
+        progress.emit_stage(
+            ProgressStage::Checking,
+            Some(0.0),
+            Some("checking launcher update hash and signature".to_string()),
+        )?;
         let actual = sha256_file(&download.path).await?;
+        if cancel.is_cancelled() {
+            return Err(AppError::Canceled);
+        }
         if actual != platform.sha256 {
             return Err(AppError::InvalidData(
                 "launcher update hash mismatch".to_string(),
@@ -115,6 +129,7 @@ pub async fn download_launcher_update(app: AppHandle) -> Result<VerifiedLauncher
         }
 
         verify_minisign_signature(&download.path, &platform.signature)?;
+        progress.emit_stage(ProgressStage::Checking, Some(100.0), None)?;
         tokio::fs::rename(&download.path, &verified_path).await?;
         progress.emit_stage(ProgressStage::Complete, Some(100.0), None)?;
         Ok::<VerifiedLauncherUpdate, AppError>(VerifiedLauncherUpdate {

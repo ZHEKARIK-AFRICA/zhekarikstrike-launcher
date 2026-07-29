@@ -1,35 +1,116 @@
 import { invoke } from '@tauri-apps/api/core';
 
 import { initializeLanguage, t } from '../localization/i18n.js';
-import { errorMessage } from './errors.js';
+import { handleError, setupErrorModal } from './common.js';
 import { waitForE2eReady } from './e2e.js';
-import { handleError, resetProgressUI, setupErrorModal, updateProgressBar } from './common.js';
 import { listenUntilPageHide } from './event-listener.js';
 import { navigateToPage } from './navigation.js';
+import { createOperationId, createStatusController } from './status-controller.js';
 
 setupErrorModal();
 
 const startInstallButton = document.getElementById('start-install');
 const cancelInstallButton = document.getElementById('cancel-install');
+const chooseFolderButton = document.getElementById('choose-folder');
 const installPathInput = document.getElementById('install-path');
+let initialized = false;
+let startupFailed = false;
+let installing = false;
+let cancelPending = false;
+let statePoll = null;
 
-function setInstalling(value) {
-    if (startInstallButton) startInstallButton.disabled = value;
-    if (cancelInstallButton) cancelInstallButton.disabled = !value;
+function renderActions(statusState) {
+    const busy = statusState.kind === 'busy' || statusState.kind === 'initializing';
+    if (startInstallButton) {
+        startInstallButton.textContent = t('start_install');
+        startInstallButton.disabled = !initialized || startupFailed || busy;
+    }
+    if (cancelInstallButton) {
+        cancelInstallButton.textContent = t('cancel_install');
+        cancelInstallButton.disabled = !installing || cancelPending;
+    }
+    if (chooseFolderButton) chooseFolderButton.disabled = !initialized || startupFailed || busy;
+    if (installPathInput) installPathInput.disabled = !initialized || startupFailed || busy;
+}
+
+const status = createStatusController({
+    root: document.querySelector('.launcher-container') || document.body,
+    statusElement: document.getElementById('install-status'),
+    progressBar: document.getElementById('progress-bar'),
+    progressInfo: document.getElementById('progress-info'),
+    renderActions
+});
+
+function stopStatePolling() {
+    if (statePoll != null) window.clearInterval(statePoll);
+    statePoll = null;
+}
+
+async function recoverAndRoute() {
+    const operationId = createOperationId();
+    status.begin({
+        flow: 'recovery', step: 'recovery', statusKey: 'status.recovering_install', operationId
+    });
+    const recovery = await invoke('recover_pending_install', { operationId });
+    if (!recovery?.recovered) return false;
+    status.succeed('status.recovery_complete');
+    const existence = await invoke('check_game_exists');
+    if (!existence?.exists) return false;
+    await navigateToPage('./public/index.html');
+    return true;
+}
+
+function restoreOperation(operation) {
+    if (!status.restoreOperation(operation)) return false;
+    installing = operation === 'installing';
+    status.rerender();
+    statePoll = window.setInterval(async () => {
+        try {
+            const current = await invoke('get_current_state');
+            if (current.operation && current.operation !== 'idle') return;
+            stopStatePolling();
+            installing = false;
+            if (await recoverAndRoute()) return;
+            const existence = await invoke('check_game_exists');
+            if (existence?.exists) {
+                await navigateToPage('./public/index.html');
+                return;
+            }
+            status.setIdle('status.install_idle');
+        } catch (error) {
+            stopStatePolling();
+            startupFailed = true;
+            status.fail('status.recovery_failed');
+            handleError(null, error, { contextKey: 'status.recovery_failed' });
+        }
+    }, 1000);
+    return true;
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
     try {
         await waitForE2eReady();
         await initializeLanguage();
+        status.rerender();
+        const current = await invoke('get_current_state');
+        const restored = restoreOperation(current.operation);
+        if (!restored && await recoverAndRoute()) return;
+
         const savedPath = await invoke('get_game_path');
-        if (savedPath && installPathInput && !installPathInput.value) installPathInput.value = savedPath;
-        setInstalling(false);
+        if (savedPath && installPathInput && !installPathInput.value) {
+            installPathInput.value = savedPath;
+        }
+        initialized = true;
+        if (!restored) status.setIdle('status.install_idle');
         document.body.classList.add('fade-in');
     } catch (error) {
-        handleError(null, `${t('stageMessages.error_loading_data')}: ${errorMessage(error)}`);
+        startupFailed = true;
+        status.fail(status.getState().flow === 'recovery'
+            ? 'status.recovery_failed'
+            : 'status.loading_failed');
+        handleError(null, error, { contextKey: status.getState().statusKey });
     }
-});
+}, { once: true });
 
 startInstallButton?.addEventListener('click', async () => {
     const gamePath = installPathInput?.value?.trim();
@@ -37,36 +118,71 @@ startInstallButton?.addEventListener('click', async () => {
         handleError(null, t('errors.install_path_not_set'));
         return;
     }
+    if (!initialized || startupFailed || installing) return;
 
-    setInstalling(true);
+    installing = true;
+    const operationId = createOperationId();
+    status.begin({
+        flow: 'install', step: 'install', statusKey: 'status.installing', operationId
+    });
     try {
-        await invoke('install_game', { gamePath });
-        resetProgressUI('progress-bar', 'install-status', 'progress-info', 'game-installed');
+        await invoke('install_game', { gamePath, operationId });
+        status.succeed('status.installation_complete');
         document.body.classList.remove('fade-in');
         document.body.classList.add('fade-out');
         await navigateToPage('./public/index.html');
     } catch (error) {
         if (error?.code === 'canceled') {
-            resetProgressUI('progress-bar', 'install-status', 'progress-info', 'cancel');
+            status.cancel('status.installation_canceled');
         } else {
-            resetProgressUI('progress-bar', 'install-status', 'progress-info', 'error');
-            handleError(null, `${t('errors.unknown_error')}: ${errorMessage(error)}`);
+            status.fail('status.installation_failed');
+            handleError(null, error, { contextKey: 'status.installation_failed' });
         }
     } finally {
-        setInstalling(false);
+        installing = false;
+        cancelPending = false;
+        status.rerender();
     }
 });
 
-cancelInstallButton?.addEventListener('click', () => invoke('cancel_install'));
-
-document.getElementById('choose-folder')?.addEventListener('click', async () => {
-    const folderPath = await invoke('select_game_folder');
-    if (folderPath && installPathInput) installPathInput.value = `${folderPath}\\ZHEKARIKSTRIKE`;
+cancelInstallButton?.addEventListener('click', async () => {
+    if (!installing || cancelPending) return;
+    cancelPending = true;
+    status.updateBusy({ step: 'cancel-install', statusKey: 'status.canceling_install' });
+    try {
+        const requested = await invoke('cancel_install');
+        if (!requested) {
+            cancelPending = false;
+            status.updateBusy({ step: 'install', statusKey: 'status.installing' });
+        }
+    } catch (error) {
+        cancelPending = false;
+        status.updateBusy({ step: 'install', statusKey: 'status.installing' });
+        handleError(null, error);
+    }
 });
 
-listenUntilPageHide('install-progress', ({ payload }) => {
-    updateProgressBar(
-        payload.progress, payload.stage, payload.timeRemainingSec,
-        'progress-bar', 'install-status', 'progress-info'
-    );
+chooseFolderButton?.addEventListener('click', async () => {
+    if (!initialized || startupFailed || installing) return;
+    try {
+        const folderPath = await invoke('select_game_folder');
+        if (folderPath && installPathInput) installPathInput.value = `${folderPath}\\ZHEKARIKSTRIKE`;
+    } catch (error) {
+        handleError(null, error);
+    }
 });
+
+void listenUntilPageHide('install-progress', ({ payload }) => {
+    const progressStatus = payload.stage === 'checking'
+        ? 'status.verifying_files'
+        : 'status.installing';
+    status.applyProgress(payload, progressStatus);
+});
+void listenUntilPageHide('recovery-progress', ({ payload }) => {
+    status.applyProgress(payload, 'status.recovering_install');
+});
+
+window.addEventListener('pagehide', () => {
+    stopStatePolling();
+    status.dispose();
+}, { once: true });

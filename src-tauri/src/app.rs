@@ -72,6 +72,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             minimize_window,
             close_window,
+            confirm_close_window,
+            cancel_close_window,
             show_main_window,
             set_window_layout,
             get_config,
@@ -94,6 +96,7 @@ pub fn run() {
             move_launcher_to_game_path,
             install_game,
             cancel_install,
+            recover_pending_install,
             verify_files,
             update_game,
             cancel_verify,
@@ -172,26 +175,20 @@ pub fn run() {
                 window.on_window_event(move |event| {
                     if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                         logger::info("window close requested");
+                        // Only the controlled shutdown path may actually close the window.
+                        // In particular, a second Alt+F4 must not bypass cancellation/cleanup.
+                        api.prevent_close();
                         let Some(state) = close_handle.try_state::<AppState>() else {
                             logger::warn("window close requested without managed app state");
                             return;
                         };
-                        if !state.begin_shutdown() {
-                            logger::info("window close allowed after shutdown began");
+                        if state.shutdown_started() {
+                            logger::info(
+                                "window close ignored while controlled shutdown is running",
+                            );
                             return;
                         }
-                        let state = state.inner().clone();
-                        api.prevent_close();
-                        let app = close_handle.clone();
-                        tauri::async_runtime::spawn(async move {
-                            if let Err(error) =
-                                crate::services::shutdown_service::shutdown(app.clone(), &state)
-                                    .await
-                            {
-                                logger::error(&format!("shutdown cleanup failed: {error}"));
-                            }
-                            app.exit(0);
-                        });
+                        crate::services::close_service::spawn_close_request(close_handle.clone());
                     }
                 });
             }

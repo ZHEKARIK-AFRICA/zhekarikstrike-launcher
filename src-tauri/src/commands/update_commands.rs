@@ -1,9 +1,9 @@
 use tauri::{AppHandle, State};
 
 use crate::error::AppError;
-use crate::models::LauncherUpdateStatus;
+use crate::models::{validated_operation_id, LauncherUpdateStatus};
 use crate::services::launcher_update_service;
-use crate::state::{AppState, OperationKind};
+use crate::state::{AppState, CancellationSlot, OperationKind};
 
 #[tauri::command]
 pub async fn check_launcher_update() -> Result<LauncherUpdateStatus, AppError> {
@@ -14,13 +14,21 @@ pub async fn check_launcher_update() -> Result<LauncherUpdateStatus, AppError> {
 pub async fn download_launcher_update(
     app: AppHandle,
     state: State<'_, AppState>,
+    operation_id: Option<String>,
 ) -> Result<(), AppError> {
-    let _lease = state.begin_operation(OperationKind::UpdatingLauncher, None)?;
+    let operation_id = validated_operation_id(operation_id)?;
+    let lease = state.begin_operation(
+        OperationKind::UpdatingLauncher,
+        Some(CancellationSlot::LauncherUpdate),
+    )?;
+    let cancel = lease
+        .cancellation_token()
+        .expect("launcher update operations always have a cancellation token");
     state.clear_launcher_update();
 
     #[cfg(feature = "e2e")]
     {
-        let _ = app;
+        let _ = (app, cancel, operation_id);
         return Err(AppError::InvalidData(
             "tampered native artifact".to_string(),
         ));
@@ -28,7 +36,8 @@ pub async fn download_launcher_update(
 
     #[cfg(not(feature = "e2e"))]
     {
-        let update = launcher_update_service::download_launcher_update(app).await?;
+        let update =
+            launcher_update_service::download_launcher_update(app, cancel, operation_id).await?;
         state.set_launcher_update(update);
         Ok(())
     }
@@ -39,6 +48,7 @@ pub async fn apply_launcher_update(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), AppError> {
+    let _lease = state.begin_operation(OperationKind::UpdatingLauncher, None)?;
     let update = state
         .launcher_update()
         .ok_or_else(|| AppError::InvalidData("no verified launcher update is ready".to_string()))?;

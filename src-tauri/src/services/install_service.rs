@@ -2,7 +2,6 @@ use std::path::PathBuf;
 
 use tauri::AppHandle;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 use crate::constants::REV_LOADER_EXE;
 use crate::error::AppError;
@@ -28,14 +27,15 @@ pub async fn install_game(
     app: AppHandle,
     game_path: PathBuf,
     cancel: CancellationToken,
+    operation_id: String,
 ) -> Result<(), AppError> {
     if !elevation_service::is_elevated()? {
         return Err(AppError::AdminRequired);
     }
 
     tokio::fs::create_dir_all(&game_path).await?;
+    config_service::set_game_path(game_path.clone()).await?;
 
-    let operation_id = Uuid::new_v4().to_string();
     let api = ApiClient::new()?;
     if let Some(manifest) = api.get_compatible_content_manifest().await? {
         content_install_service::install_or_update_content(
@@ -48,7 +48,6 @@ pub async fn install_game(
             operation_id,
         )
         .await?;
-        config_service::set_game_path(game_path).await?;
         shortcut_service::create_default_shortcuts().await?;
         return Ok(());
     }
@@ -105,7 +104,6 @@ pub async fn install_game(
     )
     .await?;
 
-    config_service::set_game_path(game_path).await?;
     shortcut_service::create_default_shortcuts().await?;
     progress.emit_stage(ProgressStage::Complete, Some(100.0), None)?;
     Ok(())

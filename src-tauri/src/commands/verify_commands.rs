@@ -1,7 +1,7 @@
 use tauri::{AppHandle, State};
-use uuid::Uuid;
 
 use crate::error::AppError;
+use crate::models::validated_operation_id;
 use crate::services::api_client::ApiClient;
 use crate::services::config_service;
 use crate::services::content_install_service;
@@ -14,7 +14,9 @@ pub async fn verify_files(
     app: AppHandle,
     state: State<'_, AppState>,
     check_all_files: bool,
+    operation_id: Option<String>,
 ) -> Result<(), AppError> {
+    let operation_id = validated_operation_id(operation_id)?;
     #[cfg(feature = "e2e")]
     {
         let lease =
@@ -22,7 +24,7 @@ pub async fn verify_files(
         let cancel = lease
             .cancellation_token()
             .expect("verify operations always have a cancellation token");
-        let _ = (app, check_all_files);
+        let _ = (app, check_all_files, operation_id);
         tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => Ok(()),
             _ = cancel.cancelled() => Err(AppError::Canceled),
@@ -39,16 +41,21 @@ pub async fn verify_files(
         } else {
             VerifyMode::AdditionalOnly
         };
-        run_verify(app, state, mode, OperationKind::Verifying).await
+        run_verify(app, state, mode, OperationKind::Verifying, operation_id).await
     }
 }
 
 #[tauri::command]
-pub async fn update_game(app: AppHandle, state: State<'_, AppState>) -> Result<(), AppError> {
+pub async fn update_game(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    operation_id: Option<String>,
+) -> Result<(), AppError> {
+    let operation_id = validated_operation_id(operation_id)?;
     #[cfg(feature = "e2e")]
     {
         let _lease = state.begin_operation(OperationKind::UpdatingGame, None)?;
-        let _ = app;
+        let _ = (app, operation_id);
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         return Ok(());
     }
@@ -75,7 +82,7 @@ pub async fn update_game(app: AppHandle, state: State<'_, AppState>) -> Result<(
                 manifest,
                 cancel,
                 "verify-progress",
-                Uuid::new_v4().to_string(),
+                operation_id,
             )
             .await;
         }
@@ -86,7 +93,7 @@ pub async fn update_game(app: AppHandle, state: State<'_, AppState>) -> Result<(
             update_mode_for_version(&current),
             cancel,
             "verify-progress",
-            Uuid::new_v4().to_string(),
+            operation_id,
         )
         .await
     }
@@ -102,6 +109,7 @@ async fn run_verify(
     state: State<'_, AppState>,
     mode: VerifyMode,
     operation: OperationKind,
+    operation_id: String,
 ) -> Result<(), AppError> {
     let lease = state.begin_operation(operation, Some(CancellationSlot::Verify))?;
     let cancel = lease
@@ -118,7 +126,7 @@ async fn run_verify(
         mode,
         cancel,
         "verify-progress",
-        Uuid::new_v4().to_string(),
+        operation_id,
     )
     .await
     .map(|_| ())

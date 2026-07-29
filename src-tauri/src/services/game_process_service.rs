@@ -5,7 +5,6 @@ use sysinfo::System;
 use tauri::{AppHandle, Emitter};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 use crate::constants::{
     GAME_PROCESS_NAME, GAME_START_TIMEOUT_MS, PROCESS_POLL_INTERVAL_MS, REV_LOADER_EXE,
@@ -23,6 +22,7 @@ pub async fn launch_game(
     app: AppHandle,
     state: &AppState,
     game_path: PathBuf,
+    operation_id: String,
 ) -> Result<(), AppError> {
     if !elevation_service::is_elevated()? {
         return Err(AppError::AdminRequired);
@@ -43,7 +43,7 @@ pub async fn launch_game(
         app.clone(),
         patch_cancel.clone(),
         "verify-progress",
-        Uuid::new_v4().to_string(),
+        operation_id,
     )
     .await
     {

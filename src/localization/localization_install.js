@@ -12,12 +12,10 @@ function applyTranslations() {
     setText('label[for="install-path"]', 'install_path');
     const installPath = document.getElementById('install-path');
     if (installPath) installPath.placeholder = t('install_placeholder');
-    setText('#start-install', 'start_install');
-    setText('#cancel-install', 'cancel_install');
-    setText('#install-status', 'install_status');
     setText('#error-message', 'error_message');
     setText('#error-modal-title', 'error_title');
     setText('#error-modal-ok', 'error_modal_ok');
+    setText('#error-technical summary', 'technical_details');
     setText('a[href="https://zhekarik.africa/strike/stream"]', 'links.stream');
     setText('a[href="https://zhekarik.africa/strike/vip"]', 'links.vip');
     setText('a[href="https://zhekarik.africa/strike/demos"]', 'links.demos');

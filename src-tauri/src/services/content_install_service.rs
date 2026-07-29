@@ -496,6 +496,7 @@ pub async fn install_or_update_content(
 
     let state = ContentCompletionState {
         schema_version: 1,
+        transaction_id: Some(transaction_id.clone()),
         content_sha256: manifest.content_sha256.clone(),
         release_id: manifest.release_id.clone(),
         game_version: manifest.game_version.clone(),

@@ -8,11 +8,11 @@ function setText(selector, key) {
 
 function applyTranslations() {
     setText('h1', 'update_launcher_title');
-    setText('#progress-status', 'updating_launcher');
     setText('.update-info', 'update_description');
     setText('#error-modal h2', 'error_title');
     setText('#error-message', 'error_message');
     setText('#error-modal-ok', 'error_modal_ok');
+    setText('#error-technical summary', 'technical_details');
 }
 
 function updateActiveLanguage(language) {

@@ -1,14 +1,21 @@
 import './e2e.js';
 
 import { t } from '../localization/i18n.js';
-import { errorMessage } from './errors.js';
+import { errorMessage, errorPresentation } from './errors.js';
 
-export function showErrorModal(message) {
+export function showErrorModal(message, technical = '') {
     const errorModal = document.getElementById('error-modal');
     const errorMessageElement = document.getElementById('error-message');
+    const technicalContainer = document.getElementById('error-technical');
+    const technicalMessage = document.getElementById('error-technical-message');
     if (errorModal && errorMessageElement) {
         errorMessageElement.textContent = errorMessage(message);
         errorModal.style.display = 'block';
+    }
+    if (technicalContainer && technicalMessage) {
+        technicalMessage.textContent = technical;
+        technicalContainer.hidden = !technical;
+        technicalContainer.open = false;
     }
 }
 
@@ -25,10 +32,10 @@ export function setupErrorModal() {
     });
 }
 
-export function handleError(_event, error) {
-    const message = errorMessage(error);
-    console.error('Error received:', message);
-    showErrorModal(message);
+export function handleError(_event, error, { contextKey } = {}) {
+    const presentation = errorPresentation(error, contextKey, t);
+    console.error('Error received:', presentation.technical);
+    showErrorModal(presentation.friendly, presentation.technical);
 }
 
 export function updateProgressBar(progress, stage, timeRemaining, progressBarId, statusId, infoId) {
