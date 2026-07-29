@@ -9,8 +9,11 @@ use crate::services::{
 use crate::state::AppState;
 
 pub async fn shutdown(app: AppHandle, state: &AppState) -> Result<(), AppError> {
+    crate::logger::info("shutdown cleanup started");
     cleanup_runtime(app.clone(), state).await?;
+    crate::logger::info("shutdown runtime cleanup finished");
     launcher_move_service::schedule_legacy_move_if_needed(app).await?;
+    crate::logger::info("shutdown launcher move scheduled");
     Ok(())
 }
 
@@ -32,6 +35,7 @@ async fn cleanup_runtime_inner(
     expected_pid: Option<u32>,
 ) -> Result<(), AppError> {
     let _guard = state.cleanup_lock.lock().await;
+    crate::logger::info("shutdown cleanup lock acquired");
 
     let finished_process = {
         let mut process_state = state.process_state.write().await;
@@ -45,12 +49,14 @@ async fn cleanup_runtime_inner(
         finished_process.owned,
     ) {
         let _ = app.emit("game-closed", ());
+        crate::logger::info("shutdown observed game state cleared");
         return Ok(());
     }
 
     if let Some(token) = state.file_patch_cancel_token.lock().await.take() {
         token.cancel();
     }
+    crate::logger::info("shutdown patch cancellation finished");
 
     if let Some(pid) = finished_process.pid.filter(|_| finished_process.owned) {
         if let Err(error) = game_process_service::stop_game_process(pid).await {
@@ -62,8 +68,10 @@ async fn cleanup_runtime_inner(
     if let Err(error) = delete_tracked_files(pure_files).await {
         crate::logger::warn(&format!("failed to delete tracked pure files: {error}"));
     }
+    crate::logger::info("shutdown pure overlay cleanup finished");
 
     if let Some(game_path) = config_service::get_game_path().await? {
+        crate::logger::info("shutdown base overlay restore started");
         let source = game_patch_service::game_patch_roots()?.game_files;
         match restore_game_files(source, game_path).await {
             Ok(restored) => {
@@ -73,13 +81,16 @@ async fn cleanup_runtime_inner(
                 crate::logger::warn(&format!("failed to restore game files: {error}"));
             }
         }
+        crate::logger::info("shutdown base overlay restore finished");
     }
 
     if let Err(error) = discord_rpc_service::stop_rich_presence(app.clone(), state).await {
         crate::logger::warn(&format!("failed to stop Discord RPC: {error}"));
     }
+    crate::logger::info("shutdown Discord cleanup finished");
 
     let _ = app.emit("game-closed", ());
+    crate::logger::info("shutdown cleanup completed");
     Ok(())
 }
 

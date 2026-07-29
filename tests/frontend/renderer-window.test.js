@@ -15,7 +15,9 @@ const { invoke, windowApi, getCurrentWindow } = vi.hoisted(() => {
         minimize: vi.fn().mockResolvedValue()
     };
     return {
-        invoke: vi.fn(),
+        invoke: vi.fn((command) => command === 'close_window'
+            ? Promise.reject(new Error('close denied'))
+            : Promise.resolve()),
         windowApi,
         getCurrentWindow: vi.fn(() => windowApi)
     };
@@ -25,7 +27,7 @@ vi.mock('@tauri-apps/api/core', () => ({ invoke }));
 vi.mock('@tauri-apps/api/window', () => ({ getCurrentWindow }));
 
 describe('shared renderer window controls', () => {
-    it('invokes close and minimize and reports a rejected window action', async () => {
+    it('uses the Rust shutdown lifecycle for close and Tauri for minimize', async () => {
         document.body.innerHTML = `
             <button id="close-window"></button>
             <button id="minimize-window"></button>
@@ -39,7 +41,8 @@ describe('shared renderer window controls', () => {
         document.getElementById('minimize-window').click();
 
         await vi.waitFor(() => {
-            expect(windowApi.close).toHaveBeenCalledOnce();
+            expect(invoke).toHaveBeenCalledWith('close_window');
+            expect(windowApi.close).not.toHaveBeenCalled();
             expect(windowApi.minimize).toHaveBeenCalledOnce();
             expect(consoleError).toHaveBeenCalledWith(
                 'Failed to close window:',
@@ -54,9 +57,7 @@ describe('shared renderer window controls', () => {
         const capabilityPath = join(process.cwd(), 'src-tauri', 'capabilities', 'default.json');
         const capability = JSON.parse(readFileSync(capabilityPath, 'utf8'));
 
-        expect(capability.permissions).toEqual(expect.arrayContaining([
-            'core:window:allow-close',
-            'core:window:allow-minimize'
-        ]));
+        expect(capability.permissions).toContain('core:window:allow-minimize');
+        expect(capability.permissions).not.toContain('core:window:allow-close');
     });
 });

@@ -26,7 +26,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     document.getElementById('close-window')?.addEventListener('click', () => {
-        void runWindowAction(() => getCurrentWindow().close(), 'close');
+        void runWindowAction(() => invoke('close_window'), 'close');
     });
     document.getElementById('minimize-window')?.addEventListener('click', () => {
         void runWindowAction(() => getCurrentWindow().minimize(), 'minimize');

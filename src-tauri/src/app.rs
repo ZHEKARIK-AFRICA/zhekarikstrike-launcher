@@ -171,10 +171,13 @@ pub fn run() {
                 let close_handle = app.handle().clone();
                 window.on_window_event(move |event| {
                     if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        logger::info("window close requested");
                         let Some(state) = close_handle.try_state::<AppState>() else {
+                            logger::warn("window close requested without managed app state");
                             return;
                         };
                         if !state.begin_shutdown() {
+                            logger::info("window close allowed after shutdown began");
                             return;
                         }
                         let state = state.inner().clone();
