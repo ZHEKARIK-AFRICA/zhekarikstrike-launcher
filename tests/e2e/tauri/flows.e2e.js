@@ -32,7 +32,7 @@ describe('Windows Tauri E2E build', () => {
         await $('#start-install').click();
         await $('#cancel-install').waitForEnabled();
         await $('#cancel-install').click();
-        await expect($('#install-status')).toHaveText('cancel');
+        await expect($('#install-status')).toHaveText('installation canceled');
     });
 
     it('covers verify, launch, and structured launch errors', async () => {
@@ -50,7 +50,11 @@ describe('Windows Tauri E2E build', () => {
         await browser.waitUntil(async () =>
             (await $('#error-modal').getCSSProperty('display')).value === 'block'
         );
-        await expect($('#error-message')).toHaveText(expect.stringContaining('native launch fixture failed'));
+        await expect($('#error-message')).toHaveText('failed to save launch settings');
+        await expect($('#error-technical-message')).toHaveElementProperty(
+            'textContent',
+            expect.stringContaining('native launch fixture failed')
+        );
     });
 
     it('shows and acknowledges updater failure without a bypass', async () => {
@@ -59,7 +63,11 @@ describe('Windows Tauri E2E build', () => {
         await browser.waitUntil(async () =>
             (await $('#error-modal').getCSSProperty('display')).value === 'block'
         );
-        await expect($('#error-message')).toHaveText(expect.stringContaining('tampered native artifact'));
+        await expect($('#error-message')).toHaveText('launcher update failed');
+        await expect($('#error-technical-message')).toHaveElementProperty(
+            'textContent',
+            expect.stringContaining('tampered native artifact')
+        );
         await expect($('#continue-without-update')).not.toBeExisting();
         await $('#error-modal-ok').click();
         await browser.waitUntil(async () =>

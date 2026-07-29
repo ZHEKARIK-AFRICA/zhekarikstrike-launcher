@@ -24,7 +24,7 @@ pub async fn install_game(
 
     #[cfg(feature = "e2e")]
     {
-        let _ = app;
+        let _ = (app, operation_id);
         if game_path.to_ascii_lowercase().contains("error") {
             return Err(AppError::Network(
                 "native install fixture failed".to_string(),
