@@ -171,18 +171,21 @@ pub fn run() {
                 let close_handle = app.handle().clone();
                 window.on_window_event(move |event| {
                     if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        let Some(state) = close_handle.try_state::<AppState>() else {
+                            return;
+                        };
+                        if !state.begin_shutdown() {
+                            return;
+                        }
+                        let state = state.inner().clone();
                         api.prevent_close();
                         let app = close_handle.clone();
                         tauri::async_runtime::spawn(async move {
-                            if let Some(state) = app.try_state::<AppState>() {
-                                if let Err(error) = crate::services::shutdown_service::shutdown(
-                                    app.clone(),
-                                    state.inner(),
-                                )
-                                .await
-                                {
-                                    logger::error(&format!("shutdown cleanup failed: {error}"));
-                                }
+                            if let Err(error) =
+                                crate::services::shutdown_service::shutdown(app.clone(), &state)
+                                    .await
+                            {
+                                logger::error(&format!("shutdown cleanup failed: {error}"));
                             }
                             app.exit(0);
                         });

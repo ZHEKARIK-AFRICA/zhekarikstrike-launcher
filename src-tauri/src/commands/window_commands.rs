@@ -17,9 +17,13 @@ pub async fn minimize_window(app: AppHandle) -> Result<(), AppError> {
 
 #[tauri::command]
 pub async fn close_window(app: AppHandle, state: State<'_, AppState>) -> Result<(), AppError> {
-    shutdown_service::shutdown(app.clone(), state.inner()).await?;
+    let cleanup_result = if state.begin_shutdown() {
+        shutdown_service::shutdown(app.clone(), state.inner()).await
+    } else {
+        Ok(())
+    };
     app.exit(0);
-    Ok(())
+    cleanup_result
 }
 
 #[tauri::command]

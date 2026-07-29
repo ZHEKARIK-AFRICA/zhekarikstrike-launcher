@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
 
 use discord_rich_presence::DiscordIpcClient;
@@ -55,6 +56,7 @@ pub struct AppState {
     pub copied_game_files: Arc<Mutex<Vec<PathBuf>>>,
     operation_lock: Arc<StdMutex<OperationState>>,
     pub cleanup_lock: Arc<Mutex<()>>,
+    shutdown_started: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -70,6 +72,7 @@ impl AppState {
             copied_game_files: Arc::new(Mutex::new(Vec::new())),
             operation_lock: Arc::new(StdMutex::new(OperationState::default())),
             cleanup_lock: Arc::new(Mutex::new(())),
+            shutdown_started: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -134,6 +137,12 @@ impl AppState {
 
     pub fn clear_launcher_update(&self) {
         *lock_unpoisoned(&self.launcher_update) = None;
+    }
+
+    pub fn begin_shutdown(&self) -> bool {
+        self.shutdown_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 }
 
@@ -238,5 +247,12 @@ mod tests {
             Err(AppError::GamePathNotSet)
         ));
         assert_eq!(state.current_state().operation, OperationKind::Idle);
+    }
+
+    #[test]
+    fn release_1_6_11_shutdown_can_only_begin_once() {
+        let state = AppState::new();
+        assert!(state.begin_shutdown());
+        assert!(!state.begin_shutdown());
     }
 }
