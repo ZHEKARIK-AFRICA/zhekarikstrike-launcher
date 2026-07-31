@@ -17,6 +17,8 @@ pub mod install_service;
 pub mod launcher_move_service;
 pub mod launcher_update_service;
 pub mod manifest_service;
+#[allow(dead_code)] // Task 2 wires this Task 1 service into commands and startup state.
+pub mod prerequisite_service;
 pub mod rev_ini_service;
 pub mod shortcut_service;
 pub mod shutdown_service;
