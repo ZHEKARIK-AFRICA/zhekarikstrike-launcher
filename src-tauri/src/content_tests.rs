@@ -10,16 +10,17 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
+use crate::error::AppError;
 use crate::models::{ContentChunk, ContentManifest, ContentMirrorIndex};
 use crate::services::api_client::{parse_content_manifest_response, parse_content_mirror_response};
 use crate::services::content_download_service::{
     decode_verified_chunk, download_content_chunk, read_verified_local_chunk, DriveCircuitBreaker,
 };
 use crate::services::content_install_service::{
-    cleanup_obsolete_directories, commit_staged_files, commit_staged_files_with_hooks,
-    estimate_existing_backup_bytes_with_hooks, load_obsolete_content_entries,
-    materializer_worker_limits, required_content_install_bytes, wait_until_chunk_ready,
-    AdaptiveDownloadController, ChunkReadiness,
+    cleanup_failed_materialization_with_hooks, cleanup_obsolete_directories, commit_staged_files,
+    commit_staged_files_with_hooks, estimate_existing_backup_bytes_with_hooks,
+    load_obsolete_content_entries, materializer_worker_limits, required_content_install_bytes,
+    wait_until_chunk_ready, AdaptiveDownloadController, ChunkReadiness,
 };
 use crate::services::content_journal_service::{
     atomic_json, backup_path, content_root, journal_path, recover_pending_content,
@@ -161,14 +162,7 @@ fn content_deletion_manifest(
 }
 
 async fn persist_active_content_manifest(game: &std::path::Path, manifest: &ContentManifest) {
-    atomic_json(
-        &content_root(game)
-            .join("manifests")
-            .join(format!("{}.json", manifest.content_sha256)),
-        manifest,
-    )
-    .await
-    .unwrap();
+    persist_content_manifest(game, manifest).await;
     atomic_json(
         &state_path(game),
         &ContentCompletionState {
@@ -178,6 +172,38 @@ async fn persist_active_content_manifest(game: &std::path::Path, manifest: &Cont
             release_id: manifest.release_id.clone(),
             game_version: manifest.game_version.clone(),
         },
+    )
+    .await
+    .unwrap();
+}
+
+async fn persist_content_manifest(game: &Path, manifest: &ContentManifest) {
+    atomic_json(
+        &content_root(game)
+            .join("manifests")
+            .join(format!("{}.json", manifest.content_sha256)),
+        manifest,
+    )
+    .await
+    .unwrap();
+}
+
+async fn write_v1_content_journal(
+    game: &Path,
+    transaction_id: &str,
+    manifest: &ContentManifest,
+    files: serde_json::Value,
+) {
+    atomic_json(
+        &journal_path(game),
+        &json!({
+            "schema_version": 1,
+            "transaction_id": transaction_id,
+            "release_id": manifest.release_id,
+            "content_sha256": manifest.content_sha256,
+            "phase": "commit",
+            "files": files
+        }),
     )
     .await
     .unwrap();
@@ -887,6 +913,144 @@ async fn content_deletion_v1_journal_recovery_remains_compatible() {
 }
 
 #[tokio::test]
+async fn content_deletion_v1_multi_entry_recovery_reverses_applied_and_cleans_unstarted_originals()
+{
+    let directory = tempdir().unwrap();
+    let game = directory.path();
+    let transaction_id = uuid::Uuid::new_v4().to_string();
+    let manifest = content_deletion_manifest(
+        'a',
+        "1.0.3.4-r1",
+        "1.0.3.4",
+        &[
+            ("csgo/applied.bin", b"applied-new"),
+            ("csgo/unstarted.bin", b"unstarted-new"),
+        ],
+    );
+    let applied = game.join("csgo/applied.bin");
+    let applied_backup = backup_path(game, &transaction_id).join("csgo/applied.bin");
+    let unstarted = game.join("csgo/unstarted.bin");
+    let unstarted_staged = staging_path(game, &transaction_id).join("csgo/unstarted.bin");
+    for parent in [
+        applied.parent().unwrap(),
+        applied_backup.parent().unwrap(),
+        unstarted_staged.parent().unwrap(),
+    ] {
+        tokio::fs::create_dir_all(parent).await.unwrap();
+    }
+    tokio::fs::write(&applied, b"applied-new").await.unwrap();
+    tokio::fs::write(&applied_backup, b"applied-old")
+        .await
+        .unwrap();
+    tokio::fs::write(&unstarted, b"unstarted-old")
+        .await
+        .unwrap();
+    tokio::fs::write(&unstarted_staged, b"unstarted-new")
+        .await
+        .unwrap();
+    write_v1_content_journal(
+        game,
+        &transaction_id,
+        &manifest,
+        json!([
+            {"path": "csgo/applied.bin", "had_original": true},
+            {"path": "csgo/unstarted.bin", "had_original": true}
+        ]),
+    )
+    .await;
+
+    assert!(recover_pending_content(game).await.unwrap());
+    assert_eq!(tokio::fs::read(&applied).await.unwrap(), b"applied-old");
+    assert_eq!(tokio::fs::read(&unstarted).await.unwrap(), b"unstarted-old");
+    assert!(!staging_path(game, &transaction_id).exists());
+    assert!(!backup_path(game, &transaction_id).exists());
+    assert!(!journal_path(game).exists());
+}
+
+#[tokio::test]
+async fn content_deletion_v1_first_install_uses_trusted_manifest_for_applied_and_unstarted_files() {
+    let directory = tempdir().unwrap();
+    let game = directory.path();
+    let transaction_id = uuid::Uuid::new_v4().to_string();
+    let manifest = content_deletion_manifest(
+        'b',
+        "1.0.3.4-r1",
+        "1.0.3.4",
+        &[
+            ("added/applied.bin", b"applied-new"),
+            ("added/unstarted.bin", b"unstarted-new"),
+        ],
+    );
+    persist_content_manifest(game, &manifest).await;
+    let applied = game.join("added/applied.bin");
+    let unstarted = game.join("added/unstarted.bin");
+    let unstarted_staged = staging_path(game, &transaction_id).join("added/unstarted.bin");
+    tokio::fs::create_dir_all(applied.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(unstarted_staged.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::write(&applied, b"applied-new").await.unwrap();
+    tokio::fs::write(&unstarted_staged, b"unstarted-new")
+        .await
+        .unwrap();
+    write_v1_content_journal(
+        game,
+        &transaction_id,
+        &manifest,
+        json!([
+            {"path": "added/applied.bin", "had_original": false},
+            {"path": "added/unstarted.bin", "had_original": false}
+        ]),
+    )
+    .await;
+
+    assert!(recover_pending_content(game).await.unwrap());
+    assert!(!applied.exists());
+    assert!(!unstarted.exists());
+    assert!(!staging_path(game, &transaction_id).exists());
+    assert!(!journal_path(game).exists());
+}
+
+#[tokio::test]
+async fn content_deletion_v1_first_install_preserves_applied_target_without_trusted_identity() {
+    for (marker, persist_manifest, target_bytes) in [
+        ('c', false, b"managed-new".as_slice()),
+        ('d', true, b"later-user-file".as_slice()),
+    ] {
+        let directory = tempdir().unwrap();
+        let game = directory.path();
+        let transaction_id = uuid::Uuid::new_v4().to_string();
+        let manifest = content_deletion_manifest(
+            marker,
+            "1.0.3.4-r1",
+            "1.0.3.4",
+            &[("added/applied.bin", b"managed-new")],
+        );
+        if persist_manifest {
+            persist_content_manifest(game, &manifest).await;
+        }
+        let target = game.join("added/applied.bin");
+        tokio::fs::create_dir_all(target.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&target, target_bytes).await.unwrap();
+        write_v1_content_journal(
+            game,
+            &transaction_id,
+            &manifest,
+            json!([{"path": "added/applied.bin", "had_original": false}]),
+        )
+        .await;
+
+        assert!(recover_pending_content(game).await.is_err());
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), target_bytes);
+        assert!(journal_path(game).exists());
+    }
+}
+
+#[tokio::test]
 async fn content_deletion_malformed_or_unsafe_journal_paths_are_rejected() {
     let directory = tempdir().unwrap();
     let game = directory.path().join("game");
@@ -1191,6 +1355,93 @@ async fn content_deletion_remove_planned_absent_never_deletes_later_user_file() 
 
     assert!(recover_pending_content(game).await.unwrap());
     assert_eq!(tokio::fs::read(&target).await.unwrap(), b"later-user-file");
+}
+
+#[tokio::test]
+async fn content_deletion_materialize_cleanup_failure_keeps_journal_for_startup_recovery() {
+    let directory = tempdir().unwrap();
+    let game = directory.path();
+    let transaction_id = uuid::Uuid::new_v4().to_string();
+    let journal = ContentJournal {
+        schema_version: 2,
+        transaction_id: transaction_id.clone(),
+        release_id: "1.0.3.5-r1".into(),
+        content_sha256: "a".repeat(64),
+        phase: ContentJournalPhase::Materialize,
+        files: Vec::new(),
+    };
+    write_journal(game, &journal).await.unwrap();
+    let staged = staging_path(game, &transaction_id).join("partial.bin");
+    tokio::fs::create_dir_all(staged.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::write(&staged, b"partial").await.unwrap();
+    let hooks = FailContentFsOperation {
+        operation: ContentFsOperation::RemoveFile,
+        path: staged.clone(),
+    };
+
+    let error = cleanup_failed_materialization_with_hooks(
+        game,
+        &transaction_id,
+        AppError::Network("pipeline exploded".into()),
+        &hooks,
+    )
+    .await;
+
+    assert_eq!(error.code(), "file-system");
+    let message = error.to_string();
+    assert!(message.contains("pipeline exploded"));
+    assert!(message.contains("injected content filesystem failure"));
+    assert!(staged.exists());
+    assert!(journal_path(game).exists());
+
+    assert!(recover_pending_content(game).await.unwrap());
+    assert!(!staging_path(game, &transaction_id).exists());
+    assert!(!journal_path(game).exists());
+}
+
+#[tokio::test]
+async fn content_deletion_materialize_cancel_propagates_journal_cleanup_failure() {
+    let directory = tempdir().unwrap();
+    let game = directory.path();
+    let transaction_id = uuid::Uuid::new_v4().to_string();
+    let journal = ContentJournal {
+        schema_version: 2,
+        transaction_id: transaction_id.clone(),
+        release_id: "1.0.3.5-r1".into(),
+        content_sha256: "b".repeat(64),
+        phase: ContentJournalPhase::Materialize,
+        files: Vec::new(),
+    };
+    write_journal(game, &journal).await.unwrap();
+    let staged = staging_path(game, &transaction_id).join("complete.bin");
+    tokio::fs::create_dir_all(staged.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::write(&staged, b"complete").await.unwrap();
+    let hooks = FailContentFsOperation {
+        operation: ContentFsOperation::RemoveFile,
+        path: journal_path(game),
+    };
+
+    let error = cleanup_failed_materialization_with_hooks(
+        game,
+        &transaction_id,
+        AppError::Canceled,
+        &hooks,
+    )
+    .await;
+
+    assert_eq!(error.code(), "file-system");
+    let message = error.to_string();
+    assert!(message.contains("Operation canceled"));
+    assert!(message.contains("injected content filesystem failure"));
+    assert!(!staging_path(game, &transaction_id).exists());
+    assert!(journal_path(game).exists());
+
+    assert!(recover_pending_content(game).await.unwrap());
+    assert!(!journal_path(game).exists());
 }
 
 #[tokio::test]

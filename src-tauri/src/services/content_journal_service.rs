@@ -7,7 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
 use crate::error::AppError;
-use crate::models::validate_game_path;
+use crate::models::{validate_game_path, ContentManifest};
 use crate::utils::hash_utils::sha256_file;
 use crate::utils::path_utils::{ensure_safe_descendant, safe_join};
 
@@ -442,7 +442,7 @@ pub async fn cleanup_transaction(game_path: &Path, transaction_id: &str) -> Resu
     cleanup_transaction_with_hooks(game_path, transaction_id, &NoContentFsHooks).await
 }
 
-async fn cleanup_transaction_with_hooks(
+pub(crate) async fn cleanup_transaction_with_hooks(
     game_path: &Path,
     transaction_id: &str,
     hooks: &dyn ContentFsHooks,
@@ -735,6 +735,8 @@ async fn rollback_replace_entry(
     backup_root: &Path,
     entry: &ContentJournalEntry,
     schema_version: u8,
+    content_sha256: &str,
+    release_id: &str,
     hooks: &dyn ContentFsHooks,
 ) -> Result<(), AppError> {
     let target = safe_join(game_path, &entry.path)?;
@@ -798,9 +800,12 @@ async fn rollback_replace_entry(
             ));
         };
         if schema_version == 1 {
+            if staged_actual.is_some() {
+                return Ok(());
+            }
             return Err(ambiguous_rollback(
                 entry,
-                "legacy journal has no original identity",
+                "legacy replacement is neither provably unstarted nor restorable",
             ));
         }
         let Some(original_expected) = original_expected else {
@@ -833,6 +838,15 @@ async fn rollback_replace_entry(
         ));
     }
     if let Some(staged_actual) = staged_actual {
+        if schema_version == 1 {
+            if target_actual.is_none() {
+                return Ok(());
+            }
+            return Err(ambiguous_rollback(
+                entry,
+                "legacy unstarted replacement facts conflict",
+            ));
+        }
         if target_expected.as_ref() != Some(&staged_actual) || target_actual.is_some() {
             return Err(ambiguous_rollback(
                 entry,
@@ -844,6 +858,26 @@ async fn rollback_replace_entry(
     let Some(target_actual) = target_actual else {
         return Ok(());
     };
+    if schema_version == 1 {
+        let target_expected = load_trusted_legacy_target_identity(
+            game_path,
+            content_sha256,
+            release_id,
+            &entry.path,
+            hooks,
+        )
+        .await?
+        .ok_or_else(|| {
+            ambiguous_rollback(entry, "trusted legacy target identity is unavailable")
+        })?;
+        if target_actual != target_expected {
+            return Err(ambiguous_rollback(
+                entry,
+                "target does not match the trusted legacy content manifest",
+            ));
+        }
+        return remove_expected_file(game_path, &target, &target_expected, hooks, entry).await;
+    }
     let Some(target_expected) = target_expected else {
         return Err(ambiguous_rollback(entry, "target identity is unavailable"));
     };
@@ -854,6 +888,69 @@ async fn rollback_replace_entry(
         ));
     }
     remove_expected_file(game_path, &target, &target_expected, hooks, entry).await
+}
+
+async fn load_trusted_legacy_target_identity(
+    game_path: &Path,
+    content_sha256: &str,
+    release_id: &str,
+    entry_path: &str,
+    hooks: &dyn ContentFsHooks,
+) -> Result<Option<ContentFileIdentity>, AppError> {
+    let Some(manifest) =
+        load_persisted_content_manifest_with_hooks(game_path, content_sha256, release_id, hooks)
+            .await?
+    else {
+        return Ok(None);
+    };
+    Ok(manifest
+        .files
+        .iter()
+        .find(|file| file.path.eq_ignore_ascii_case(entry_path))
+        .map(|file| ContentFileIdentity {
+            size: file.size,
+            sha256: file.sha256.clone(),
+        }))
+}
+
+pub(crate) async fn load_persisted_content_manifest_with_hooks(
+    game_path: &Path,
+    content_sha256: &str,
+    release_id: &str,
+    hooks: &dyn ContentFsHooks,
+) -> Result<Option<ContentManifest>, AppError> {
+    if content_sha256.len() != 64
+        || !content_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || release_id.is_empty()
+    {
+        return Err(AppError::InvalidData(
+            "invalid persisted content manifest binding".into(),
+        ));
+    }
+    let path = content_root(game_path)
+        .join("manifests")
+        .join(format!("{content_sha256}.json"));
+    let Some(metadata) = guarded_content_metadata(game_path, &path, hooks).await? else {
+        return Ok(None);
+    };
+    if !metadata.is_file() {
+        return Err(AppError::InvalidData(
+            "persisted content manifest path is not a file".into(),
+        ));
+    }
+    let bytes = guarded_content_read(game_path, &path, hooks).await?;
+    let manifest: ContentManifest = serde_json::from_slice(&bytes).map_err(|error| {
+        AppError::InvalidData(format!("invalid persisted content manifest: {error}"))
+    })?;
+    manifest.validate()?;
+    if manifest.content_sha256 != content_sha256 || manifest.release_id != release_id {
+        return Err(AppError::InvalidData(
+            "persisted content manifest binding does not match".into(),
+        ));
+    }
+    Ok(Some(manifest))
 }
 
 async fn rollback_remove_entry(
@@ -939,6 +1036,8 @@ async fn rollback_content_transaction_with_hooks(
                     &backup_root,
                     entry,
                     schema_version,
+                    &journal.content_sha256,
+                    &journal.release_id,
                     hooks,
                 )
                 .await?;
@@ -1018,21 +1117,5 @@ async fn atomic_replace(source: &Path, target: &Path) -> Result<(), AppError> {
 #[cfg(not(target_os = "windows"))]
 async fn atomic_replace(source: &Path, target: &Path) -> Result<(), AppError> {
     tokio::fs::rename(source, target).await?;
-    Ok(())
-}
-
-pub async fn remove_file_if_exists(path: &Path) -> Result<(), AppError> {
-    let metadata = match tokio::fs::symlink_metadata(path).await {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    if !metadata.is_file() {
-        return Err(AppError::InvalidData(format!(
-            "managed cleanup path is not a file: {}",
-            path.display()
-        )));
-    }
-    tokio::fs::remove_file(path).await?;
     Ok(())
 }

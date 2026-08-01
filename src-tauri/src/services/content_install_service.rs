@@ -25,13 +25,13 @@ use crate::services::content_download_service::{
     verified_compressed_file, DriveCircuitBreaker,
 };
 use crate::services::content_journal_service::{
-    atomic_json, backup_path, capture_content_file_identity, cleanup_transaction, content_root,
-    guarded_content_create_dir_all, guarded_content_metadata, guarded_content_rename,
-    guarded_remove_file_if_exists, journal_path, load_completion_state, recover_interrupted_commit,
-    recover_pending_content, remove_empty_obsolete_directories, remove_file_if_exists,
-    staging_path, state_path, write_journal, ContentCompletionState, ContentFileIdentity,
-    ContentFsHooks, ContentJournal, ContentJournalAction, ContentJournalEntry, ContentJournalPhase,
-    NoContentFsHooks,
+    atomic_json, backup_path, capture_content_file_identity, cleanup_transaction,
+    cleanup_transaction_with_hooks, content_root, guarded_content_create_dir_all,
+    guarded_content_metadata, guarded_content_rename, guarded_remove_file_if_exists, journal_path,
+    load_completion_state, load_persisted_content_manifest_with_hooks, recover_interrupted_commit,
+    recover_pending_content, remove_empty_obsolete_directories, staging_path, state_path,
+    write_journal, ContentCompletionState, ContentFileIdentity, ContentFsHooks, ContentJournal,
+    ContentJournalAction, ContentJournalEntry, ContentJournalPhase, NoContentFsHooks,
 };
 use crate::services::disk_service::ensure_disk_space;
 use crate::services::verify_hash_service::{
@@ -498,14 +498,22 @@ pub async fn install_or_update_content(
         .await
     };
     if let Err(error) = pipeline_result {
-        cleanup_transaction(&game_path, &transaction_id).await.ok();
-        remove_file_if_exists(&journal_path(&game_path)).await.ok();
-        return Err(error);
+        return Err(cleanup_failed_materialization_with_hooks(
+            &game_path,
+            &transaction_id,
+            error,
+            &NoContentFsHooks,
+        )
+        .await);
     }
     if cancel.is_cancelled() {
-        cleanup_transaction(&game_path, &transaction_id).await.ok();
-        remove_file_if_exists(&journal_path(&game_path)).await.ok();
-        return Err(AppError::Canceled);
+        return Err(cleanup_failed_materialization_with_hooks(
+            &game_path,
+            &transaction_id,
+            AppError::Canceled,
+            &NoContentFsHooks,
+        )
+        .await);
     }
 
     let manifest_path = content_root(&game_path)
@@ -561,25 +569,46 @@ async fn rollback_failed_install(
     operation_error
 }
 
+pub(crate) async fn cleanup_failed_materialization_with_hooks(
+    game_path: &Path,
+    transaction_id: &str,
+    operation_error: AppError,
+    hooks: &dyn ContentFsHooks,
+) -> AppError {
+    if let Err(cleanup_error) =
+        cleanup_transaction_with_hooks(game_path, transaction_id, hooks).await
+    {
+        return AppError::FileSystem(format!(
+            "content materialization failed ({operation_error}); transaction cleanup also failed ({cleanup_error}); recovery journal was preserved"
+        ));
+    }
+    if let Err(journal_error) =
+        guarded_remove_file_if_exists(game_path, &journal_path(game_path), hooks).await
+    {
+        return AppError::FileSystem(format!(
+            "content materialization failed ({operation_error}); journal cleanup also failed ({journal_error}); recovery journal was preserved"
+        ));
+    }
+    operation_error
+}
+
 async fn load_previous_manifest(game_path: &Path) -> Result<Option<ContentManifest>, AppError> {
     let state = match load_completion_state(game_path).await {
         Ok(Some(state)) if state.schema_version == 1 => state,
         Ok(_) | Err(_) => return Ok(None),
     };
-    let path = content_root(game_path)
-        .join("manifests")
-        .join(format!("{}.json", state.content_sha256));
-    let Ok(bytes) = tokio::fs::read(path).await else {
-        return Ok(None);
-    };
-    let Ok(manifest) = serde_json::from_slice::<ContentManifest>(&bytes) else {
-        return Ok(None);
-    };
-    if manifest.validate().is_err()
-        || manifest.content_sha256 != state.content_sha256
-        || manifest.release_id != state.release_id
-        || manifest.game_version != state.game_version
+    let manifest = match load_persisted_content_manifest_with_hooks(
+        game_path,
+        &state.content_sha256,
+        &state.release_id,
+        &NoContentFsHooks,
+    )
+    .await
     {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) | Err(_) => return Ok(None),
+    };
+    if manifest.game_version != state.game_version {
         return Ok(None);
     }
     Ok(Some(manifest))
