@@ -6,7 +6,16 @@ const OPERATION_STATUS_KEYS = {
     'updating-game': 'status.checking_game_updates',
     'launching-game': 'status.launching_game',
     'updating-launcher': 'status.downloading_launcher_update',
-    'recovering-content': 'status.recovering_install'
+    'recovering-content': 'status.recovering_install',
+    'installing-prerequisites': 'status.prerequisite_detecting'
+};
+
+const PREREQUISITE_STATUS_KEYS = {
+    detecting: 'status.prerequisite_detecting',
+    downloading: 'status.prerequisite_downloading',
+    verifying: 'status.prerequisite_verifying',
+    installing: 'status.prerequisite_installing',
+    complete: 'status.prerequisite_verifying'
 };
 
 function formatEta(seconds, translate) {
@@ -153,6 +162,26 @@ export function createStatusController({
         return true;
     }
 
+    function restorePrerequisite(snapshot) {
+        if (!snapshot?.active) return false;
+        const stage = snapshot.stage || 'detecting';
+        begin({
+            flow: 'prerequisites',
+            step: stage,
+            statusKey: PREREQUISITE_STATUS_KEYS[stage] || PREREQUISITE_STATUS_KEYS.detecting,
+            indeterminate: !Number.isFinite(snapshot.progress),
+            operationId: snapshot.operationId || null
+        });
+        applyProgress({
+            operationId: snapshot.operationId,
+            stage,
+            progress: snapshot.progress,
+            downloadedBytes: snapshot.downloadedBytes,
+            totalBytes: snapshot.totalBytes
+        }, PREREQUISITE_STATUS_KEYS[stage]);
+        return true;
+    }
+
     function rerender() {
         render();
     }
@@ -180,6 +209,7 @@ export function createStatusController({
         setIdle,
         setRunning,
         restoreOperation,
+        restorePrerequisite,
         rerender,
         getState: () => ({ ...state }),
         dispose() {

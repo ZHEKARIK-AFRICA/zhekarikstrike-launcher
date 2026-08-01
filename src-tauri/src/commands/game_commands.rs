@@ -18,6 +18,8 @@ pub async fn launch_game(
     if game_process_service::game_is_running(state.inner()).await {
         return Err(AppError::GameAlreadyRunning);
     }
+    let prerequisites = super::prerequisite_commands::check_game_prerequisites_fast().await?;
+    super::prerequisite_commands::guard_prerequisite_result(prerequisites)?;
     let _lease = state.begin_operation(OperationKind::LaunchingGame, None)?;
 
     #[cfg(feature = "e2e")]

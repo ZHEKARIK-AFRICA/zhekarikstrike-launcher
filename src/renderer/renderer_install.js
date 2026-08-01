@@ -62,7 +62,7 @@ async function recoverAndRoute() {
 
 function restoreOperation(operation) {
     if (!status.restoreOperation(operation)) return false;
-    installing = operation === 'installing';
+    installing = operation === 'installing' || operation === 'installing-prerequisites';
     status.rerender();
     statePoll = window.setInterval(async () => {
         try {
@@ -87,13 +87,39 @@ function restoreOperation(operation) {
     return true;
 }
 
+async function restoreCurrentOperation(operation) {
+    if (operation === 'installing-prerequisites') {
+        const prerequisite = await invoke('get_prerequisite_state');
+        if (status.restorePrerequisite(prerequisite)) {
+            installing = true;
+            status.rerender();
+            statePoll = window.setInterval(async () => {
+                try {
+                    const current = await invoke('get_current_state');
+                    if (current.operation && current.operation !== 'idle') return;
+                    stopStatePolling();
+                    installing = false;
+                    await navigateToPage('./public/index.html');
+                } catch (error) {
+                    stopStatePolling();
+                    startupFailed = true;
+                    status.fail('status.prerequisite_failed');
+                    handleError(null, error);
+                }
+            }, 1000);
+            return true;
+        }
+    }
+    return restoreOperation(operation);
+}
+
 document.addEventListener('DOMContentLoaded', async () => {
     try {
         await waitForE2eReady();
         await initializeLanguage();
         status.rerender();
         const current = await invoke('get_current_state');
-        const restored = restoreOperation(current.operation);
+        const restored = await restoreCurrentOperation(current.operation);
         if (!restored && await recoverAndRoute()) return;
 
         const savedPath = await invoke('get_game_path');
@@ -134,6 +160,15 @@ startInstallButton?.addEventListener('click', async () => {
     } catch (error) {
         if (error?.code === 'canceled') {
             status.cancel('status.installation_canceled');
+        } else if (String(error?.code || '').startsWith('prerequisite_')) {
+            status.fail('status.prerequisite_failed');
+            handleError(null, error);
+            try {
+                sessionStorage.setItem('pending-prerequisite-error', JSON.stringify(error));
+            } catch (storageError) {
+                console.error('Failed to carry prerequisite error to the main page:', storageError);
+            }
+            await navigateToPage('./public/index.html');
         } else {
             status.fail('status.installation_failed');
             handleError(null, error, { contextKey: 'status.installation_failed' });
@@ -180,6 +215,16 @@ void listenUntilPageHide('install-progress', ({ payload }) => {
 });
 void listenUntilPageHide('recovery-progress', ({ payload }) => {
     status.applyProgress(payload, 'status.recovering_install');
+});
+void listenUntilPageHide('prerequisite-progress', ({ payload }) => {
+    const statusKey = {
+        detecting: 'status.prerequisite_detecting',
+        downloading: 'status.prerequisite_downloading',
+        verifying: 'status.prerequisite_verifying',
+        installing: 'status.prerequisite_installing',
+        complete: 'status.prerequisite_verifying'
+    }[payload.stage] || 'status.prerequisite_detecting';
+    status.applyProgress(payload, statusKey);
 });
 
 window.addEventListener('pagehide', () => {

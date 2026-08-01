@@ -91,6 +91,27 @@ describe('status controller', () => {
         expect(document.getElementById('root').getAttribute('aria-busy')).toBe('true');
     });
 
+    it('restores the exact prerequisite stage and progress after a reload', () => {
+        controller.restorePrerequisite({
+            active: true,
+            operationId: 'prerequisite-operation',
+            stage: 'downloading',
+            componentId: 'vc2010-sp1-x86',
+            progress: 37,
+            downloadedBytes: 370,
+            totalBytes: 1000,
+            restartRecommended: false
+        });
+
+        expect(controller.getState()).toMatchObject({
+            kind: 'busy', flow: 'prerequisites', step: 'downloading',
+            activeOperationId: 'prerequisite-operation', progress: 37
+        });
+        expect(document.getElementById('status').textContent)
+            .toBe('status.prerequisite_downloading');
+        expect(document.getElementById('progress').style.width).toBe('37%');
+    });
+
     it('stops reacting to language events after dispose', () => {
         controller.setIdle('ready');
         controller.dispose();

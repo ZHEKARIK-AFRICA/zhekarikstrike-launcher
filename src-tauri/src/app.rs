@@ -97,6 +97,8 @@ pub fn run() {
             install_game,
             cancel_install,
             recover_pending_install,
+            ensure_game_prerequisites,
+            get_prerequisite_state,
             verify_files,
             update_game,
             cancel_verify,

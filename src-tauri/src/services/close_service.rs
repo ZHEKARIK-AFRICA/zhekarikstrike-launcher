@@ -161,6 +161,7 @@ mod tests {
         );
         for operation in [
             OperationKind::Installing,
+            OperationKind::InstallingPrerequisites,
             OperationKind::Verifying,
             OperationKind::UpdatingGame,
             OperationKind::LaunchingGame,

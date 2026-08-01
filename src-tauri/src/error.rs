@@ -41,6 +41,21 @@ pub enum AppError {
     #[error("Administrator privileges are required")]
     AdminRequired,
 
+    #[error("Prerequisite download failed: {0}")]
+    PrerequisiteDownload(String),
+
+    #[error("Prerequisite verification failed: {0}")]
+    PrerequisiteVerification(String),
+
+    #[error("Prerequisite install failed: {0}")]
+    PrerequisiteInstall(String),
+
+    #[error("Prerequisite restart required: {0}")]
+    PrerequisiteRestartRequired(String),
+
+    #[error("Prerequisite is unsupported: {0}")]
+    PrerequisiteUnsupported(String),
+
     #[error("Invalid data: {0}")]
     InvalidData(String),
 
@@ -61,6 +76,11 @@ impl AppError {
             AppError::OperationInProgress(_) => "operation-in-progress",
             AppError::Canceled => "canceled",
             AppError::AdminRequired => "admin-required",
+            AppError::PrerequisiteDownload(_) => "prerequisite_download_failed",
+            AppError::PrerequisiteVerification(_) => "prerequisite_verification_failed",
+            AppError::PrerequisiteInstall(_) => "prerequisite_install_failed",
+            AppError::PrerequisiteRestartRequired(_) => "prerequisite_restart_required",
+            AppError::PrerequisiteUnsupported(_) => "prerequisite_unsupported",
             AppError::InvalidData(_) => "invalid-data",
             AppError::Unknown(_) => "unknown",
         }
@@ -132,5 +152,52 @@ mod release_1_6_11_tests {
         let error = AppError::GameAlreadyRunning;
         assert_eq!(error.code(), "game_already_running");
         assert_eq!(error.frontend_error().details, None);
+    }
+
+    #[test]
+    fn release_1_6_13_prerequisite_errors_keep_structured_frontend_codes() {
+        let cases = [
+            (
+                AppError::PrerequisiteDownload("offline".into()),
+                "prerequisite_download_failed",
+            ),
+            (
+                AppError::PrerequisiteVerification("bad hash".into()),
+                "prerequisite_verification_failed",
+            ),
+            (
+                AppError::PrerequisiteInstall("exit 1603".into()),
+                "prerequisite_install_failed",
+            ),
+            (
+                AppError::PrerequisiteRestartRequired("restart Windows".into()),
+                "prerequisite_restart_required",
+            ),
+            (
+                AppError::PrerequisiteUnsupported("arm64".into()),
+                "prerequisite_unsupported",
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(error.code(), expected);
+            assert!(error.frontend_error().message.contains(':'));
+        }
+    }
+}
+
+impl From<crate::services::prerequisite_service::PrerequisiteError> for AppError {
+    fn from(value: crate::services::prerequisite_service::PrerequisiteError) -> Self {
+        use crate::services::prerequisite_service::PrerequisiteError;
+        match value {
+            PrerequisiteError::Download(message) => Self::PrerequisiteDownload(message),
+            PrerequisiteError::Verification(message) => Self::PrerequisiteVerification(message),
+            PrerequisiteError::Install(message) => Self::PrerequisiteInstall(message),
+            PrerequisiteError::RestartRequired(message) => {
+                Self::PrerequisiteRestartRequired(message)
+            }
+            PrerequisiteError::Unsupported(message) => Self::PrerequisiteUnsupported(message),
+            PrerequisiteError::Canceled => Self::Canceled,
+        }
     }
 }

@@ -25,6 +25,18 @@ const ANALYSIS_PATH: &str = ".zhekarik/prerequisites/analysis-v1.json";
 pub type ServiceFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, PrerequisiteError>> + Send + 'a>>;
 
+#[derive(Debug, Clone)]
+pub struct PrerequisiteServiceProgress {
+    pub stage: &'static str,
+    pub component_id: Option<String>,
+    pub progress: Option<f64>,
+    pub downloaded_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
+    pub restart_recommended: bool,
+}
+
+pub type PrerequisiteProgressCallback = Arc<dyn Fn(PrerequisiteServiceProgress) + Send + Sync>;
+
 #[derive(Debug, thiserror::Error)]
 pub enum PrerequisiteError {
     #[error("prerequisite download failed: {0}")]
@@ -209,6 +221,7 @@ pub struct PrerequisiteService {
     trust: Arc<dyn TrustVerifier>,
     runtime: Arc<dyn RuntimeProbe>,
     runner: Arc<dyn InstallerRunner>,
+    progress: Option<PrerequisiteProgressCallback>,
 }
 
 impl PrerequisiteService {
@@ -223,6 +236,7 @@ impl PrerequisiteService {
             trust,
             runtime,
             runner,
+            progress: None,
         }
     }
 
@@ -233,6 +247,46 @@ impl PrerequisiteService {
             Arc::new(SystemRuntimeProbe),
             Arc::new(ProcessInstallerRunner),
         ))
+    }
+
+    pub fn windows_with_progress(
+        progress: PrerequisiteProgressCallback,
+    ) -> Result<Self, PrerequisiteError> {
+        Ok(Self {
+            downloader: Arc::new(HttpInstallerDownloader::new_with_progress(
+                progress.clone(),
+            )?),
+            trust: Arc::new(WindowsTrustVerifier),
+            runtime: Arc::new(SystemRuntimeProbe),
+            runner: Arc::new(ProcessInstallerRunner),
+            progress: Some(progress),
+        })
+    }
+
+    pub fn with_progress(mut self, progress: PrerequisiteProgressCallback) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+
+    fn emit_progress(
+        &self,
+        stage: &'static str,
+        component_id: Option<&str>,
+        progress: Option<f64>,
+        downloaded_bytes: Option<u64>,
+        total_bytes: Option<u64>,
+        restart_recommended: bool,
+    ) {
+        if let Some(callback) = &self.progress {
+            callback(PrerequisiteServiceProgress {
+                stage,
+                component_id: component_id.map(str::to_string),
+                progress,
+                downloaded_bytes,
+                total_bytes,
+                restart_recommended,
+            });
+        }
     }
 
     pub async fn analyze_active(
@@ -358,7 +412,16 @@ impl PrerequisiteService {
         self.ensure_manifest(game_root, &manifest, cancel).await
     }
 
-    async fn ensure_manifest(
+    pub async fn check_active(
+        &self,
+        game_root: &Path,
+        cancel: &CancellationToken,
+    ) -> Result<EnsurePrerequisitesResult, PrerequisiteError> {
+        let manifest = load_active_manifest(game_root).await?;
+        self.check_manifest(game_root, &manifest, cancel).await
+    }
+
+    async fn check_manifest(
         &self,
         game_root: &Path,
         manifest: &ContentManifest,
@@ -389,6 +452,62 @@ impl PrerequisiteService {
                 &requirement.imports,
             )? {
                 result.already_present.push(requirement.component_id);
+            } else {
+                result.ready = false;
+            }
+        }
+        Ok(result)
+    }
+
+    async fn ensure_manifest(
+        &self,
+        game_root: &Path,
+        manifest: &ContentManifest,
+        cancel: &CancellationToken,
+    ) -> Result<EnsurePrerequisitesResult, PrerequisiteError> {
+        self.emit_progress("detecting", None, Some(0.0), None, None, false);
+        let analysis = self.analyze(game_root, manifest, cancel).await?;
+        self.emit_progress("detecting", None, Some(100.0), None, None, false);
+        let mut result = EnsurePrerequisitesResult {
+            ready: true,
+            installed: Vec::new(),
+            already_present: Vec::new(),
+            restart_status: RestartStatus::None,
+        };
+        for requirement in analysis.requirements {
+            if cancel.is_cancelled() {
+                return Err(PrerequisiteError::Canceled);
+            }
+            let component = catalog_component(&requirement.component_id)
+                .ok_or_else(|| PrerequisiteError::Unsupported(requirement.component_id.clone()))?;
+            if component.architecture != requirement.architecture {
+                return Err(PrerequisiteError::Unsupported(format!(
+                    "{} has no {:?} catalog entry",
+                    requirement.component_id, requirement.architecture
+                )));
+            }
+            self.emit_progress(
+                "verifying",
+                Some(&requirement.component_id),
+                Some(0.0),
+                None,
+                None,
+                false,
+            );
+            if self.runtime.component_satisfied(
+                &component,
+                requirement.architecture,
+                &requirement.imports,
+            )? {
+                self.emit_progress(
+                    "verifying",
+                    Some(&requirement.component_id),
+                    Some(100.0),
+                    None,
+                    None,
+                    false,
+                );
+                result.already_present.push(requirement.component_id);
                 continue;
             }
             let exit = self
@@ -412,6 +531,14 @@ impl PrerequisiteService {
             result.ready &= completion.ready;
             result.installed.push(requirement.component_id);
         }
+        self.emit_progress(
+            "complete",
+            None,
+            Some(100.0),
+            None,
+            None,
+            result.restart_status != RestartStatus::None,
+        );
         Ok(result)
     }
 
@@ -430,7 +557,23 @@ impl PrerequisiteService {
             InstallerSource::Remote(_) => {
                 let cache = game_root.join(".zhekarik/prerequisites/cache");
                 let target = cache.join(format!("{}.exe", component.id));
+                self.emit_progress(
+                    "downloading",
+                    Some(component.id),
+                    Some(0.0),
+                    Some(0),
+                    Some(component.size),
+                    false,
+                );
                 self.downloader.download(component, &target, cancel).await?;
+                self.emit_progress(
+                    "downloading",
+                    Some(component.id),
+                    Some(100.0),
+                    Some(component.size),
+                    Some(component.size),
+                    false,
+                );
                 target
             }
             InstallerSource::GameLocal(relative) => {
@@ -459,6 +602,14 @@ impl PrerequisiteService {
         if cancel.is_cancelled() {
             return Err(PrerequisiteError::Canceled);
         }
+        self.emit_progress(
+            "verifying",
+            Some(component.id),
+            Some(0.0),
+            None,
+            None,
+            false,
+        );
         verify_execution_artifact(
             &artifact,
             component.size,
@@ -466,8 +617,25 @@ impl PrerequisiteService {
             component.architecture,
             self.trust.as_ref(),
         )?;
+        self.emit_progress(
+            "verifying",
+            Some(component.id),
+            Some(100.0),
+            None,
+            None,
+            false,
+        );
 
-        match component.id {
+        self.emit_progress(
+            "installing",
+            Some(component.id),
+            Some(0.0),
+            None,
+            None,
+            false,
+        );
+
+        let result = match component.id {
             "vc2010-sp1-x86" => {
                 let arguments = vec!["/quiet".into(), "/norestart".into()];
                 classify_installer_exit(self.runner.run(&artifact, &arguments, cancel).await?)
@@ -477,7 +645,18 @@ impl PrerequisiteService {
                     .await
             }
             _ => Err(PrerequisiteError::Unsupported(component.id.into())),
+        };
+        if let Ok(exit) = result {
+            self.emit_progress(
+                "installing",
+                Some(component.id),
+                Some(100.0),
+                None,
+                None,
+                exit != InstallerExit::Success,
+            );
         }
+        result
     }
 
     async fn install_directx(
@@ -978,6 +1157,7 @@ fn verification<T>(message: &str) -> Result<T, PrerequisiteError> {
 
 pub struct HttpInstallerDownloader {
     client: reqwest::Client,
+    progress: Option<PrerequisiteProgressCallback>,
 }
 
 impl HttpInstallerDownloader {
@@ -992,7 +1172,18 @@ impl HttpInstallerDownloader {
             ))
             .build()
             .map_err(|error| PrerequisiteError::Download(error.to_string()))?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            progress: None,
+        })
+    }
+
+    fn new_with_progress(
+        progress: PrerequisiteProgressCallback,
+    ) -> Result<Self, PrerequisiteError> {
+        let mut downloader = Self::new()?;
+        downloader.progress = Some(progress);
+        Ok(downloader)
     }
 }
 
@@ -1068,6 +1259,16 @@ impl InstallerDownloader for HttpInstallerDownloader {
                     file.write_all(&chunk)
                         .await
                         .map_err(|error| PrerequisiteError::Download(error.to_string()))?;
+                    if let Some(callback) = &self.progress {
+                        callback(PrerequisiteServiceProgress {
+                            stage: "downloading",
+                            component_id: Some(component.id.to_string()),
+                            progress: Some((size as f64 / component.size as f64) * 100.0),
+                            downloaded_bytes: Some(size),
+                            total_bytes: Some(component.size),
+                            restart_recommended: false,
+                        });
+                    }
                 }
                 file.flush()
                     .await
@@ -1109,7 +1310,7 @@ impl InstallerRunner for ProcessInstallerRunner {
                 return Err(PrerequisiteError::Canceled);
             }
             let mut command = tokio::process::Command::new(program);
-            command.args(arguments).kill_on_drop(true);
+            command.args(arguments);
             #[cfg(windows)]
             {
                 use std::os::windows::process::CommandExt;
@@ -1118,17 +1319,14 @@ impl InstallerRunner for ProcessInstallerRunner {
             let mut child = command
                 .spawn()
                 .map_err(|error| PrerequisiteError::Install(error.to_string()))?;
-            tokio::select! {
-                _ = cancel.cancelled() => {
-                    child.kill().await.ok();
-                    child.wait().await.ok();
-                    Err(PrerequisiteError::Canceled)
-                }
-                status = child.wait() => {
-                    let status = status.map_err(|error| PrerequisiteError::Install(error.to_string()))?;
-                    Ok(status.code().unwrap_or(-1))
-                }
-            }
+            // Cancellation is intentionally ignored after spawn: Windows runtime installers
+            // must be allowed to finish. The close lifecycle waits up to ten seconds and a
+            // later launch performs a fresh runtime check.
+            let status = child
+                .wait()
+                .await
+                .map_err(|error| PrerequisiteError::Install(error.to_string()))?;
+            Ok(status.code().unwrap_or(-1))
         })
     }
 }
@@ -2014,5 +2212,108 @@ mod tests {
             directx.local_source().unwrap(),
             PathBuf::from("directx_installer/directx_jun2010_redist.exe")
         );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cancellation_after_system_installer_spawn_does_not_kill_it() {
+        let cancel = CancellationToken::new();
+        let cancel_after_spawn = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel_after_spawn.cancel();
+        });
+        let shell = PathBuf::from(std::env::var("COMSPEC").expect("Windows command shell"));
+        let arguments = vec![
+            "/C".to_string(),
+            "ping 127.0.0.1 -n 2 > nul & exit /b 0".to_string(),
+        ];
+
+        let exit = ProcessInstallerRunner
+            .run(&shell, &arguments, &cancel)
+            .await
+            .expect("installer owns its lifecycle after spawn");
+
+        assert_eq!(exit, 0);
+        assert!(cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn prerequisite_status_flow_reports_detection_verification_and_completion() {
+        let directory = tempdir().expect("temporary game directory");
+        fs::write(
+            directory.path().join("game.exe"),
+            fixture_pe(PeArchitecture::X86, &["msvcr100.dll"]),
+        )
+        .expect("PE fixture should be written");
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = events.clone();
+        let service = PrerequisiteService::new(
+            Arc::new(RecordingDownloader::default()),
+            Arc::new(AcceptingTrust),
+            Arc::new(FixedProbe { satisfied: true }),
+            Arc::new(RecordingRunner::default()),
+        )
+        .with_progress(Arc::new(move |event| {
+            recorded.lock().expect("progress recording lock").push((
+                event.stage,
+                event.component_id,
+                event.progress,
+            ));
+        }));
+
+        let result = service
+            .ensure_manifest(
+                directory.path(),
+                &analysis_manifest(&"a".repeat(64), &["game.exe"]),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("already installed runtime should be ready");
+
+        assert!(result.ready);
+        assert_eq!(result.already_present, vec!["vc2010-sp1-x86"]);
+        assert_eq!(
+            *events.lock().expect("progress recording lock"),
+            vec![
+                ("detecting", None, Some(0.0)),
+                ("detecting", None, Some(100.0)),
+                ("verifying", Some("vc2010-sp1-x86".into()), Some(0.0)),
+                ("verifying", Some("vc2010-sp1-x86".into()), Some(100.0)),
+                ("complete", None, Some(100.0)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn fast_check_never_downloads_or_runs_a_missing_prerequisite() {
+        let directory = tempdir().expect("temporary game directory");
+        fs::write(
+            directory.path().join("game.exe"),
+            fixture_pe(PeArchitecture::X86, &["msvcr100.dll"]),
+        )
+        .expect("PE fixture should be written");
+        let downloader = Arc::new(RecordingDownloader::default());
+        let runner = Arc::new(RecordingRunner::default());
+        let service = PrerequisiteService::new(
+            downloader.clone(),
+            Arc::new(AcceptingTrust),
+            Arc::new(FixedProbe { satisfied: false }),
+            runner.clone(),
+        );
+
+        let result = service
+            .check_manifest(
+                directory.path(),
+                &analysis_manifest(&"b".repeat(64), &["game.exe"]),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("fast check should report missing state without installing");
+
+        assert!(!result.ready);
+        assert!(result.installed.is_empty());
+        assert_eq!(downloader.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 0);
     }
 }

@@ -74,6 +74,27 @@ function restoreOperation(operation) {
     return true;
 }
 
+async function restoreCurrentOperation(current) {
+    if (current?.operation === 'installing-prerequisites') {
+        const prerequisite = await invoke('get_prerequisite_state');
+        if (status.restorePrerequisite(prerequisite)) {
+            stopStatePolling();
+            statePoll = window.setInterval(async () => {
+                try {
+                    const latest = await invoke('get_current_state');
+                    if (latest.operation && latest.operation !== 'idle') return;
+                    stopStatePolling();
+                    await syncIdleState();
+                } catch (error) {
+                    console.error('Failed to refresh prerequisite state:', error);
+                }
+            }, 1000);
+            return true;
+        }
+    }
+    return restoreOperation(current?.operation);
+}
+
 document.addEventListener('DOMContentLoaded', async () => {
     try {
         await waitForE2eReady();
@@ -107,7 +128,17 @@ document.addEventListener('DOMContentLoaded', async () => {
         }));
 
         initialized = true;
-        if (!restoreOperation(current.operation)) await syncIdleState();
+        if (!await restoreCurrentOperation(current)) await syncIdleState();
+        try {
+            const pendingPrerequisiteError = sessionStorage.getItem('pending-prerequisite-error');
+            if (pendingPrerequisiteError) {
+                sessionStorage.removeItem('pending-prerequisite-error');
+                handleError(null, JSON.parse(pendingPrerequisiteError));
+            }
+        } catch (error) {
+            sessionStorage.removeItem('pending-prerequisite-error');
+            console.error('Failed to restore prerequisite error:', error);
+        }
         document.body.classList.add('fade-in');
     } catch (error) {
         startupFailed = true;
@@ -135,6 +166,19 @@ playButton?.addEventListener('click', async () => {
             step: 'launch-verification', statusKey: 'status.checking_launch_files', operationId
         });
         await invoke('verify_files', { checkAllFiles: false, operationId });
+
+        failureKey = 'status.prerequisite_failed';
+        operationId = createOperationId();
+        status.beginStep({
+            step: 'detecting', statusKey: 'status.prerequisite_detecting', operationId
+        });
+        const prerequisites = await invoke('ensure_game_prerequisites', { operationId });
+        if (!prerequisites?.ready) {
+            throw {
+                code: 'prerequisite_restart_required',
+                message: 'Installed prerequisites require a Windows restart.'
+            };
+        }
 
         failureKey = 'status.launch_settings_failed';
         status.beginStep({
@@ -233,6 +277,16 @@ void listenUntilPageHide('verify-progress', ({ payload }) => {
 });
 void listenUntilPageHide('recovery-progress', ({ payload }) => {
     status.applyProgress(payload, 'status.recovering_install');
+});
+void listenUntilPageHide('prerequisite-progress', ({ payload }) => {
+    const statusKey = {
+        detecting: 'status.prerequisite_detecting',
+        downloading: 'status.prerequisite_downloading',
+        verifying: 'status.prerequisite_verifying',
+        installing: 'status.prerequisite_installing',
+        complete: 'status.prerequisite_verifying'
+    }[payload.stage] || 'status.prerequisite_detecting';
+    status.applyProgress(payload, statusKey);
 });
 void listenUntilPageHide('game-starting', () => {
     launchEventSeen = true;

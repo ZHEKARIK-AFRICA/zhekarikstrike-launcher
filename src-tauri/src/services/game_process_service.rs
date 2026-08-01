@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -75,14 +76,25 @@ pub async fn launch_game(
             crate::logger::warn(&format!("Discord RPC start failed: {error}"));
         }
 
-        Command::new(&exe_path)
+        let mut revloader = Command::new(&exe_path)
             .current_dir(&game_path)
             .spawn()
             .map_err(|error| AppError::Unknown(format!("failed to spawn game: {error}")))?;
 
-        let game_process = wait_for_process(
-            GAME_PROCESS_NAME,
-            Duration::from_millis(GAME_START_TIMEOUT_MS),
+        let game_process = wait_for_game_or_loader_exit(
+            wait_for_process(
+                GAME_PROCESS_NAME,
+                Duration::from_millis(GAME_START_TIMEOUT_MS),
+            ),
+            async move {
+                let status = revloader.wait().await.map_err(|error| {
+                    AppError::Unknown(format!("failed to observe RevLoader.exe: {error}"))
+                })?;
+                if let Some(game_process) = find_process_by_name(GAME_PROCESS_NAME).await {
+                    return Ok(game_process);
+                }
+                revloader_exit_result(status.code().unwrap_or(-1))
+            },
         )
         .await?;
         {
@@ -206,6 +218,36 @@ async fn wait_for_process(name: &str, timeout: Duration) -> Result<GameProcessIn
     Err(AppError::Unknown(format!("Timed out waiting for {name}")))
 }
 
+fn classify_revloader_exit(code: i32) -> Result<(), AppError> {
+    if code == 0xC000_0135_u32 as i32 {
+        return Err(AppError::PrerequisiteRestartRequired(
+            "RevLoader.exe could not find a required runtime DLL; install prerequisites or restart Windows"
+                .to_string(),
+        ));
+    }
+    Err(AppError::Unknown(format!(
+        "RevLoader.exe exited before the game appeared (code {code})"
+    )))
+}
+
+fn revloader_exit_result(code: i32) -> Result<GameProcessInfo, AppError> {
+    classify_revloader_exit(code)?;
+    unreachable!("all loader exits are launch failures")
+}
+
+async fn wait_for_game_or_loader_exit<G, L>(game: G, loader: L) -> Result<GameProcessInfo, AppError>
+where
+    G: Future<Output = Result<GameProcessInfo, AppError>>,
+    L: Future<Output = Result<GameProcessInfo, AppError>>,
+{
+    tokio::pin!(game);
+    tokio::pin!(loader);
+    tokio::select! {
+        game = &mut game => game,
+        loader = &mut loader => loader,
+    }
+}
+
 async fn is_pid_running(pid: u32) -> bool {
     let mut system = System::new_all();
     system.refresh_all();
@@ -217,7 +259,13 @@ async fn is_pid_running(pid: u32) -> bool {
 
 #[cfg(test)]
 mod release_1_6_11_tests {
-    use super::{detected_process_state, is_observed_external_process};
+    use std::future::{pending, ready};
+
+    use super::{
+        classify_revloader_exit, detected_process_state, is_observed_external_process,
+        revloader_exit_result, wait_for_game_or_loader_exit,
+    };
+    use crate::error::AppError;
     use crate::models::{GameProcessInfo, GameProcessStateKind};
 
     #[test]
@@ -239,5 +287,44 @@ mod release_1_6_11_tests {
         assert!(is_observed_external_process(Some(42), false));
         assert!(!is_observed_external_process(Some(42), true));
         assert!(!is_observed_external_process(None, false));
+    }
+
+    #[test]
+    fn release_1_6_13_missing_runtime_exit_is_a_targeted_prerequisite_error() {
+        let error = classify_revloader_exit(0xC000_0135_u32 as i32)
+            .expect_err("missing DLL exit must fail immediately");
+        assert!(matches!(error, AppError::PrerequisiteRestartRequired(_)));
+    }
+
+    #[test]
+    fn release_1_6_13_other_revloader_exit_is_reported_immediately() {
+        let error = classify_revloader_exit(5)
+            .expect_err("unexpected loader exit must not wait for the game timeout");
+        assert_eq!(error.code(), "unknown");
+        assert!(error.to_string().contains("code 5"));
+    }
+
+    #[tokio::test]
+    async fn release_1_6_13_loader_exit_wins_without_waiting_for_game_timeout() {
+        let result = wait_for_game_or_loader_exit(pending(), ready(revloader_exit_result(5))).await;
+
+        assert!(result
+            .expect_err("loader exit should win")
+            .to_string()
+            .contains("code 5"));
+    }
+
+    #[tokio::test]
+    async fn release_1_6_13_loader_handoff_accepts_a_game_found_on_final_probe() {
+        let handed_off = GameProcessInfo {
+            pid: 73,
+            name: "zhekarikstrike.exe".into(),
+        };
+
+        let game = wait_for_game_or_loader_exit(pending(), ready(Ok(handed_off.clone())))
+            .await
+            .expect("a game found as RevLoader exits should win the race");
+
+        assert_eq!(game.pid, 73);
     }
 }

@@ -36,4 +36,18 @@ describe('createI18n', () => {
         expect(invoke).toHaveBeenCalledWith('set_language', { language: 'ru' });
         expect(i18n.t('play')).toBe('ИГРАТЬ');
     });
+
+    it('provides prerequisite lifecycle statuses in English and Russian', async () => {
+        const keys = [
+            'status.prerequisite_detecting',
+            'status.prerequisite_downloading',
+            'status.prerequisite_installing',
+            'status.prerequisite_verifying'
+        ];
+        const i18n = createI18n({ invoke: vi.fn().mockResolvedValue(null), systemLanguage: 'en' });
+        for (const key of keys) expect(i18n.t(key)).not.toBe(key);
+
+        await i18n.setLanguage('ru');
+        for (const key of keys) expect(i18n.t(key)).not.toBe(key);
+    });
 });

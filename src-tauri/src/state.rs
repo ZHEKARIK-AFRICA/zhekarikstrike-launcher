@@ -16,6 +16,7 @@ pub enum OperationKind {
     #[default]
     Idle,
     Installing,
+    InstallingPrerequisites,
     Verifying,
     UpdatingGame,
     LaunchingGame,
@@ -47,11 +48,26 @@ pub struct CurrentState {
     pub launcher_update_ready: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PrerequisiteOperationState {
+    pub active: bool,
+    pub operation_id: Option<String>,
+    pub stage: Option<String>,
+    pub component_id: Option<String>,
+    pub progress: Option<f64>,
+    pub downloaded_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
+    pub restart_recommended: bool,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     install_cancel_token: Arc<StdMutex<Option<CancellationToken>>>,
     verify_cancel_token: Arc<StdMutex<Option<CancellationToken>>>,
     launcher_update_cancel_token: Arc<StdMutex<Option<CancellationToken>>>,
+    prerequisite_cancel_token: Arc<StdMutex<Option<CancellationToken>>>,
+    prerequisite_state: Arc<StdMutex<PrerequisiteOperationState>>,
     launcher_update: Arc<StdMutex<Option<VerifiedLauncherUpdate>>>,
     pub file_patch_cancel_token: Arc<Mutex<Option<CancellationToken>>>,
     pub process_state: Arc<RwLock<GameProcessState>>,
@@ -70,6 +86,8 @@ impl AppState {
             install_cancel_token: Arc::new(StdMutex::new(None)),
             verify_cancel_token: Arc::new(StdMutex::new(None)),
             launcher_update_cancel_token: Arc::new(StdMutex::new(None)),
+            prerequisite_cancel_token: Arc::new(StdMutex::new(None)),
+            prerequisite_state: Arc::new(StdMutex::new(PrerequisiteOperationState::default())),
             launcher_update: Arc::new(StdMutex::new(None)),
             file_patch_cancel_token: Arc::new(Mutex::new(None)),
             process_state: Arc::new(RwLock::new(GameProcessState::default())),
@@ -99,6 +117,7 @@ impl AppState {
             CancellationSlot::Install => self.install_cancel_token.clone(),
             CancellationSlot::Verify => self.verify_cancel_token.clone(),
             CancellationSlot::LauncherUpdate => self.launcher_update_cancel_token.clone(),
+            CancellationSlot::Prerequisite => self.prerequisite_cancel_token.clone(),
         });
         let cancellation_token = cancel_slot.as_ref().map(|slot| {
             let token = CancellationToken::new();
@@ -125,11 +144,28 @@ impl AppState {
         cancel_slot(&self.launcher_update_cancel_token)
     }
 
+    pub fn cancel_prerequisites(&self) -> bool {
+        cancel_slot(&self.prerequisite_cancel_token)
+    }
+
+    pub fn prerequisite_state(&self) -> PrerequisiteOperationState {
+        lock_unpoisoned(&self.prerequisite_state).clone()
+    }
+
+    pub fn set_prerequisite_state(&self, snapshot: PrerequisiteOperationState) {
+        *lock_unpoisoned(&self.prerequisite_state) = snapshot;
+    }
+
+    pub fn finish_prerequisite_operation(&self) {
+        lock_unpoisoned(&self.prerequisite_state).active = false;
+    }
+
     pub fn cancel_active_operation(&self) -> bool {
         match self.current_state().operation {
             OperationKind::Installing => self.cancel_install(),
             OperationKind::Verifying | OperationKind::UpdatingGame => self.cancel_verify(),
             OperationKind::UpdatingLauncher => self.cancel_launcher_update(),
+            OperationKind::InstallingPrerequisites => self.cancel_prerequisites(),
             OperationKind::Idle
             | OperationKind::LaunchingGame
             | OperationKind::RecoveringContent => false,
@@ -209,6 +245,7 @@ pub enum CancellationSlot {
     Install,
     Verify,
     LauncherUpdate,
+    Prerequisite,
 }
 
 #[derive(Debug)]
@@ -341,6 +378,27 @@ mod tests {
             .cancellation_token()
             .expect("launcher update should expose a token");
 
+        assert!(state.cancel_active_operation());
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn release_1_6_13_prerequisite_operation_is_exclusive_and_cancelable() {
+        let state = AppState::new();
+        let lease = state
+            .begin_operation(
+                OperationKind::InstallingPrerequisites,
+                Some(CancellationSlot::Prerequisite),
+            )
+            .expect("prerequisite operation should start");
+        let token = lease
+            .cancellation_token()
+            .expect("prerequisite downloads expose cancellation");
+
+        assert_eq!(
+            state.current_state().operation,
+            OperationKind::InstallingPrerequisites
+        );
         assert!(state.cancel_active_operation());
         assert!(token.is_cancelled());
     }

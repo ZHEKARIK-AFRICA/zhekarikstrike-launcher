@@ -23,28 +23,62 @@ pub async fn install_game(
         .expect("install operations always have a cancellation token");
 
     #[cfg(feature = "e2e")]
-    {
-        let _ = (app, operation_id);
+    let content_result = {
         if game_path.to_ascii_lowercase().contains("error") {
-            return Err(AppError::Network(
+            Err(AppError::Network(
                 "native install fixture failed".to_string(),
-            ));
-        }
-        if game_path.to_ascii_lowercase().contains("cancel") {
+            ))
+        } else if game_path.to_ascii_lowercase().contains("cancel") {
             cancel.cancelled().await;
-            return Err(AppError::Canceled);
+            Err(AppError::Canceled)
+        } else {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            Ok(())
         }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        return Ok(());
-    }
+    };
 
     #[cfg(not(feature = "e2e"))]
-    install_service::install_game(app, PathBuf::from(game_path), cancel, operation_id).await
+    let content_result = install_service::install_game(
+        app.clone(),
+        PathBuf::from(game_path),
+        cancel,
+        operation_id.clone(),
+    )
+    .await;
+
+    drop(lease);
+    complete_install_flow(content_result, || {
+        super::prerequisite_commands::ensure_game_prerequisites_inner(
+            app,
+            state.inner(),
+            operation_id,
+        )
+    })
+    .await
+}
+
+async fn complete_install_flow<F, Fut>(
+    content_result: Result<(), AppError>,
+    ensure: F,
+) -> Result<(), AppError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<
+        Output = Result<super::prerequisite_commands::PrerequisiteResult, AppError>,
+    >,
+{
+    content_result?;
+    let prerequisites = ensure().await?;
+    super::prerequisite_commands::guard_prerequisite_result(prerequisites)?;
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn cancel_install(state: State<'_, AppState>) -> Result<bool, AppError> {
-    Ok(state.cancel_install())
+    Ok(match state.current_state().operation {
+        OperationKind::InstallingPrerequisites => state.cancel_prerequisites(),
+        _ => state.cancel_install(),
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -84,5 +118,52 @@ pub async fn recover_pending_install(
         let recovered = content_journal_service::recover_pending_content(&game_path).await?;
         progress.emit_stage(ProgressStage::Cleanup, Some(100.0), None)?;
         Ok(PendingInstallRecovery { recovered })
+    }
+}
+
+#[cfg(test)]
+mod prerequisite_flow_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::complete_install_flow;
+    use crate::commands::prerequisite_commands::PrerequisiteResult;
+    use crate::error::AppError;
+
+    fn ready() -> PrerequisiteResult {
+        PrerequisiteResult {
+            ready: true,
+            installed: Vec::new(),
+            already_present: Vec::new(),
+            restart_recommended: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn release_1_6_13_prerequisites_run_after_content_commit() {
+        let called = AtomicBool::new(false);
+
+        complete_install_flow(Ok(()), || async {
+            called.store(true, Ordering::SeqCst);
+            Ok(ready())
+        })
+        .await
+        .expect("ready prerequisites should complete installation");
+
+        assert!(called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn release_1_6_13_content_failure_never_starts_prerequisites() {
+        let called = AtomicBool::new(false);
+        let error =
+            complete_install_flow(Err(AppError::Network("content failed".into())), || async {
+                called.store(true, Ordering::SeqCst);
+                Ok(ready())
+            })
+            .await
+            .expect_err("content failure should be preserved");
+
+        assert_eq!(error.code(), "network");
+        assert!(!called.load(Ordering::SeqCst));
     }
 }
