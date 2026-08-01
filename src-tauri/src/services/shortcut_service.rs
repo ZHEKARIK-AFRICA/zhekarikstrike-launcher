@@ -11,9 +11,25 @@ pub async fn create_default_shortcuts() -> Result<(), AppError> {
     }
 
     let target_path = launcher_move_service::shortcut_target_path().await?;
+    create_default_shortcuts_for_target(target_path).await
+}
+
+pub async fn create_default_shortcuts_for_target(target_path: PathBuf) -> Result<(), AppError> {
     create_desktop_shortcut(target_path.clone(), default_shortcut_name()).await?;
     create_start_menu_shortcut(target_path, default_shortcut_name()).await?;
     Ok(())
+}
+
+pub async fn repair_existing_default_shortcuts_for_target(
+    target_path: PathBuf,
+) -> Result<(), AppError> {
+    if cfg!(debug_assertions) {
+        return Ok(());
+    }
+
+    let shortcut_name = default_shortcut_name();
+    repair_existing_shortcut(&target_path, &desktop_shortcut_path(&shortcut_name)?).await?;
+    repair_existing_shortcut(&target_path, &start_menu_shortcut_path(&shortcut_name)?).await
 }
 
 pub async fn create_desktop_shortcut(
@@ -24,12 +40,7 @@ pub async fn create_desktop_shortcut(
         return Ok(());
     }
 
-    let desktop = env::var_os("USERPROFILE")
-        .map(PathBuf::from)
-        .ok_or_else(|| AppError::FileSystem("USERPROFILE is not set".to_string()))?
-        .join("Desktop");
-
-    create_shortcut(&target_path, &desktop.join(format!("{shortcut_name}.lnk")))
+    create_shortcut(&target_path, &desktop_shortcut_path(&shortcut_name)?)
 }
 
 pub async fn create_start_menu_shortcut(
@@ -40,18 +51,36 @@ pub async fn create_start_menu_shortcut(
         return Ok(());
     }
 
-    let start_menu = env::var_os("APPDATA")
+    create_shortcut(&target_path, &start_menu_shortcut_path(&shortcut_name)?)
+}
+
+fn desktop_shortcut_path(shortcut_name: &str) -> Result<PathBuf, AppError> {
+    Ok(env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .ok_or_else(|| AppError::FileSystem("USERPROFILE is not set".to_string()))?
+        .join("Desktop")
+        .join(format!("{shortcut_name}.lnk")))
+}
+
+fn start_menu_shortcut_path(shortcut_name: &str) -> Result<PathBuf, AppError> {
+    Ok(env::var_os("APPDATA")
         .map(PathBuf::from)
         .ok_or_else(|| AppError::FileSystem("APPDATA is not set".to_string()))?
         .join("Microsoft")
         .join("Windows")
         .join("Start Menu")
-        .join("Programs");
+        .join("Programs")
+        .join(format!("{shortcut_name}.lnk")))
+}
 
-    create_shortcut(
-        &target_path,
-        &start_menu.join(format!("{shortcut_name}.lnk")),
-    )
+async fn repair_existing_shortcut(
+    target_path: &Path,
+    shortcut_path: &Path,
+) -> Result<(), AppError> {
+    if !tokio::fs::try_exists(shortcut_path).await? {
+        return Ok(());
+    }
+    create_shortcut(target_path, shortcut_path)
 }
 
 #[cfg(target_os = "windows")]
@@ -125,4 +154,23 @@ fn wide_path(path: &Path) -> Vec<u16> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect()
+}
+
+#[cfg(test)]
+mod release_1_6_13_tests {
+    use tempfile::tempdir;
+
+    use super::repair_existing_shortcut;
+
+    #[tokio::test]
+    async fn deleted_shortcut_is_not_recreated_during_portable_move() {
+        let directory = tempdir().expect("temporary directory should exist");
+        let shortcut = directory.path().join("deleted-by-user.lnk");
+
+        repair_existing_shortcut(&directory.path().join("launcher.exe"), &shortcut)
+            .await
+            .expect("missing shortcut should be ignored");
+
+        assert!(!shortcut.exists());
+    }
 }

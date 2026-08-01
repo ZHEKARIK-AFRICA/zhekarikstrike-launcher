@@ -1,18 +1,22 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::constants::MODERN_API_BASE_URL;
 use crate::error::AppError;
 use crate::services::content_journal_service::{atomic_bytes, atomic_json};
+use crate::utils::hash_utils::sha256_file;
 
 const AVATAR_STATE_PATH: &str = ".zhekarik/avatar-state.json";
+const AVATAR_STATE_SCHEMA_VERSION: u8 = 2;
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct AvatarState {
     schema_version: u8,
     nickname: String,
+    sha256: String,
 }
 
 pub async fn generate_avatar(game_path: PathBuf, nickname: String) -> Result<(), AppError> {
@@ -42,9 +46,15 @@ async fn avatar_is_current(game_path: &Path, nickname: &str) -> bool {
     let Ok(bytes) = tokio::fs::read(game_path.join(AVATAR_STATE_PATH)).await else {
         return false;
     };
-    serde_json::from_slice::<AvatarState>(&bytes)
-        .ok()
-        .is_some_and(|state| state.schema_version == 1 && state.nickname == nickname)
+    let Ok(state) = serde_json::from_slice::<AvatarState>(&bytes) else {
+        return false;
+    };
+    if state.schema_version != AVATAR_STATE_SCHEMA_VERSION || state.nickname != nickname {
+        return false;
+    }
+    sha256_file(game_path.join("platform/avatar.dat"))
+        .await
+        .is_ok_and(|sha256| sha256 == state.sha256)
 }
 
 async fn persist_avatar(game_path: &Path, nickname: &str, bytes: &[u8]) -> Result<(), AppError> {
@@ -52,8 +62,9 @@ async fn persist_avatar(game_path: &Path, nickname: &str, bytes: &[u8]) -> Resul
     atomic_json(
         &game_path.join(AVATAR_STATE_PATH),
         &AvatarState {
-            schema_version: 1,
+            schema_version: AVATAR_STATE_SCHEMA_VERSION,
             nickname: nickname.to_string(),
+            sha256: hex::encode(Sha256::digest(bytes)),
         },
     )
     .await
@@ -82,5 +93,22 @@ mod release_1_6_11_tests {
                 .expect("avatar should exist"),
             b"png-bytes"
         );
+    }
+
+    #[tokio::test]
+    async fn release_1_6_13_replaced_avatar_invalidates_the_same_nickname_state() {
+        let directory = tempdir().expect("temporary game path should be created");
+        persist_avatar(directory.path(), "player", b"generated-avatar")
+            .await
+            .expect("avatar and state should be persisted");
+
+        tokio::fs::write(
+            directory.path().join("platform/avatar.dat"),
+            b"content-manifest-avatar",
+        )
+        .await
+        .expect("content update should replace the avatar");
+
+        assert!(!avatar_is_current(directory.path(), "player").await);
     }
 }

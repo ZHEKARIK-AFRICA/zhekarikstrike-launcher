@@ -75,7 +75,7 @@ pub async fn update_rev_ini(
     tokio::fs::write(&rev_ini_path, updated).await?;
 
     if let Err(error) = generate_avatar(game_path, nickname).await {
-        eprintln!("avatar generation failed: {error}");
+        crate::logger::warn(&format!("avatar generation failed: {error}"));
     }
 
     Ok(())

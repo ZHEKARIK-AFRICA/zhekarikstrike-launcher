@@ -1804,10 +1804,20 @@ fn version_at_least(actual: &str, required: &str) -> bool {
     }
 }
 
+fn hidden_std_command(program: &str) -> StdCommand {
+    let mut command = StdCommand::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    command
+}
+
 fn windows_file_version(path: &Path) -> Result<Option<String>, PrerequisiteError> {
     #[cfg(windows)]
     {
-        let output = StdCommand::new("powershell.exe")
+        let output = hidden_std_command("powershell.exe")
             .args([
                 "-NoLogo",
                 "-NoProfile",
@@ -1902,7 +1912,7 @@ fn win_verify_trust(_path: &Path) -> Result<(), PrerequisiteError> {
 fn signer_subject(path: &Path) -> Result<String, PrerequisiteError> {
     #[cfg(windows)]
     {
-        let output = StdCommand::new("powershell.exe")
+        let output = hidden_std_command("powershell.exe")
             .args([
                 "-NoLogo",
                 "-NoProfile",
