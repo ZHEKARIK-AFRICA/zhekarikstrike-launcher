@@ -224,7 +224,7 @@ startInstallButton?.addEventListener('click', async () => {
                 const terminal = await invoke('get_prerequisite_state');
                 carriedError = terminal?.error || error;
                 carriedOperationId = terminal?.operationId || operationId;
-            } catch (_) { /* preserve original */ }
+            } catch { /* preserve original */ }
             try {
                 sessionStorage.setItem('pending-prerequisite-error', JSON.stringify({
                     operationId: carriedOperationId,

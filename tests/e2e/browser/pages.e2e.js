@@ -37,12 +37,14 @@ async function expectTechnicalDetails(text) {
 const installStartup = {
     get_language: { value: 'en' },
     get_current_state: { value: { operation: 'idle' } },
+    get_prerequisite_state: { value: { active: false, outcome: 'none' } },
     recover_pending_install: { value: { recovered: false } },
     get_game_path: { value: 'D:\\Games\\ZHEKARIKSTRIKE' }
 };
 
 const mainStartup = {
     get_language: { value: 'en' },
+    get_prerequisite_state: { value: { active: false, outcome: 'none' } },
     recover_pending_install: { value: { recovered: false } },
     get_game_data: {
         value: {
@@ -150,6 +152,9 @@ describe('Tauri renderer pages in browser mode', () => {
             ...mainStartup,
             update_game: { value: null },
             verify_files: { value: null },
+            ensure_game_prerequisites: {
+                value: { ready: true, installed: [], alreadyPresent: [], restartRecommended: false }
+            },
             update_rev_ini: { value: null },
             launch_game: { value: null }
         });
@@ -160,6 +165,7 @@ describe('Tauri renderer pages in browser mode', () => {
             return mocks.launch_game.mock.calls.length === 1;
         });
         await mocks.verify_files.update();
+        await mocks.ensure_game_prerequisites.update();
         await mocks.update_rev_ini.update();
         expect(mocks.verify_files.mock.calls[0][0]).toEqual(expect.objectContaining({
             checkAllFiles: false, operationId: expect.any(String)
@@ -168,6 +174,9 @@ describe('Tauri renderer pages in browser mode', () => {
             launchParams: '-novid',
             clanTag: 'ZS',
             nickname: 'Player'
+        });
+        expect(mocks.ensure_game_prerequisites.mock.calls[0][0]).toEqual({
+            operationId: expect.any(String)
         });
     });
 
