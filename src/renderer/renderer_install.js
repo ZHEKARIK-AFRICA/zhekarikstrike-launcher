@@ -46,6 +46,29 @@ function stopStatePolling() {
     statePoll = null;
 }
 
+async function handlePrerequisiteTerminal(prerequisite) {
+    if (prerequisite?.outcome === 'failed') {
+        try {
+            sessionStorage.setItem('pending-prerequisite-error', JSON.stringify(prerequisite.error));
+        } catch (error) {
+            console.error('Failed to carry prerequisite error to the main page:', error);
+        }
+        await navigateToPage('./public/index.html');
+        return true;
+    }
+    if (prerequisite?.outcome === 'canceled') {
+        installing = false;
+        status.cancel('status.installation_canceled');
+        return true;
+    }
+    if (prerequisite?.outcome === 'succeeded') {
+        installing = false;
+        await navigateToPage('./public/index.html');
+        return true;
+    }
+    return false;
+}
+
 async function recoverAndRoute() {
     const operationId = createOperationId();
     status.begin({
@@ -70,6 +93,8 @@ function restoreOperation(operation) {
             if (current.operation && current.operation !== 'idle') return;
             stopStatePolling();
             installing = false;
+            const prerequisite = await invoke('get_prerequisite_state');
+            if (await handlePrerequisiteTerminal(prerequisite)) return;
             if (await recoverAndRoute()) return;
             const existence = await invoke('check_game_exists');
             if (existence?.exists) {
@@ -87,9 +112,8 @@ function restoreOperation(operation) {
     return true;
 }
 
-async function restoreCurrentOperation(operation) {
+async function restoreCurrentOperation(operation, prerequisite) {
     if (operation === 'installing-prerequisites') {
-        const prerequisite = await invoke('get_prerequisite_state');
         if (status.restorePrerequisite(prerequisite)) {
             installing = true;
             status.rerender();
@@ -99,7 +123,10 @@ async function restoreCurrentOperation(operation) {
                     if (current.operation && current.operation !== 'idle') return;
                     stopStatePolling();
                     installing = false;
-                    await navigateToPage('./public/index.html');
+                    const terminal = await invoke('get_prerequisite_state');
+                    if (!await handlePrerequisiteTerminal(terminal)) {
+                        await navigateToPage('./public/index.html');
+                    }
                 } catch (error) {
                     stopStatePolling();
                     startupFailed = true;
@@ -119,7 +146,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         await initializeLanguage();
         status.rerender();
         const current = await invoke('get_current_state');
-        const restored = await restoreCurrentOperation(current.operation);
+        const prerequisite = await invoke('get_prerequisite_state');
+        const terminal = await handlePrerequisiteTerminal(prerequisite);
+        const restored = terminal || await restoreCurrentOperation(current.operation, prerequisite);
         if (!restored && await recoverAndRoute()) return;
 
         const savedPath = await invoke('get_game_path');
@@ -153,6 +182,7 @@ startInstallButton?.addEventListener('click', async () => {
     });
     try {
         await invoke('install_game', { gamePath, operationId });
+        await invoke('get_prerequisite_state');
         status.succeed('status.installation_complete');
         document.body.classList.remove('fade-in');
         document.body.classList.add('fade-out');
@@ -163,8 +193,13 @@ startInstallButton?.addEventListener('click', async () => {
         } else if (String(error?.code || '').startsWith('prerequisite_')) {
             status.fail('status.prerequisite_failed');
             handleError(null, error);
+            let carriedError = error;
             try {
-                sessionStorage.setItem('pending-prerequisite-error', JSON.stringify(error));
+                const terminal = await invoke('get_prerequisite_state');
+                carriedError = terminal?.error || error;
+            } catch (_) { /* preserve original */ }
+            try {
+                sessionStorage.setItem('pending-prerequisite-error', JSON.stringify(carriedError));
             } catch (storageError) {
                 console.error('Failed to carry prerequisite error to the main page:', storageError);
             }

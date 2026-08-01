@@ -5,6 +5,8 @@ use tauri::{AppHandle, State};
 
 use crate::error::AppError;
 use crate::models::{validated_operation_id, ProgressEmitter, ProgressStage};
+#[cfg(not(feature = "e2e"))]
+use crate::services::shortcut_service;
 use crate::services::{config_service, content_journal_service, install_service};
 use crate::state::{AppState, CancellationSlot, OperationKind};
 
@@ -47,29 +49,49 @@ pub async fn install_game(
     .await;
 
     drop(lease);
-    complete_install_flow(content_result, || {
-        super::prerequisite_commands::ensure_game_prerequisites_inner(
-            app,
-            state.inner(),
-            operation_id,
-        )
-    })
+    complete_install_flow(
+        content_result,
+        || {
+            super::prerequisite_commands::ensure_game_prerequisites_inner(
+                app,
+                state.inner(),
+                operation_id,
+            )
+        },
+        create_post_install_shortcuts,
+    )
     .await
 }
 
-async fn complete_install_flow<F, Fut>(
+async fn create_post_install_shortcuts() -> Result<(), AppError> {
+    #[cfg(feature = "e2e")]
+    return Ok(());
+
+    #[cfg(not(feature = "e2e"))]
+    shortcut_service::create_default_shortcuts().await
+}
+
+async fn complete_install_flow<F, Fut, P, PostFut>(
     content_result: Result<(), AppError>,
     ensure: F,
+    post_install: P,
 ) -> Result<(), AppError>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<
         Output = Result<super::prerequisite_commands::PrerequisiteResult, AppError>,
     >,
+    P: FnOnce() -> PostFut,
+    PostFut: std::future::Future<Output = Result<(), AppError>>,
 {
     content_result?;
     let prerequisites = ensure().await?;
     super::prerequisite_commands::guard_prerequisite_result(prerequisites)?;
+    if let Err(error) = post_install().await {
+        crate::logger::warn(&format!(
+            "installed content and prerequisites but could not create shortcuts: {error}"
+        ));
+    }
     Ok(())
 }
 
@@ -142,10 +164,14 @@ mod prerequisite_flow_tests {
     async fn release_1_6_13_prerequisites_run_after_content_commit() {
         let called = AtomicBool::new(false);
 
-        complete_install_flow(Ok(()), || async {
-            called.store(true, Ordering::SeqCst);
-            Ok(ready())
-        })
+        complete_install_flow(
+            Ok(()),
+            || async {
+                called.store(true, Ordering::SeqCst);
+                Ok(ready())
+            },
+            || async { Ok(()) },
+        )
         .await
         .expect("ready prerequisites should complete installation");
 
@@ -155,15 +181,41 @@ mod prerequisite_flow_tests {
     #[tokio::test]
     async fn release_1_6_13_content_failure_never_starts_prerequisites() {
         let called = AtomicBool::new(false);
-        let error =
-            complete_install_flow(Err(AppError::Network("content failed".into())), || async {
+        let error = complete_install_flow(
+            Err(AppError::Network("content failed".into())),
+            || async {
                 called.store(true, Ordering::SeqCst);
                 Ok(ready())
-            })
-            .await
-            .expect_err("content failure should be preserved");
+            },
+            || async { Ok(()) },
+        )
+        .await
+        .expect_err("content failure should be preserved");
 
         assert_eq!(error.code(), "network");
         assert!(!called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn committed_content_still_runs_prerequisites_when_shortcuts_fail() {
+        let prerequisite_called = AtomicBool::new(false);
+        let post_install_called = AtomicBool::new(false);
+
+        complete_install_flow(
+            Ok(()),
+            || async {
+                prerequisite_called.store(true, Ordering::SeqCst);
+                Ok(ready())
+            },
+            || async {
+                post_install_called.store(true, Ordering::SeqCst);
+                Err(AppError::FileSystem("shortcut denied".into()))
+            },
+        )
+        .await
+        .expect("post-commit shortcut failure must not invalidate installed content");
+
+        assert!(prerequisite_called.load(Ordering::SeqCst));
+        assert!(post_install_called.load(Ordering::SeqCst));
     }
 }

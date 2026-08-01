@@ -14,7 +14,7 @@ use crate::services::disk_service::ensure_disk_space;
 use crate::services::download_service::download_file;
 use crate::services::elevation_service;
 use crate::services::manifest_service::VerifyMode;
-use crate::services::shortcut_service;
+use crate::services::prerequisite_service;
 use crate::services::verify_service::verify_game_files;
 
 fn required_install_bytes(archive_size: u64, unpacked_size: u64) -> Result<u64, AppError> {
@@ -48,13 +48,12 @@ pub async fn install_game(
             operation_id,
         )
         .await?;
-        shortcut_service::create_default_shortcuts().await?;
         return Ok(());
     }
 
     let progress = ProgressEmitter::new(app.clone(), "install-progress", operation_id.clone());
     let manifest = api.get_full_manifest().await?;
-    let archive = manifest.archive;
+    let archive = manifest.archive.clone();
     let required_bytes = required_install_bytes(archive.size, archive.unpacked_size)?;
 
     if !tokio::fs::try_exists(game_path.join(REV_LOADER_EXE))
@@ -84,8 +83,6 @@ pub async fn install_game(
             cancel.clone(),
         )
         .await?;
-
-        config_service::set_game_version("0.0.0".to_string()).await?;
     } else {
         progress.emit_stage(
             ProgressStage::Verify,
@@ -104,7 +101,12 @@ pub async fn install_game(
     )
     .await?;
 
-    shortcut_service::create_default_shortcuts().await?;
+    prerequisite_service::store_legacy_manifest(&game_path, &manifest).await?;
+    if let Err(error) = config_service::set_game_version("0.0.0".to_string()).await {
+        crate::logger::warn(&format!(
+            "installed legacy content but could not save its version: {error}"
+        ));
+    }
     progress.emit_stage(ProgressStage::Complete, Some(100.0), None)?;
     Ok(())
 }

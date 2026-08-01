@@ -505,7 +505,11 @@ pub async fn install_or_update_content(
         return Err(rollback_failed_install(&game_path, &journal, error).await);
     }
 
-    config_service::set_game_version(manifest.game_version).await?;
+    if let Err(error) = config_service::set_game_version(manifest.game_version).await {
+        crate::logger::warn(&format!(
+            "committed content but could not save its display version: {error}"
+        ));
+    }
     cleanup_transaction(&game_path, &transaction_id).await.ok();
     remove_directory_if_exists(&chunk_directory).await.ok();
     remove_file_if_exists(&journal_path(&game_path)).await.ok();

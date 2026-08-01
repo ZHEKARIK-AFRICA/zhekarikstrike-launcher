@@ -7,7 +7,7 @@ use serde::Serialize;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
-use crate::error::AppError;
+use crate::error::{AppError, FrontendError};
 use crate::models::{GameProcessState, VerifiedLauncherUpdate};
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Default)]
@@ -48,6 +48,26 @@ pub struct CurrentState {
     pub launcher_update_ready: bool,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PrerequisiteOutcome {
+    #[default]
+    None,
+    Running,
+    Succeeded,
+    Failed,
+    Canceled,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrerequisiteTerminalResult {
+    pub ready: bool,
+    pub installed: Vec<String>,
+    pub already_present: Vec<String>,
+    pub restart_recommended: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct PrerequisiteOperationState {
@@ -59,6 +79,9 @@ pub struct PrerequisiteOperationState {
     pub downloaded_bytes: Option<u64>,
     pub total_bytes: Option<u64>,
     pub restart_recommended: bool,
+    pub outcome: PrerequisiteOutcome,
+    pub result: Option<PrerequisiteTerminalResult>,
+    pub error: Option<FrontendError>,
 }
 
 #[derive(Clone)]
@@ -148,16 +171,83 @@ impl AppState {
         cancel_slot(&self.prerequisite_cancel_token)
     }
 
-    pub fn prerequisite_state(&self) -> PrerequisiteOperationState {
-        lock_unpoisoned(&self.prerequisite_state).clone()
+    pub fn consume_prerequisite_state(&self) -> PrerequisiteOperationState {
+        let mut state = lock_unpoisoned(&self.prerequisite_state);
+        let snapshot = state.clone();
+        if matches!(
+            snapshot.outcome,
+            PrerequisiteOutcome::Succeeded
+                | PrerequisiteOutcome::Failed
+                | PrerequisiteOutcome::Canceled
+        ) {
+            *state = PrerequisiteOperationState::default();
+        }
+        snapshot
     }
 
-    pub fn set_prerequisite_state(&self, snapshot: PrerequisiteOperationState) {
-        *lock_unpoisoned(&self.prerequisite_state) = snapshot;
+    pub fn begin_prerequisite_operation(&self, operation_id: &str) {
+        *lock_unpoisoned(&self.prerequisite_state) = PrerequisiteOperationState {
+            active: true,
+            operation_id: Some(operation_id.to_string()),
+            stage: Some("detecting".into()),
+            progress: Some(0.0),
+            outcome: PrerequisiteOutcome::Running,
+            ..PrerequisiteOperationState::default()
+        };
     }
 
-    pub fn finish_prerequisite_operation(&self) {
-        lock_unpoisoned(&self.prerequisite_state).active = false;
+    pub fn update_prerequisite_state(&self, snapshot: PrerequisiteOperationState) {
+        let mut state = lock_unpoisoned(&self.prerequisite_state);
+        if state.outcome == PrerequisiteOutcome::Running
+            && state.operation_id == snapshot.operation_id
+        {
+            *state = snapshot;
+        }
+    }
+
+    pub fn finish_prerequisite_success(
+        &self,
+        operation_id: &str,
+        result: PrerequisiteTerminalResult,
+    ) {
+        self.finish_prerequisite(
+            operation_id,
+            PrerequisiteOutcome::Succeeded,
+            Some(result),
+            None,
+        );
+    }
+
+    pub fn finish_prerequisite_failure(&self, operation_id: &str, error: FrontendError) {
+        self.finish_prerequisite(operation_id, PrerequisiteOutcome::Failed, None, Some(error));
+    }
+
+    pub fn finish_prerequisite_canceled(&self, operation_id: &str, error: FrontendError) {
+        self.finish_prerequisite(
+            operation_id,
+            PrerequisiteOutcome::Canceled,
+            None,
+            Some(error),
+        );
+    }
+
+    fn finish_prerequisite(
+        &self,
+        operation_id: &str,
+        outcome: PrerequisiteOutcome,
+        result: Option<PrerequisiteTerminalResult>,
+        error: Option<FrontendError>,
+    ) {
+        let mut state = lock_unpoisoned(&self.prerequisite_state);
+        if state.operation_id.as_deref() != Some(operation_id)
+            || state.outcome != PrerequisiteOutcome::Running
+        {
+            return;
+        }
+        state.active = false;
+        state.outcome = outcome;
+        state.result = result;
+        state.error = error;
     }
 
     pub fn cancel_active_operation(&self) -> bool {
@@ -286,7 +376,9 @@ fn lock_unpoisoned<T>(mutex: &StdMutex<T>) -> StdMutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, CancellationSlot, OperationKind};
+    use super::{
+        AppState, CancellationSlot, OperationKind, PrerequisiteOutcome, PrerequisiteTerminalResult,
+    };
     use crate::error::AppError;
 
     #[test]
@@ -401,5 +493,53 @@ mod tests {
         );
         assert!(state.cancel_active_operation());
         assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn prerequisite_terminal_outcome_is_keyed_and_consumed_once() {
+        let state = AppState::new();
+        state.begin_prerequisite_operation("operation-1");
+        state.finish_prerequisite_failure(
+            "operation-1",
+            AppError::PrerequisiteInstall("exit 1603".into()).frontend_error(),
+        );
+
+        let terminal = state.consume_prerequisite_state();
+        assert_eq!(terminal.operation_id.as_deref(), Some("operation-1"));
+        assert_eq!(terminal.outcome, PrerequisiteOutcome::Failed);
+        assert_eq!(
+            terminal.error.as_ref().map(|error| error.code.as_str()),
+            Some("prerequisite_install_failed")
+        );
+        assert_eq!(
+            state.consume_prerequisite_state().outcome,
+            PrerequisiteOutcome::None
+        );
+    }
+
+    #[test]
+    fn prerequisite_success_and_cancel_are_distinct_terminal_outcomes() {
+        let state = AppState::new();
+        state.begin_prerequisite_operation("success");
+        state.finish_prerequisite_success(
+            "success",
+            PrerequisiteTerminalResult {
+                ready: true,
+                installed: vec!["vc2010-sp1-x86".into()],
+                already_present: Vec::new(),
+                restart_recommended: false,
+            },
+        );
+        assert_eq!(
+            state.consume_prerequisite_state().outcome,
+            PrerequisiteOutcome::Succeeded
+        );
+
+        state.begin_prerequisite_operation("cancel");
+        state.finish_prerequisite_canceled("cancel", AppError::Canceled.frontend_error());
+        assert_eq!(
+            state.consume_prerequisite_state().outcome,
+            PrerequisiteOutcome::Canceled
+        );
     }
 }

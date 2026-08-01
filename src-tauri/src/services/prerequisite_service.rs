@@ -14,13 +14,16 @@ use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::models::ContentManifest;
-use crate::services::content_journal_service::{atomic_json, content_root, load_completion_state};
+use crate::models::{ContentManifest, GameManifest};
+use crate::services::content_journal_service::{
+    atomic_json, content_root, load_completion_state, state_path,
+};
 use crate::utils::path_utils::safe_join;
 
 pub const PREREQUISITE_CATALOG_VERSION: u32 = 1;
-const ANALYSIS_SCHEMA_VERSION: u8 = 2;
+const ANALYSIS_SCHEMA_VERSION: u8 = 3;
 const ANALYSIS_PATH: &str = ".zhekarik/prerequisites/analysis-v1.json";
+const LEGACY_MANIFEST_PATH: &str = ".zhekarik/prerequisites/legacy-manifest.json";
 
 pub type ServiceFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, PrerequisiteError>> + Send + 'a>>;
@@ -117,7 +120,58 @@ impl CatalogComponent {
 pub struct PrerequisiteRequirement {
     pub component_id: String,
     pub architecture: PeArchitecture,
+    pub importer: String,
     pub imports: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PrerequisiteManifestFile {
+    path: String,
+    size: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Clone)]
+struct ActivePrerequisiteManifest {
+    content_sha256: String,
+    files: Vec<PrerequisiteManifestFile>,
+}
+
+impl ActivePrerequisiteManifest {
+    fn from_content(manifest: &ContentManifest) -> Self {
+        Self {
+            content_sha256: manifest.content_sha256.clone(),
+            files: manifest
+                .files
+                .iter()
+                .map(|file| PrerequisiteManifestFile {
+                    path: file.path.clone(),
+                    size: file.size,
+                    sha256: file.sha256.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    fn from_legacy(manifest: &GameManifest) -> Result<Self, PrerequisiteError> {
+        manifest
+            .validate_complete()
+            .map_err(|error| PrerequisiteError::Verification(error.to_string()))?;
+        let bytes = serde_json::to_vec(manifest)
+            .map_err(|error| PrerequisiteError::Verification(error.to_string()))?;
+        Ok(Self {
+            content_sha256: hex::encode(Sha256::digest(bytes)),
+            files: manifest
+                .files
+                .iter()
+                .map(|file| PrerequisiteManifestFile {
+                    path: file.path.clone(),
+                    size: file.size,
+                    sha256: file.sha256.clone(),
+                })
+                .collect(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -294,14 +348,28 @@ impl PrerequisiteService {
         game_root: &Path,
         cancel: &CancellationToken,
     ) -> Result<AnalysisCache, PrerequisiteError> {
-        let manifest = load_active_manifest(game_root).await?;
-        self.analyze(game_root, &manifest, cancel).await
+        let manifest = load_prerequisite_manifest(game_root).await?;
+        self.analyze_manifest(game_root, &manifest, cancel).await
     }
 
     async fn analyze(
         &self,
         game_root: &Path,
         manifest: &ContentManifest,
+        cancel: &CancellationToken,
+    ) -> Result<AnalysisCache, PrerequisiteError> {
+        self.analyze_manifest(
+            game_root,
+            &ActivePrerequisiteManifest::from_content(manifest),
+            cancel,
+        )
+        .await
+    }
+
+    async fn analyze_manifest(
+        &self,
+        game_root: &Path,
+        manifest: &ActivePrerequisiteManifest,
         cancel: &CancellationToken,
     ) -> Result<AnalysisCache, PrerequisiteError> {
         if cancel.is_cancelled() {
@@ -316,7 +384,8 @@ impl PrerequisiteService {
             }
         }
 
-        let mut requirements = BTreeMap::<(String, PeArchitecture), BTreeSet<String>>::new();
+        let mut requirements =
+            BTreeMap::<(String, PeArchitecture, String), BTreeSet<String>>::new();
         for file in manifest.files.iter().filter(|file| {
             Path::new(&file.path).extension().is_some_and(|ext| {
                 ext.eq_ignore_ascii_case("exe") || ext.eq_ignore_ascii_case("dll")
@@ -340,34 +409,6 @@ impl PrerequisiteService {
                 };
                 let component = catalog_component(component_id)
                     .ok_or_else(|| PrerequisiteError::Unsupported(component_id.to_string()))?;
-                let app_local = app_local_dependency_paths(game_root, &module_path, &import)?;
-                let system = self
-                    .runtime
-                    .system_dependency_path(&import, image.architecture)?;
-                let mut app_local_satisfied = false;
-                for path in &app_local {
-                    if dependency_satisfies(
-                        path,
-                        &component,
-                        image.architecture,
-                        self.runtime.as_ref(),
-                    )? {
-                        app_local_satisfied = true;
-                        break;
-                    }
-                }
-                let system_satisfied = match system.as_deref() {
-                    Some(path) => dependency_satisfies(
-                        path,
-                        &component,
-                        image.architecture,
-                        self.runtime.as_ref(),
-                    )?,
-                    None => false,
-                };
-                if app_local_satisfied || system_satisfied {
-                    continue;
-                }
                 if component.architecture != image.architecture {
                     return Err(PrerequisiteError::Unsupported(format!(
                         "{} has no {:?} catalog entry required by {}",
@@ -377,7 +418,11 @@ impl PrerequisiteService {
                     )));
                 }
                 requirements
-                    .entry((component_id.to_string(), image.architecture))
+                    .entry((
+                        component_id.to_string(),
+                        image.architecture,
+                        file.path.clone(),
+                    ))
                     .or_default()
                     .insert(import.to_ascii_lowercase());
             }
@@ -389,9 +434,10 @@ impl PrerequisiteService {
             requirements: requirements
                 .into_iter()
                 .map(
-                    |((component_id, architecture), imports)| PrerequisiteRequirement {
+                    |((component_id, architecture, importer), imports)| PrerequisiteRequirement {
                         component_id,
                         architecture,
+                        importer,
                         imports: imports.into_iter().collect(),
                     },
                 )
@@ -408,8 +454,9 @@ impl PrerequisiteService {
         game_root: &Path,
         cancel: &CancellationToken,
     ) -> Result<EnsurePrerequisitesResult, PrerequisiteError> {
-        let manifest = load_active_manifest(game_root).await?;
-        self.ensure_manifest(game_root, &manifest, cancel).await
+        let manifest = load_prerequisite_manifest(game_root).await?;
+        self.ensure_prerequisite_manifest(game_root, &manifest, cancel)
+            .await
     }
 
     pub async fn check_active(
@@ -417,8 +464,9 @@ impl PrerequisiteService {
         game_root: &Path,
         cancel: &CancellationToken,
     ) -> Result<EnsurePrerequisitesResult, PrerequisiteError> {
-        let manifest = load_active_manifest(game_root).await?;
-        self.check_manifest(game_root, &manifest, cancel).await
+        let manifest = load_prerequisite_manifest(game_root).await?;
+        self.check_prerequisite_manifest(game_root, &manifest, cancel)
+            .await
     }
 
     async fn check_manifest(
@@ -427,7 +475,21 @@ impl PrerequisiteService {
         manifest: &ContentManifest,
         cancel: &CancellationToken,
     ) -> Result<EnsurePrerequisitesResult, PrerequisiteError> {
-        let analysis = self.analyze(game_root, manifest, cancel).await?;
+        self.check_prerequisite_manifest(
+            game_root,
+            &ActivePrerequisiteManifest::from_content(manifest),
+            cancel,
+        )
+        .await
+    }
+
+    async fn check_prerequisite_manifest(
+        &self,
+        game_root: &Path,
+        manifest: &ActivePrerequisiteManifest,
+        cancel: &CancellationToken,
+    ) -> Result<EnsurePrerequisitesResult, PrerequisiteError> {
+        let analysis = self.analyze_manifest(game_root, manifest, cancel).await?;
         let mut result = EnsurePrerequisitesResult {
             ready: true,
             installed: Vec::new(),
@@ -446,12 +508,10 @@ impl PrerequisiteService {
                     requirement.component_id, requirement.architecture
                 )));
             }
-            if self.runtime.component_satisfied(
-                &component,
-                requirement.architecture,
-                &requirement.imports,
-            )? {
-                result.already_present.push(requirement.component_id);
+            if self.requirement_satisfied(game_root, &requirement, &component)? {
+                if !result.already_present.contains(&requirement.component_id) {
+                    result.already_present.push(requirement.component_id);
+                }
             } else {
                 result.ready = false;
             }
@@ -465,8 +525,22 @@ impl PrerequisiteService {
         manifest: &ContentManifest,
         cancel: &CancellationToken,
     ) -> Result<EnsurePrerequisitesResult, PrerequisiteError> {
+        self.ensure_prerequisite_manifest(
+            game_root,
+            &ActivePrerequisiteManifest::from_content(manifest),
+            cancel,
+        )
+        .await
+    }
+
+    async fn ensure_prerequisite_manifest(
+        &self,
+        game_root: &Path,
+        manifest: &ActivePrerequisiteManifest,
+        cancel: &CancellationToken,
+    ) -> Result<EnsurePrerequisitesResult, PrerequisiteError> {
         self.emit_progress("detecting", None, Some(0.0), None, None, false);
-        let analysis = self.analyze(game_root, manifest, cancel).await?;
+        let analysis = self.analyze_manifest(game_root, manifest, cancel).await?;
         self.emit_progress("detecting", None, Some(100.0), None, None, false);
         let mut result = EnsurePrerequisitesResult {
             ready: true,
@@ -474,6 +548,8 @@ impl PrerequisiteService {
             already_present: Vec::new(),
             restart_status: RestartStatus::None,
         };
+        let mut installed = BTreeSet::new();
+        let mut already_present = BTreeSet::new();
         for requirement in analysis.requirements {
             if cancel.is_cancelled() {
                 return Err(PrerequisiteError::Canceled);
@@ -494,11 +570,7 @@ impl PrerequisiteService {
                 None,
                 false,
             );
-            if self.runtime.component_satisfied(
-                &component,
-                requirement.architecture,
-                &requirement.imports,
-            )? {
+            if self.requirement_satisfied(game_root, &requirement, &component)? {
                 self.emit_progress(
                     "verifying",
                     Some(&requirement.component_id),
@@ -507,7 +579,13 @@ impl PrerequisiteService {
                     None,
                     false,
                 );
-                result.already_present.push(requirement.component_id);
+                if !installed.contains(&requirement.component_id) {
+                    already_present.insert(requirement.component_id);
+                }
+                continue;
+            }
+            if installed.contains(&requirement.component_id) {
+                result.ready = false;
                 continue;
             }
             let exit = self
@@ -529,8 +607,11 @@ impl PrerequisiteService {
                 .await?;
             result.restart_status = result.restart_status.merge(completion.restart_status);
             result.ready &= completion.ready;
-            result.installed.push(requirement.component_id);
+            already_present.remove(&requirement.component_id);
+            installed.insert(requirement.component_id);
         }
+        result.installed = installed.into_iter().collect();
+        result.already_present = already_present.into_iter().collect();
         self.emit_progress(
             "complete",
             None,
@@ -545,7 +626,7 @@ impl PrerequisiteService {
     async fn install_component(
         &self,
         game_root: &Path,
-        manifest: Option<&ContentManifest>,
+        manifest: Option<&ActivePrerequisiteManifest>,
         component: &CatalogComponent,
         _imports: &[String],
         cancel: &CancellationToken,
@@ -657,6 +738,57 @@ impl PrerequisiteService {
             );
         }
         result
+    }
+
+    fn requirement_satisfied(
+        &self,
+        game_root: &Path,
+        requirement: &PrerequisiteRequirement,
+        component: &CatalogComponent,
+    ) -> Result<bool, PrerequisiteError> {
+        if self.runtime.component_satisfied(
+            component,
+            requirement.architecture,
+            &requirement.imports,
+        )? {
+            return Ok(true);
+        }
+
+        let importer = safe_join(game_root, &requirement.importer)
+            .map_err(|error| PrerequisiteError::Verification(error.to_string()))?;
+        for import in &requirement.imports {
+            let app_local = app_local_dependency_paths(game_root, &importer, import)?;
+            let app_local_satisfied = app_local.iter().try_fold(false, |satisfied, path| {
+                if satisfied {
+                    Ok(true)
+                } else {
+                    dependency_satisfies(
+                        path,
+                        component,
+                        requirement.architecture,
+                        self.runtime.as_ref(),
+                    )
+                }
+            })?;
+            let system_satisfied = self
+                .runtime
+                .system_dependency_path(import, requirement.architecture)?
+                .as_deref()
+                .map(|path| {
+                    dependency_satisfies(
+                        path,
+                        component,
+                        requirement.architecture,
+                        self.runtime.as_ref(),
+                    )
+                })
+                .transpose()?
+                .unwrap_or(false);
+            if !app_local_satisfied && !system_satisfied {
+                return Ok(false);
+            }
+        }
+        Ok(!requirement.imports.is_empty())
     }
 
     async fn install_directx(
@@ -780,6 +912,40 @@ pub async fn load_active_manifest(game_root: &Path) -> Result<ContentManifest, P
             .ok();
     }
     result
+}
+
+async fn load_prerequisite_manifest(
+    game_root: &Path,
+) -> Result<ActivePrerequisiteManifest, PrerequisiteError> {
+    if tokio::fs::try_exists(state_path(game_root))
+        .await
+        .unwrap_or(false)
+    {
+        return load_active_manifest(game_root)
+            .await
+            .map(|manifest| ActivePrerequisiteManifest::from_content(&manifest));
+    }
+
+    let path = game_root.join(LEGACY_MANIFEST_PATH);
+    let bytes = tokio::fs::read(&path).await.map_err(|error| {
+        PrerequisiteError::Unsupported(format!(
+            "active content state and legacy manifest are unavailable: {error}"
+        ))
+    })?;
+    let manifest: GameManifest = serde_json::from_slice(&bytes).map_err(|error| {
+        PrerequisiteError::Verification(format!("legacy manifest is invalid: {error}"))
+    })?;
+    ActivePrerequisiteManifest::from_legacy(&manifest)
+}
+
+pub async fn store_legacy_manifest(
+    game_root: &Path,
+    manifest: &GameManifest,
+) -> Result<(), PrerequisiteError> {
+    ActivePrerequisiteManifest::from_legacy(manifest)?;
+    atomic_json(&game_root.join(LEGACY_MANIFEST_PATH), manifest)
+        .await
+        .map_err(|error| PrerequisiteError::Verification(error.to_string()))
 }
 
 pub fn catalog_component(id: &str) -> Option<CatalogComponent> {
@@ -1547,7 +1713,8 @@ mod tests {
 
     use super::*;
     use crate::models::{
-        ContentChunking, ContentCompression, ContentDelivery, ContentFile, ContentManifest,
+        expected_game_file_url, ContentChunking, ContentCompression, ContentDelivery, ContentFile,
+        ContentManifest, GameArchiveManifest, GameFileManifestEntry, GameManifest,
     };
 
     fn analysis_manifest(content_sha256: &str, paths: &[&str]) -> ContentManifest {
@@ -1584,6 +1751,37 @@ mod tests {
                     temporary: false,
                     additional_check: false,
                     chunks: Vec::new(),
+                })
+                .collect(),
+        }
+    }
+
+    fn legacy_analysis_manifest(paths: &[&str]) -> GameManifest {
+        let mut paths = paths
+            .iter()
+            .map(|path| (*path).to_string())
+            .collect::<Vec<_>>();
+        if !paths.iter().any(|path| path == "RevLoader.exe") {
+            paths.push("RevLoader.exe".into());
+        }
+        GameManifest {
+            game_version: "1.0.3.4".into(),
+            generated_at: "2026-08-01T00:00:00Z".into(),
+            archive: GameArchiveManifest {
+                url: "https://api.zhekarik.africa/launcher/game/archive".into(),
+                size: 1,
+                sha256: "a".repeat(64),
+                unpacked_size: paths.len() as u64,
+            },
+            files: paths
+                .into_iter()
+                .map(|path| GameFileManifestEntry {
+                    url: expected_game_file_url(&path),
+                    path,
+                    size: 1,
+                    sha256: "b".repeat(64),
+                    excluded_from_hash_check: false,
+                    temporary: false,
                 })
                 .collect(),
         }
@@ -1833,16 +2031,21 @@ mod tests {
             ]),
         };
 
-        let analysis = analysis_service(Arc::new(runtime))
-            .analyze(
-                directory.path(),
-                &analysis_manifest(&"f".repeat(64), &["game/game.exe"]),
-                &CancellationToken::new(),
-            )
+        let service = analysis_service(Arc::new(runtime));
+        let manifest = analysis_manifest(&"f".repeat(64), &["game/game.exe"]);
+        let analysis = service
+            .analyze(directory.path(), &manifest, &CancellationToken::new())
             .await
             .expect("analysis should succeed");
 
-        assert!(analysis.requirements.is_empty());
+        assert_eq!(analysis.requirements.len(), 1);
+        assert!(
+            service
+                .check_manifest(directory.path(), &manifest, &CancellationToken::new())
+                .await
+                .expect("cached requirement should be checked dynamically")
+                .ready
+        );
     }
 
     #[tokio::test]
@@ -2315,5 +2518,125 @@ mod tests {
         assert!(result.installed.is_empty());
         assert_eq!(downloader.calls.load(Ordering::SeqCst), 0);
         assert_eq!(runner.calls.load(Ordering::SeqCst), 0);
+    }
+
+    struct ToggleProbe {
+        satisfied: std::sync::atomic::AtomicBool,
+    }
+
+    impl RuntimeProbe for ToggleProbe {
+        fn system_dependency_path(
+            &self,
+            _import: &str,
+            _architecture: PeArchitecture,
+        ) -> Result<Option<PathBuf>, PrerequisiteError> {
+            Ok(None)
+        }
+
+        fn dependency_file_version(
+            &self,
+            _path: &Path,
+        ) -> Result<Option<String>, PrerequisiteError> {
+            Ok(None)
+        }
+
+        fn component_satisfied(
+            &self,
+            _component: &CatalogComponent,
+            _architecture: PeArchitecture,
+            _imports: &[String],
+        ) -> Result<bool, PrerequisiteError> {
+            Ok(self.satisfied.load(Ordering::SeqCst))
+        }
+    }
+
+    #[tokio::test]
+    async fn same_content_cache_rechecks_a_runtime_removed_after_initial_satisfaction() {
+        let directory = tempdir().expect("temporary game directory");
+        fs::write(
+            directory.path().join("game.exe"),
+            fixture_pe(PeArchitecture::X86, &["msvcr100.dll"]),
+        )
+        .expect("PE fixture should be written");
+        let runtime = Arc::new(ToggleProbe {
+            satisfied: std::sync::atomic::AtomicBool::new(true),
+        });
+        let downloader = Arc::new(RecordingDownloader::default());
+        let runner = Arc::new(RecordingRunner::default());
+        let service = PrerequisiteService::new(
+            downloader.clone(),
+            Arc::new(AcceptingTrust),
+            runtime.clone(),
+            runner.clone(),
+        );
+        let manifest = analysis_manifest(&"c".repeat(64), &["game.exe"]);
+
+        assert!(
+            service
+                .check_manifest(directory.path(), &manifest, &CancellationToken::new())
+                .await
+                .expect("installed runtime should pass")
+                .ready
+        );
+        runtime.satisfied.store(false, Ordering::SeqCst);
+        let removed = service
+            .check_manifest(directory.path(), &manifest, &CancellationToken::new())
+            .await
+            .expect("same cached content should be rechecked dynamically");
+
+        assert!(!removed.ready);
+        assert_eq!(downloader.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_manifest_is_a_safe_prerequisite_source_when_v2_state_is_absent() {
+        let directory = tempdir().expect("temporary game directory");
+        let manifest = legacy_analysis_manifest(&["game.exe"]);
+        fs::write(
+            directory.path().join("game.exe"),
+            fixture_pe(PeArchitecture::X86, &["msvcr100.dll"]),
+        )
+        .expect("PE fixture should be written");
+        fs::write(
+            directory.path().join("RevLoader.exe"),
+            fixture_pe(PeArchitecture::X86, &[]),
+        )
+        .expect("RevLoader fixture should be written");
+        store_legacy_manifest(directory.path(), &manifest)
+            .await
+            .expect("validated v1 manifest should persist");
+        let service = PrerequisiteService::new(
+            Arc::new(RecordingDownloader::default()),
+            Arc::new(AcceptingTrust),
+            Arc::new(FixedProbe { satisfied: true }),
+            Arc::new(RecordingRunner::default()),
+        );
+
+        let result = service
+            .check_active(directory.path(), &CancellationToken::new())
+            .await
+            .expect("legacy install should remain prerequisite-capable");
+
+        assert!(result.ready);
+        assert_eq!(result.already_present, vec!["vc2010-sp1-x86"]);
+    }
+
+    #[tokio::test]
+    async fn invalid_v2_state_never_falls_back_to_the_legacy_manifest() {
+        let directory = tempdir().expect("temporary game directory");
+        store_legacy_manifest(directory.path(), &legacy_analysis_manifest(&["game.exe"]))
+            .await
+            .expect("validated v1 manifest should persist");
+        let state_path = crate::services::content_journal_service::state_path(directory.path());
+        fs::create_dir_all(state_path.parent().unwrap()).expect("state parent");
+        fs::write(&state_path, b"invalid v2 state").expect("invalid state fixture");
+
+        let error = analysis_service(Arc::new(FixedProbe { satisfied: true }))
+            .check_active(directory.path(), &CancellationToken::new())
+            .await
+            .expect_err("invalid v2 state must fail closed");
+
+        assert!(matches!(error, PrerequisiteError::Verification(_)));
     }
 }

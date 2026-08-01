@@ -184,6 +184,110 @@ describe('main renderer Tauri command contracts', () => {
         expect(sessionStorage.getItem('pending-prerequisite-error')).toBeNull();
     });
 
+    it('preserves the localized prerequisite restart message after game-starting', async () => {
+        invoke.mockImplementation(async (command) => {
+            if (command === 'get_language') return 'en';
+            if (command === 'get_current_state') return { operation: 'idle' };
+            if (command === 'get_prerequisite_state') return { outcome: 'none', active: false };
+            if (command === 'recover_pending_install') return { recovered: false };
+            if (command === 'get_game_data') {
+                return { nickname: '', clanTag: '', launchParams: '', gamePath: 'C:\\Game' };
+            }
+            if (command === 'get_game_process_state') return { kind: 'stopped', pid: null };
+            if (command === 'ensure_game_prerequisites') {
+                return { ready: true, installed: [], alreadyPresent: [], restartRecommended: false };
+            }
+            if (command === 'launch_game') {
+                handlers.get('game-starting')({ payload: null });
+                throw {
+                    code: 'prerequisite_restart_required',
+                    message: 'Prerequisite restart required: missing runtime DLL'
+                };
+            }
+            return null;
+        });
+        await loadRenderer();
+
+        document.getElementById('play-button').click();
+
+        await vi.waitFor(() => {
+            expect(document.getElementById('error-message').textContent)
+                .toBe('Restart Windows to finish installing the required components.');
+            expect(document.getElementById('launcher-status').textContent)
+                .toBe('failed to install a required component');
+        });
+    });
+
+    it('restores and shows an exact failed prerequisite terminal on main reload', async () => {
+        invoke.mockImplementation(async (command) => {
+            if (command === 'get_language') return 'en';
+            if (command === 'get_current_state') return { operation: 'idle' };
+            if (command === 'get_prerequisite_state') return {
+                active: false, operationId: 'failed', outcome: 'failed',
+                error: {
+                    code: 'prerequisite_install_failed',
+                    message: 'Prerequisite install failed: exit 1603', details: null
+                }
+            };
+            if (command === 'recover_pending_install') return { recovered: false };
+            if (command === 'get_game_data') {
+                return { nickname: '', clanTag: '', launchParams: '', gamePath: 'C:\\Game' };
+            }
+            if (command === 'get_game_process_state') return { kind: 'stopped', pid: null };
+            return null;
+        });
+
+        await loadRenderer();
+
+        expect(document.getElementById('error-technical-message').textContent)
+            .toContain('exit 1603');
+        expect(document.getElementById('launcher-status').textContent)
+            .toBe('failed to install a required component');
+    });
+
+    it('restores a canceled prerequisite terminal on main reload', async () => {
+        invoke.mockImplementation(async (command) => {
+            if (command === 'get_language') return 'en';
+            if (command === 'get_current_state') return { operation: 'idle' };
+            if (command === 'get_prerequisite_state') return {
+                active: false, operationId: 'cancel', outcome: 'canceled',
+                error: { code: 'canceled', message: 'Operation canceled', details: null }
+            };
+            if (command === 'recover_pending_install') return { recovered: false };
+            if (command === 'get_game_data') {
+                return { nickname: '', clanTag: '', launchParams: '', gamePath: 'C:\\Game' };
+            }
+            if (command === 'get_game_process_state') return { kind: 'stopped', pid: null };
+            return null;
+        });
+
+        await loadRenderer();
+
+        expect(document.getElementById('launcher-status').textContent)
+            .toBe('game launch canceled');
+    });
+
+    it('restores a successful prerequisite terminal on main reload', async () => {
+        invoke.mockImplementation(async (command) => {
+            if (command === 'get_language') return 'en';
+            if (command === 'get_current_state') return { operation: 'idle' };
+            if (command === 'get_prerequisite_state') return {
+                active: false, operationId: 'success', outcome: 'succeeded',
+                result: { ready: true, installed: [], alreadyPresent: [], restartRecommended: false }
+            };
+            if (command === 'recover_pending_install') return { recovered: false };
+            if (command === 'get_game_data') {
+                return { nickname: '', clanTag: '', launchParams: '', gamePath: 'C:\\Game' };
+            }
+            if (command === 'get_game_process_state') return { kind: 'stopped', pid: null };
+            return null;
+        });
+
+        await loadRenderer();
+
+        expect(document.getElementById('launcher-status').textContent).toBe('ready to launch!');
+    });
+
     it('release_1_6_12_replaces_searching_updates_with_a_terminal_network_error', async () => {
         invoke.mockImplementation(async (command) => {
             if (command === 'get_language') return 'en';

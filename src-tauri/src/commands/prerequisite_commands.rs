@@ -9,7 +9,10 @@ use crate::services::config_service;
 use crate::services::prerequisite_service::{
     EnsurePrerequisitesResult, PrerequisiteService, PrerequisiteServiceProgress, RestartStatus,
 };
-use crate::state::{AppState, CancellationSlot, OperationKind, PrerequisiteOperationState};
+use crate::state::{
+    AppState, CancellationSlot, OperationKind, PrerequisiteOperationState, PrerequisiteOutcome,
+    PrerequisiteTerminalResult,
+};
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -27,6 +30,17 @@ impl From<EnsurePrerequisitesResult> for PrerequisiteResult {
             installed: value.installed,
             already_present: value.already_present,
             restart_recommended: value.restart_status != RestartStatus::None,
+        }
+    }
+}
+
+impl From<&PrerequisiteResult> for PrerequisiteTerminalResult {
+    fn from(value: &PrerequisiteResult) -> Self {
+        Self {
+            ready: value.ready,
+            installed: value.installed.clone(),
+            already_present: value.already_present.clone(),
+            restart_recommended: value.restart_recommended,
         }
     }
 }
@@ -66,15 +80,10 @@ impl PrerequisiteProgressPayload {
             downloaded_bytes: self.downloaded_bytes,
             total_bytes: self.total_bytes,
             restart_recommended: self.restart_recommended,
+            outcome: PrerequisiteOutcome::Running,
+            result: None,
+            error: None,
         }
-    }
-}
-
-struct PrerequisiteStateGuard(AppState);
-
-impl Drop for PrerequisiteStateGuard {
-    fn drop(&mut self) {
-        self.0.finish_prerequisite_operation();
     }
 }
 
@@ -90,7 +99,7 @@ pub async fn ensure_game_prerequisites(
 
 #[tauri::command]
 pub fn get_prerequisite_state(state: State<'_, AppState>) -> PrerequisiteOperationState {
-    state.prerequisite_state()
+    state.consume_prerequisite_state()
 }
 
 pub(crate) async fn ensure_game_prerequisites_inner(
@@ -105,50 +114,56 @@ pub(crate) async fn ensure_game_prerequisites_inner(
     let cancel = lease
         .cancellation_token()
         .expect("prerequisite operations always expose cancellation");
-    let initial = PrerequisiteProgressPayload {
-        operation_id: operation_id.clone(),
-        stage: "detecting".into(),
-        component_id: None,
-        progress: Some(0.0),
-        downloaded_bytes: None,
-        total_bytes: None,
-        restart_recommended: false,
-    };
-    state.set_prerequisite_state(initial.snapshot(true));
-    let _state_guard = PrerequisiteStateGuard(state.clone());
+    state.begin_prerequisite_operation(&operation_id);
 
-    #[cfg(feature = "e2e")]
-    {
-        let _ = (app, cancel);
-        return Ok(PrerequisiteResult {
-            ready: true,
-            installed: Vec::new(),
-            already_present: Vec::new(),
-            restart_recommended: false,
-        });
-    }
+    let result: Result<PrerequisiteResult, AppError> = async {
+        #[cfg(feature = "e2e")]
+        {
+            let _ = (app, cancel);
+            Ok(PrerequisiteResult {
+                ready: true,
+                installed: Vec::new(),
+                already_present: Vec::new(),
+                restart_recommended: false,
+            })
+        }
 
-    #[cfg(not(feature = "e2e"))]
-    {
-        let callback_app = app.clone();
-        let callback_state = state.clone();
-        let callback_operation_id = operation_id.clone();
-        let callback = Arc::new(move |update: PrerequisiteServiceProgress| {
-            let payload = PrerequisiteProgressPayload::from_service(&callback_operation_id, update);
-            callback_state.set_prerequisite_state(payload.snapshot(true));
-            if let Err(error) = callback_app.emit("prerequisite-progress", payload) {
-                crate::logger::warn(&format!("failed to emit prerequisite progress: {error}"));
-            }
-        });
-        let game_path = config_service::get_game_path()
-            .await?
-            .ok_or(AppError::GamePathNotSet)?;
-        let service = PrerequisiteService::windows_with_progress(callback)?;
-        Ok(service.ensure_active(&game_path, &cancel).await?.into())
+        #[cfg(not(feature = "e2e"))]
+        {
+            let callback_app = app.clone();
+            let callback_state = state.clone();
+            let callback_operation_id = operation_id.clone();
+            let callback = Arc::new(move |update: PrerequisiteServiceProgress| {
+                let payload =
+                    PrerequisiteProgressPayload::from_service(&callback_operation_id, update);
+                callback_state.update_prerequisite_state(payload.snapshot(true));
+                if let Err(error) = callback_app.emit("prerequisite-progress", payload) {
+                    crate::logger::warn(&format!("failed to emit prerequisite progress: {error}"));
+                }
+            });
+            let game_path = config_service::get_game_path()
+                .await?
+                .ok_or(AppError::GamePathNotSet)?;
+            let service = PrerequisiteService::windows_with_progress(callback)?;
+            Ok(service.ensure_active(&game_path, &cancel).await?.into())
+        }
     }
+    .await;
+
+    match &result {
+        Ok(value) => state.finish_prerequisite_success(&operation_id, value.into()),
+        Err(AppError::Canceled) => {
+            state.finish_prerequisite_canceled(&operation_id, AppError::Canceled.frontend_error())
+        }
+        Err(error) => state.finish_prerequisite_failure(&operation_id, error.frontend_error()),
+    }
+    drop(lease);
+    result
 }
 
-pub(crate) async fn check_game_prerequisites_fast() -> Result<PrerequisiteResult, AppError> {
+pub(crate) async fn check_game_prerequisites_fast_at(
+    game_path: &std::path::Path,
+) -> Result<PrerequisiteResult, AppError> {
     #[cfg(feature = "e2e")]
     return Ok(PrerequisiteResult {
         ready: true,
@@ -159,12 +174,9 @@ pub(crate) async fn check_game_prerequisites_fast() -> Result<PrerequisiteResult
 
     #[cfg(not(feature = "e2e"))]
     {
-        let game_path = config_service::get_game_path()
-            .await?
-            .ok_or(AppError::GamePathNotSet)?;
         let service = PrerequisiteService::windows()?;
         Ok(service
-            .check_active(&game_path, &tokio_util::sync::CancellationToken::new())
+            .check_active(game_path, &tokio_util::sync::CancellationToken::new())
             .await?
             .into())
     }

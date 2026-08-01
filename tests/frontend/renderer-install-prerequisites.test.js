@@ -145,4 +145,65 @@ describe('install prerequisite flow', () => {
             .toBe('verifying prerequisite component...');
         expect(document.getElementById('progress-bar').style.width).toBe('70%');
     });
+
+    it('routes an exact failed terminal from an install reload to main', async () => {
+        invoke.mockImplementation(async (command) => {
+            if (command === 'get_language') return 'en';
+            if (command === 'get_current_state') return { operation: 'idle' };
+            if (command === 'get_prerequisite_state') return {
+                active: false, operationId: 'failed', outcome: 'failed',
+                error: {
+                    code: 'prerequisite_verification_failed',
+                    message: 'Prerequisite verification failed: signer mismatch', details: null
+                }
+            };
+            if (command === 'get_game_path') return 'C:\\Game';
+            if (command === 'recover_pending_install') return { recovered: false };
+            return null;
+        });
+
+        await loadRenderer();
+
+        expect(navigateToPage).toHaveBeenCalledWith('./public/index.html');
+        expect(JSON.parse(sessionStorage.getItem('pending-prerequisite-error')))
+            .toMatchObject({ code: 'prerequisite_verification_failed' });
+    });
+
+    it('restores a canceled prerequisite terminal on install reload', async () => {
+        invoke.mockImplementation(async (command) => {
+            if (command === 'get_language') return 'en';
+            if (command === 'get_current_state') return { operation: 'idle' };
+            if (command === 'get_prerequisite_state') return {
+                active: false, operationId: 'cancel', outcome: 'canceled',
+                error: { code: 'canceled', message: 'Operation canceled', details: null }
+            };
+            if (command === 'get_game_path') return 'C:\\Game';
+            if (command === 'recover_pending_install') return { recovered: false };
+            return null;
+        });
+
+        await loadRenderer();
+
+        expect(document.getElementById('install-status').textContent)
+            .toBe('installation canceled');
+        expect(navigateToPage).not.toHaveBeenCalled();
+    });
+
+    it('routes a successful prerequisite terminal from install reload to main', async () => {
+        invoke.mockImplementation(async (command) => {
+            if (command === 'get_language') return 'en';
+            if (command === 'get_current_state') return { operation: 'idle' };
+            if (command === 'get_prerequisite_state') return {
+                active: false, operationId: 'success', outcome: 'succeeded',
+                result: { ready: true, installed: [], alreadyPresent: [], restartRecommended: false }
+            };
+            if (command === 'get_game_path') return 'C:\\Game';
+            if (command === 'recover_pending_install') return { recovered: false };
+            return null;
+        });
+
+        await loadRenderer();
+
+        expect(navigateToPage).toHaveBeenCalledWith('./public/index.html');
+    });
 });

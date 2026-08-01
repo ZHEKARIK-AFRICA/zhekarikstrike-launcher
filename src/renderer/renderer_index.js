@@ -74,9 +74,30 @@ function restoreOperation(operation) {
     return true;
 }
 
-async function restoreCurrentOperation(current) {
+async function handlePrerequisiteTerminal(prerequisite) {
+    if (prerequisite?.outcome === 'failed') {
+        status.fail('status.prerequisite_failed');
+        handleError(null, prerequisite.error);
+        return true;
+    }
+    if (prerequisite?.outcome === 'canceled') {
+        status.cancel('status.launch_canceled');
+        return true;
+    }
+    if (prerequisite?.outcome === 'succeeded') {
+        await syncIdleState();
+        return true;
+    }
+    return false;
+}
+
+async function finishRestoredPrerequisite() {
+    const prerequisite = await invoke('get_prerequisite_state');
+    if (!await handlePrerequisiteTerminal(prerequisite)) await syncIdleState();
+}
+
+async function restoreCurrentOperation(current, prerequisite) {
     if (current?.operation === 'installing-prerequisites') {
-        const prerequisite = await invoke('get_prerequisite_state');
         if (status.restorePrerequisite(prerequisite)) {
             stopStatePolling();
             statePoll = window.setInterval(async () => {
@@ -84,7 +105,7 @@ async function restoreCurrentOperation(current) {
                     const latest = await invoke('get_current_state');
                     if (latest.operation && latest.operation !== 'idle') return;
                     stopStatePolling();
-                    await syncIdleState();
+                    await finishRestoredPrerequisite();
                 } catch (error) {
                     console.error('Failed to refresh prerequisite state:', error);
                 }
@@ -128,7 +149,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         }));
 
         initialized = true;
-        if (!await restoreCurrentOperation(current)) await syncIdleState();
+        const prerequisite = await invoke('get_prerequisite_state');
+        if (!await handlePrerequisiteTerminal(prerequisite)
+            && !await restoreCurrentOperation(current, prerequisite)) await syncIdleState();
         try {
             const pendingPrerequisiteError = sessionStorage.getItem('pending-prerequisite-error');
             if (pendingPrerequisiteError) {
@@ -173,6 +196,7 @@ playButton?.addEventListener('click', async () => {
             step: 'detecting', statusKey: 'status.prerequisite_detecting', operationId
         });
         const prerequisites = await invoke('ensure_game_prerequisites', { operationId });
+        await invoke('get_prerequisite_state');
         if (!prerequisites?.ready) {
             throw {
                 code: 'prerequisite_restart_required',
@@ -195,15 +219,21 @@ playButton?.addEventListener('click', async () => {
         status.beginStep({ step: 'prepare-game', statusKey: 'status.preparing_game', operationId });
         await invoke('launch_game', { operationId });
     } catch (error) {
+        if (String(error?.code || '').startsWith('prerequisite_')) {
+            try { await invoke('get_prerequisite_state'); } catch (_) { /* preserve original */ }
+        }
         if (error?.code === 'canceled') {
             status.cancel('status.launch_canceled');
         } else if (error?.code === 'game_already_running') {
             gameRunning = true;
             status.setRunning();
         } else {
-            if (launchEventSeen) failureKey = 'status.game_launch_failed';
+            const prerequisiteFailure = String(error?.code || '').startsWith('prerequisite_');
+            if (prerequisiteFailure) failureKey = 'status.prerequisite_failed';
+            else if (launchEventSeen) failureKey = 'status.game_launch_failed';
             status.fail(failureKey);
-            handleError(null, error, { contextKey: failureKey });
+            if (prerequisiteFailure) handleError(null, error);
+            else handleError(null, error, { contextKey: failureKey });
         }
     }
 });
