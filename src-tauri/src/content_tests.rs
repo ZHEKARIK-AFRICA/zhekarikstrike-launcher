@@ -15,13 +15,14 @@ use crate::services::content_download_service::{
     decode_verified_chunk, download_content_chunk, read_verified_local_chunk, DriveCircuitBreaker,
 };
 use crate::services::content_install_service::{
+    cleanup_obsolete_directories, commit_staged_files, load_obsolete_content_entries,
     materializer_worker_limits, required_content_install_bytes, wait_until_chunk_ready,
     AdaptiveDownloadController, ChunkReadiness,
 };
 use crate::services::content_journal_service::{
     atomic_json, backup_path, content_root, journal_path, recover_pending_content, staging_path,
-    state_path, write_journal, ContentCompletionState, ContentJournal, ContentJournalEntry,
-    ContentJournalPhase,
+    state_path, write_journal, ContentCompletionState, ContentJournal, ContentJournalAction,
+    ContentJournalEntry, ContentJournalPhase,
 };
 
 fn sha256(data: &[u8]) -> String {
@@ -67,6 +68,71 @@ fn manifest_json(raw: &[u8], compressed: &[u8]) -> serde_json::Value {
             "chunks": [raw_sha]
         }]
     })
+}
+
+fn content_deletion_manifest(
+    content_marker: char,
+    release_id: &str,
+    game_version: &str,
+    extra_files: &[(&str, &[u8])],
+) -> ContentManifest {
+    let loader = format!("loader-{content_marker}").into_bytes();
+    let loader_compressed = encoded(&loader);
+    let mut document = manifest_json(&loader, &loader_compressed);
+    document["content_sha256"] = json!(content_marker.to_string().repeat(64));
+    document["release_id"] = json!(release_id);
+    document["game_version"] = json!(game_version);
+    document["source_archive_sha256"] = json!("f".repeat(64));
+    let mut unpacked_size = loader.len() as u64;
+    let mut download_size = loader_compressed.len() as u64;
+    for (path, raw) in extra_files {
+        let compressed = encoded(raw);
+        let raw_sha = sha256(raw);
+        document["chunks"][&raw_sha] = json!({
+            "uncompressed_size": raw.len(),
+            "compressed_size": compressed.len(),
+            "compressed_sha256": sha256(&compressed)
+        });
+        document["files"].as_array_mut().unwrap().push(json!({
+            "path": path,
+            "size": raw.len(),
+            "sha256": raw_sha.clone(),
+            "excluded_from_hash_check": false,
+            "temporary": false,
+            "additional_check": false,
+            "chunks": [raw_sha]
+        }));
+        unpacked_size += raw.len() as u64;
+        download_size += compressed.len() as u64;
+    }
+    document["unpacked_size"] = json!(unpacked_size);
+    document["download_size"] = json!(download_size);
+    let manifest: ContentManifest = serde_json::from_value(document).unwrap();
+    manifest.validate().unwrap();
+    manifest
+}
+
+async fn persist_active_content_manifest(game: &std::path::Path, manifest: &ContentManifest) {
+    atomic_json(
+        &content_root(game)
+            .join("manifests")
+            .join(format!("{}.json", manifest.content_sha256)),
+        manifest,
+    )
+    .await
+    .unwrap();
+    atomic_json(
+        &state_path(game),
+        &ContentCompletionState {
+            schema_version: 1,
+            transaction_id: None,
+            content_sha256: manifest.content_sha256.clone(),
+            release_id: manifest.release_id.clone(),
+            game_version: manifest.game_version.clone(),
+        },
+    )
+    .await
+    .unwrap();
 }
 
 #[test]
@@ -270,7 +336,7 @@ async fn release_1_6_12_recovery_preserves_chunks_and_parts_but_cleans_transacti
     let game = directory.path();
     let transaction_id = uuid::Uuid::new_v4().to_string();
     let journal = ContentJournal {
-        schema_version: 1,
+        schema_version: 2,
         transaction_id: transaction_id.clone(),
         release_id: "release-1".to_string(),
         content_sha256: "a".repeat(64),
@@ -332,7 +398,7 @@ async fn release_1_6_12_recovery_rolls_back_an_interrupted_commit() {
     let added = game.join("added.bin");
     tokio::fs::write(&added, b"new").await.unwrap();
     let journal = ContentJournal {
-        schema_version: 1,
+        schema_version: 2,
         transaction_id,
         release_id: "1.0.3.4-r1".to_string(),
         content_sha256: "a".repeat(64),
@@ -340,10 +406,12 @@ async fn release_1_6_12_recovery_rolls_back_an_interrupted_commit() {
         files: vec![
             ContentJournalEntry {
                 path: "csgo/game.bin".to_string(),
+                action: ContentJournalAction::Replace,
                 had_original: true,
             },
             ContentJournalEntry {
                 path: "added.bin".to_string(),
+                action: ContentJournalAction::Replace,
                 had_original: false,
             },
         ],
@@ -371,13 +439,14 @@ async fn release_1_6_12_completed_commit_keeps_files_and_only_cleans_transaction
     tokio::fs::write(&target, b"committed").await.unwrap();
     tokio::fs::write(&backup, b"old").await.unwrap();
     let journal = ContentJournal {
-        schema_version: 1,
+        schema_version: 2,
         transaction_id: transaction_id.clone(),
         release_id: "release-1".to_string(),
         content_sha256: "b".repeat(64),
         phase: ContentJournalPhase::Commit,
         files: vec![ContentJournalEntry {
             path: "csgo/game.bin".to_string(),
+            action: ContentJournalAction::Replace,
             had_original: true,
         }],
     };
@@ -420,13 +489,14 @@ async fn release_1_6_12_old_matching_state_does_not_complete_a_new_transaction()
         .unwrap();
     tokio::fs::write(&backup, b"old").await.unwrap();
     let journal = ContentJournal {
-        schema_version: 1,
+        schema_version: 2,
         transaction_id: transaction_id.clone(),
         release_id: "release-1".to_string(),
         content_sha256: "c".repeat(64),
         phase: ContentJournalPhase::Commit,
         files: vec![ContentJournalEntry {
             path: "csgo/game.bin".to_string(),
+            action: ContentJournalAction::Replace,
             had_original: true,
         }],
     };
@@ -454,13 +524,341 @@ fn content_disk_space_counts_only_unique_missing_chunks_and_checks_overflow() {
     let compressed = encoded(raw);
     let manifest: ContentManifest =
         serde_json::from_value(manifest_json(raw, &compressed)).unwrap();
-    let required = required_content_install_bytes(&manifest, &HashSet::new(), 100, 50, 25).unwrap();
+    let required =
+        required_content_install_bytes(&manifest, &HashSet::new(), 100, 50, 0, 25).unwrap();
     assert_eq!(required, compressed.len() as u64 + 175);
 
     let cached = HashSet::from([sha256(raw)]);
     assert_eq!(
-        required_content_install_bytes(&manifest, &cached, 100, 50, 25).unwrap(),
+        required_content_install_bytes(&manifest, &cached, 100, 50, 0, 25).unwrap(),
         175
     );
-    assert!(required_content_install_bytes(&manifest, &HashSet::new(), u64::MAX, 1, 0,).is_err());
+    assert!(required_content_install_bytes(&manifest, &HashSet::new(), u64::MAX, 1, 0, 0).is_err());
+}
+
+#[tokio::test]
+async fn content_deletion_exact_obsolete_file_is_backed_up_and_unknown_file_is_preserved() {
+    let directory = tempdir().unwrap();
+    let game = directory.path();
+    let previous = content_deletion_manifest(
+        'c',
+        "1.0.3.4-r1",
+        "1.0.3.4",
+        &[("legacy/obsolete.bin", b"managed-old")],
+    );
+    let next = content_deletion_manifest('d', "1.0.3.5-r1", "1.0.3.5", &[]);
+    persist_active_content_manifest(game, &previous).await;
+    let obsolete = game.join("legacy/obsolete.bin");
+    let unknown = game.join("legacy/user-notes.txt");
+    tokio::fs::create_dir_all(obsolete.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::write(&obsolete, b"managed-old").await.unwrap();
+    tokio::fs::write(&unknown, b"keep-me").await.unwrap();
+
+    let entries = load_obsolete_content_entries(game, &next).await.unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].path, "legacy/obsolete.bin");
+    assert_eq!(entries[0].action, ContentJournalAction::Remove);
+    let transaction_id = uuid::Uuid::new_v4().to_string();
+    let journal = ContentJournal {
+        schema_version: 2,
+        transaction_id: transaction_id.clone(),
+        release_id: next.release_id.clone(),
+        content_sha256: next.content_sha256.clone(),
+        phase: ContentJournalPhase::Commit,
+        files: entries,
+    };
+
+    commit_staged_files(game, &staging_path(game, &transaction_id), &journal)
+        .await
+        .unwrap();
+    cleanup_obsolete_directories(game, &journal).await.unwrap();
+
+    assert!(!obsolete.exists());
+    assert_eq!(tokio::fs::read(unknown).await.unwrap(), b"keep-me");
+    assert_eq!(
+        tokio::fs::read(backup_path(game, &transaction_id).join("legacy/obsolete.bin"))
+            .await
+            .unwrap(),
+        b"managed-old"
+    );
+}
+
+#[tokio::test]
+async fn content_deletion_missing_invalid_or_mismatched_previous_manifest_deletes_nothing() {
+    let directory = tempdir().unwrap();
+    let game = directory.path();
+    let next = content_deletion_manifest('e', "1.0.3.5-r1", "1.0.3.5", &[]);
+    let candidate = game.join("legacy/old.bin");
+    tokio::fs::create_dir_all(candidate.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::write(&candidate, b"do-not-infer-ownership")
+        .await
+        .unwrap();
+
+    assert!(load_obsolete_content_entries(game, &next)
+        .await
+        .unwrap()
+        .is_empty());
+
+    tokio::fs::create_dir_all(content_root(game)).await.unwrap();
+    tokio::fs::write(state_path(game), b"invalid-json")
+        .await
+        .unwrap();
+    assert!(load_obsolete_content_entries(game, &next)
+        .await
+        .unwrap()
+        .is_empty());
+
+    let previous_hash = "f".repeat(64);
+    atomic_json(
+        &state_path(game),
+        &ContentCompletionState {
+            schema_version: 1,
+            transaction_id: None,
+            content_sha256: previous_hash.clone(),
+            release_id: "1.0.3.4-r1".into(),
+            game_version: "1.0.3.4".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(load_obsolete_content_entries(game, &next)
+        .await
+        .unwrap()
+        .is_empty());
+    tokio::fs::create_dir_all(content_root(game).join("manifests"))
+        .await
+        .unwrap();
+    tokio::fs::write(
+        content_root(game)
+            .join("manifests")
+            .join(format!("{previous_hash}.json")),
+        b"invalid-manifest",
+    )
+    .await
+    .unwrap();
+    assert!(load_obsolete_content_entries(game, &next)
+        .await
+        .unwrap()
+        .is_empty());
+
+    let previous = content_deletion_manifest(
+        'f',
+        "1.0.3.4-r1",
+        "1.0.3.4",
+        &[("legacy/old.bin", b"managed-old")],
+    );
+    persist_active_content_manifest(game, &previous).await;
+    let mut mismatched_state: serde_json::Value =
+        serde_json::from_slice(&tokio::fs::read(state_path(game)).await.unwrap()).unwrap();
+    mismatched_state["release_id"] = json!("1.0.3.4-r2");
+    atomic_json(&state_path(game), &mismatched_state)
+        .await
+        .unwrap();
+    assert!(load_obsolete_content_entries(game, &next)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        tokio::fs::read(candidate).await.unwrap(),
+        b"do-not-infer-ownership"
+    );
+}
+
+#[tokio::test]
+async fn content_deletion_interrupted_recovery_restores_removal_and_preserves_chunks_and_parts() {
+    let directory = tempdir().unwrap();
+    let game = directory.path();
+    let transaction_id = uuid::Uuid::new_v4().to_string();
+    let target = game.join("legacy/obsolete.bin");
+    let backup = backup_path(game, &transaction_id).join("legacy/obsolete.bin");
+    tokio::fs::create_dir_all(target.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(backup.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::write(&target, b"managed-old").await.unwrap();
+    tokio::fs::rename(&target, &backup).await.unwrap();
+    let chunk = content_root(game).join("chunks/aa/chunk.zst");
+    let part = content_root(game).join("chunks/bb/chunk.zst.part");
+    for path in [&chunk, &part] {
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(path, b"cache").await.unwrap();
+    }
+    atomic_json(
+        &journal_path(game),
+        &json!({
+            "schema_version": 2,
+            "transaction_id": transaction_id,
+            "release_id": "1.0.3.5-r1",
+            "content_sha256": "a".repeat(64),
+            "phase": "commit",
+            "files": [{
+                "path": "legacy/obsolete.bin",
+                "action": "remove"
+            }]
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert!(recover_pending_content(game).await.unwrap());
+    assert_eq!(tokio::fs::read(target).await.unwrap(), b"managed-old");
+    assert!(chunk.exists());
+    assert!(part.exists());
+}
+
+#[tokio::test]
+async fn content_deletion_committed_recovery_keeps_deletion_cleans_backup_and_only_safe_empty_dirs()
+{
+    let directory = tempdir().unwrap();
+    let game = directory.path();
+    let transaction_id = uuid::Uuid::new_v4().to_string();
+    let backup = backup_path(game, &transaction_id).join("known/nested/obsolete.bin");
+    tokio::fs::create_dir_all(backup.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::write(&backup, b"managed-old").await.unwrap();
+    tokio::fs::create_dir_all(game.join("known/nested"))
+        .await
+        .unwrap();
+    tokio::fs::write(game.join("known/user.txt"), b"keep-me")
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(game.join("unrelated-empty"))
+        .await
+        .unwrap();
+    atomic_json(
+        &journal_path(game),
+        &json!({
+            "schema_version": 2,
+            "transaction_id": transaction_id,
+            "release_id": "1.0.3.5-r1",
+            "content_sha256": "b".repeat(64),
+            "phase": "commit",
+            "files": [{
+                "path": "known/nested/obsolete.bin",
+                "action": "remove"
+            }]
+        }),
+    )
+    .await
+    .unwrap();
+    atomic_json(
+        &state_path(game),
+        &ContentCompletionState {
+            schema_version: 1,
+            transaction_id: Some(transaction_id.clone()),
+            content_sha256: "b".repeat(64),
+            release_id: "1.0.3.5-r1".into(),
+            game_version: "1.0.3.5".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(recover_pending_content(game).await.unwrap());
+    assert!(!game.join("known/nested/obsolete.bin").exists());
+    assert!(!game.join("known/nested").exists());
+    assert_eq!(
+        tokio::fs::read(game.join("known/user.txt")).await.unwrap(),
+        b"keep-me"
+    );
+    assert!(game.join("unrelated-empty").exists());
+    assert!(!backup_path(game, &transaction_id).exists());
+    assert!(!journal_path(game).exists());
+}
+
+#[tokio::test]
+async fn content_deletion_v1_journal_recovery_remains_compatible() {
+    let directory = tempdir().unwrap();
+    let game = directory.path();
+    let transaction_id = uuid::Uuid::new_v4().to_string();
+    let target = game.join("csgo/game.bin");
+    let backup = backup_path(game, &transaction_id).join("csgo/game.bin");
+    tokio::fs::create_dir_all(target.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(backup.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::write(&target, b"new").await.unwrap();
+    tokio::fs::write(&backup, b"old").await.unwrap();
+    atomic_json(
+        &journal_path(game),
+        &json!({
+            "schema_version": 1,
+            "transaction_id": transaction_id,
+            "release_id": "1.0.3.4-r1",
+            "content_sha256": "c".repeat(64),
+            "phase": "commit",
+            "files": [{"path": "csgo/game.bin", "had_original": true}]
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert!(recover_pending_content(game).await.unwrap());
+    assert_eq!(tokio::fs::read(target).await.unwrap(), b"old");
+}
+
+#[tokio::test]
+async fn content_deletion_malformed_or_unsafe_journal_paths_are_rejected() {
+    let directory = tempdir().unwrap();
+    let game = directory.path().join("game");
+    let outside = directory.path().join("outside.bin");
+    tokio::fs::write(&outside, b"keep-me").await.unwrap();
+    for unsafe_path in [
+        "../outside.bin",
+        r"C:\outside.bin",
+        ".zhekarik/content/state.json",
+    ] {
+        atomic_json(
+            &journal_path(&game),
+            &json!({
+                "schema_version": 2,
+                "transaction_id": uuid::Uuid::new_v4().to_string(),
+                "release_id": "1.0.3.5-r1",
+                "content_sha256": "d".repeat(64),
+                "phase": "commit",
+                "files": [{"path": unsafe_path, "action": "remove"}]
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(recover_pending_content(&game).await.is_err());
+    }
+    atomic_json(
+        &journal_path(&game),
+        &json!({
+            "schema_version": 2,
+            "transaction_id": uuid::Uuid::new_v4().to_string(),
+            "release_id": "1.0.3.5-r1",
+            "content_sha256": "d".repeat(64),
+            "phase": "commit",
+            "files": [{"path": "legacy/obsolete.bin"}]
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(recover_pending_content(&game).await.is_err());
+    assert_eq!(tokio::fs::read(outside).await.unwrap(), b"keep-me");
+}
+
+#[test]
+fn content_deletion_disk_preflight_includes_obsolete_backup_and_checks_overflow() {
+    let manifest = content_deletion_manifest('e', "1.0.3.5-r1", "1.0.3.5", &[]);
+    let available = manifest.chunks.keys().cloned().collect::<HashSet<_>>();
+
+    assert_eq!(
+        required_content_install_bytes(&manifest, &available, 10, 20, 30, 40).unwrap(),
+        100
+    );
+    assert!(required_content_install_bytes(&manifest, &available, 0, 1, u64::MAX, 0).is_err());
 }
