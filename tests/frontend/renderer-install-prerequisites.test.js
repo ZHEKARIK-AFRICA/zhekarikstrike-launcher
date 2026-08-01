@@ -213,6 +213,73 @@ describe('install prerequisite flow', () => {
         expect(navigateToPage).toHaveBeenCalledWith('./public/index.html');
     });
 
+    it('hands off an exact restart failure instead of restoring not-ready as success', async () => {
+        invoke.mockImplementation(async (command) => {
+            if (command === 'get_language') return 'en';
+            if (command === 'get_current_state') return { operation: 'idle' };
+            if (command === 'get_prerequisite_state') return {
+                active: false, operationId: 'restart', outcome: 'failed',
+                error: {
+                    code: 'prerequisite_restart_required',
+                    message: 'Prerequisite restart required: restart Windows', details: null
+                }
+            };
+            if (command === 'get_game_path') return 'C:\\Game';
+            if (command === 'recover_pending_install') return { recovered: false };
+            return null;
+        });
+
+        await loadRenderer();
+
+        expect(JSON.parse(sessionStorage.getItem('pending-prerequisite-error')))
+            .toMatchObject({
+                operationId: 'restart',
+                error: { code: 'prerequisite_restart_required' }
+            });
+        expect(navigateToPage).toHaveBeenCalledWith('./public/index.html');
+    });
+
+    it('routes a post-commit full-manifest network failure to prerequisite-only retry', async () => {
+        let prerequisiteFailed = false;
+        invoke.mockImplementation(async (command) => {
+            if (command === 'get_language') return 'en';
+            if (command === 'get_current_state') return { operation: 'idle' };
+            if (command === 'get_prerequisite_state') {
+                if (!prerequisiteFailed) return { active: false, outcome: 'none' };
+                return {
+                    active: false, operationId: 'network', outcome: 'failed',
+                    error: {
+                        code: 'prerequisite_download_failed',
+                        message: 'Prerequisite download failed: full manifest offline', details: null
+                    }
+                };
+            }
+            if (command === 'get_game_path') return 'C:\\Game';
+            if (command === 'recover_pending_install') return { recovered: false };
+            if (command === 'install_game') {
+                prerequisiteFailed = true;
+                throw {
+                    code: 'prerequisite_download_failed',
+                    message: 'Prerequisite download failed: full manifest offline'
+                };
+            }
+            return null;
+        });
+        await loadRenderer();
+
+        document.getElementById('start-install').click();
+
+        await vi.waitFor(() => {
+            expect(navigateToPage).toHaveBeenCalledWith('./public/index.html');
+            expect(JSON.parse(sessionStorage.getItem('pending-prerequisite-error')))
+                .toMatchObject({ error: { code: 'prerequisite_download_failed' } });
+            expect(document.getElementById('error-message').textContent)
+                .toBe('Could not download a required component.');
+            expect(document.getElementById('error-technical-message').textContent)
+                .toContain('full manifest offline');
+        });
+    });
+
     it('persists a failed handoff before ack and resumes routing after a reload', async () => {
         let acknowledgeCalls = 0;
         invoke.mockImplementation(async (command, args) => {

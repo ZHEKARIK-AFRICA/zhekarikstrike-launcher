@@ -459,12 +459,34 @@ impl PrerequisiteService {
             .await
     }
 
+    pub async fn ensure_active_for_version(
+        &self,
+        game_root: &Path,
+        installed_version: &str,
+        cancel: &CancellationToken,
+    ) -> Result<EnsurePrerequisitesResult, PrerequisiteError> {
+        let manifest = load_prerequisite_manifest_for_version(game_root, installed_version).await?;
+        self.ensure_prerequisite_manifest(game_root, &manifest, cancel)
+            .await
+    }
+
     pub async fn check_active(
         &self,
         game_root: &Path,
         cancel: &CancellationToken,
     ) -> Result<EnsurePrerequisitesResult, PrerequisiteError> {
         let manifest = load_prerequisite_manifest(game_root).await?;
+        self.check_prerequisite_manifest(game_root, &manifest, cancel)
+            .await
+    }
+
+    pub async fn check_active_for_version(
+        &self,
+        game_root: &Path,
+        installed_version: &str,
+        cancel: &CancellationToken,
+    ) -> Result<EnsurePrerequisitesResult, PrerequisiteError> {
+        let manifest = load_prerequisite_manifest_for_version(game_root, installed_version).await?;
         self.check_prerequisite_manifest(game_root, &manifest, cancel)
             .await
     }
@@ -921,9 +943,30 @@ async fn load_prerequisite_manifest(
     load_prerequisite_manifest_from_state_probe(game_root, state_probe).await
 }
 
+async fn load_prerequisite_manifest_for_version(
+    game_root: &Path,
+    installed_version: &str,
+) -> Result<ActivePrerequisiteManifest, PrerequisiteError> {
+    let state_probe = tokio::fs::try_exists(state_path(game_root)).await;
+    load_prerequisite_manifest_from_state_probe_for_version(
+        game_root,
+        state_probe,
+        Some(installed_version),
+    )
+    .await
+}
+
 async fn load_prerequisite_manifest_from_state_probe(
     game_root: &Path,
     state_probe: std::io::Result<bool>,
+) -> Result<ActivePrerequisiteManifest, PrerequisiteError> {
+    load_prerequisite_manifest_from_state_probe_for_version(game_root, state_probe, None).await
+}
+
+async fn load_prerequisite_manifest_from_state_probe_for_version(
+    game_root: &Path,
+    state_probe: std::io::Result<bool>,
+    installed_version: Option<&str>,
 ) -> Result<ActivePrerequisiteManifest, PrerequisiteError> {
     match state_probe {
         Ok(true) => {
@@ -948,7 +991,21 @@ async fn load_prerequisite_manifest_from_state_probe(
     let manifest: GameManifest = serde_json::from_slice(&bytes).map_err(|error| {
         PrerequisiteError::Verification(format!("legacy manifest is invalid: {error}"))
     })?;
+    if installed_version
+        .is_some_and(|version| known_legacy_version(version) && manifest.game_version != version)
+    {
+        return Err(PrerequisiteError::Verification(format!(
+            "legacy prerequisite manifest version {} does not match installed version {}",
+            manifest.game_version,
+            installed_version.unwrap_or_default()
+        )));
+    }
     ActivePrerequisiteManifest::from_legacy(&manifest)
+}
+
+fn known_legacy_version(version: &str) -> bool {
+    let version = version.trim();
+    !version.is_empty() && version != "0.0.0"
 }
 
 pub trait LegacyManifestWriter: Send + Sync {
@@ -974,6 +1031,13 @@ impl LegacyManifestWriter for AtomicLegacyManifestWriter {
 pub async fn legacy_manifest_backfill_required(
     game_root: &Path,
 ) -> Result<bool, PrerequisiteError> {
+    legacy_manifest_refresh_required(game_root, "").await
+}
+
+pub async fn legacy_manifest_refresh_required(
+    game_root: &Path,
+    installed_version: &str,
+) -> Result<bool, PrerequisiteError> {
     match tokio::fs::try_exists(state_path(game_root)).await {
         Ok(true) => return Ok(false),
         Ok(false) => {}
@@ -983,12 +1047,42 @@ pub async fn legacy_manifest_backfill_required(
             )));
         }
     }
-    match tokio::fs::try_exists(game_root.join(LEGACY_MANIFEST_PATH)).await {
-        Ok(exists) => Ok(!exists),
+    let path = game_root.join(LEGACY_MANIFEST_PATH);
+    match tokio::fs::try_exists(&path).await {
+        Ok(false) => Ok(true),
+        Ok(true) => {
+            legacy_manifest_refresh_from_read(installed_version, tokio::fs::read(path).await)
+        }
         Err(error) => Err(PrerequisiteError::Verification(format!(
             "could not probe legacy prerequisite manifest: {error}"
         ))),
     }
+}
+
+fn legacy_manifest_refresh_from_read(
+    installed_version: &str,
+    read_result: std::io::Result<Vec<u8>>,
+) -> Result<bool, PrerequisiteError> {
+    let bytes = match read_result {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => {
+            return Err(PrerequisiteError::Verification(format!(
+                "could not read legacy prerequisite manifest: {error}"
+            )));
+        }
+    };
+    let manifest: GameManifest = match serde_json::from_slice(&bytes) {
+        Ok(manifest) => manifest,
+        Err(_) => return Ok(true),
+    };
+    if ActivePrerequisiteManifest::from_legacy(&manifest).is_err() {
+        return Ok(true);
+    }
+    Ok(
+        known_legacy_version(installed_version)
+            && manifest.game_version != installed_version.trim(),
+    )
 }
 
 pub async fn backfill_legacy_manifest_with_writer(
@@ -996,8 +1090,24 @@ pub async fn backfill_legacy_manifest_with_writer(
     manifest: &GameManifest,
     writer: &dyn LegacyManifestWriter,
 ) -> Result<(), PrerequisiteError> {
+    refresh_legacy_manifest_with_writer(game_root, "", manifest, writer).await
+}
+
+pub async fn refresh_legacy_manifest_with_writer(
+    game_root: &Path,
+    installed_version: &str,
+    manifest: &GameManifest,
+    writer: &dyn LegacyManifestWriter,
+) -> Result<(), PrerequisiteError> {
     ActivePrerequisiteManifest::from_legacy(manifest)?;
-    if !legacy_manifest_backfill_required(game_root).await? {
+    if known_legacy_version(installed_version) && manifest.game_version != installed_version.trim()
+    {
+        return Err(PrerequisiteError::Verification(format!(
+            "full legacy manifest version {} does not match installed version {}",
+            manifest.game_version, installed_version
+        )));
+    }
+    if !legacy_manifest_refresh_required(game_root, installed_version).await? {
         return Ok(());
     }
     writer.store(game_root, manifest).await
@@ -1008,6 +1118,20 @@ pub async fn backfill_legacy_manifest(
     manifest: &GameManifest,
 ) -> Result<(), PrerequisiteError> {
     backfill_legacy_manifest_with_writer(game_root, manifest, &AtomicLegacyManifestWriter).await
+}
+
+pub async fn refresh_legacy_manifest(
+    game_root: &Path,
+    installed_version: &str,
+    manifest: &GameManifest,
+) -> Result<(), PrerequisiteError> {
+    refresh_legacy_manifest_with_writer(
+        game_root,
+        installed_version,
+        manifest,
+        &AtomicLegacyManifestWriter,
+    )
+    .await
 }
 
 pub async fn store_legacy_manifest(
@@ -2765,6 +2889,142 @@ mod tests {
         .expect_err("state probe errors must fail closed");
 
         assert!(matches!(error, PrerequisiteError::Verification(_)));
+    }
+
+    #[tokio::test]
+    async fn v1_version_change_refreshes_sidecar_and_rescans_new_imports() {
+        let directory = tempdir().expect("temporary game directory");
+        let mut old_manifest = legacy_analysis_manifest(&["game.exe"]);
+        old_manifest.game_version = "1.0.3.5".into();
+        fs::write(
+            directory.path().join("game.exe"),
+            fixture_pe(PeArchitecture::X86, &[]),
+        )
+        .expect("old PE fixture should be written");
+        fs::write(
+            directory.path().join("RevLoader.exe"),
+            fixture_pe(PeArchitecture::X86, &[]),
+        )
+        .expect("RevLoader fixture should be written");
+        store_legacy_manifest(directory.path(), &old_manifest)
+            .await
+            .expect("old sidecar should persist");
+        let service = analysis_service(Arc::new(FixedProbe { satisfied: false }));
+        assert!(
+            service
+                .check_active_for_version(directory.path(), "1.0.3.5", &CancellationToken::new(),)
+                .await
+                .expect("old generation should be checked")
+                .ready
+        );
+
+        let mut new_manifest = legacy_analysis_manifest(&["game.exe"]);
+        new_manifest.game_version = "1.0.3.6".into();
+        fs::write(
+            directory.path().join("game.exe"),
+            fixture_pe(PeArchitecture::X86, &["xinput1_3.dll"]),
+        )
+        .expect("new PE fixture should be written");
+        assert!(
+            legacy_manifest_refresh_required(directory.path(), "1.0.3.6")
+                .await
+                .expect("stale sidecar should be detected")
+        );
+        assert!(service
+            .check_active_for_version(directory.path(), "1.0.3.6", &CancellationToken::new(),)
+            .await
+            .is_err());
+
+        refresh_legacy_manifest_with_writer(
+            directory.path(),
+            "1.0.3.6",
+            &new_manifest,
+            &AtomicLegacyManifestWriter,
+        )
+        .await
+        .expect("public ensure refresh should replace stale metadata");
+        let refreshed = service
+            .check_active_for_version(directory.path(), "1.0.3.6", &CancellationToken::new())
+            .await
+            .expect("fast guard should rescan refreshed generation");
+        assert!(!refreshed.ready);
+    }
+
+    #[tokio::test]
+    async fn failed_stale_sidecar_refresh_is_retried_without_accepting_old_generation() {
+        let directory = tempdir().expect("temporary game directory");
+        let mut old_manifest = legacy_analysis_manifest(&["game.exe"]);
+        old_manifest.game_version = "1.0.3.5".into();
+        store_legacy_manifest(directory.path(), &old_manifest)
+            .await
+            .expect("old sidecar should persist");
+        let mut new_manifest = legacy_analysis_manifest(&["game.exe"]);
+        new_manifest.game_version = "1.0.3.6".into();
+        let writer = FailOnceLegacyWriter {
+            failed: std::sync::atomic::AtomicBool::new(false),
+        };
+
+        refresh_legacy_manifest_with_writer(directory.path(), "1.0.3.6", &new_manifest, &writer)
+            .await
+            .expect_err("first replacement should fail");
+        let preserved: GameManifest = serde_json::from_slice(
+            &fs::read(directory.path().join(LEGACY_MANIFEST_PATH))
+                .expect("old sidecar should remain readable"),
+        )
+        .expect("old sidecar should remain valid");
+        assert_eq!(preserved.game_version, "1.0.3.5");
+        assert!(
+            load_prerequisite_manifest_for_version(directory.path(), "1.0.3.6")
+                .await
+                .is_err()
+        );
+        assert!(
+            legacy_manifest_refresh_required(directory.path(), "1.0.3.6")
+                .await
+                .expect("old sidecar should remain detectably stale")
+        );
+
+        refresh_legacy_manifest_with_writer(directory.path(), "1.0.3.6", &new_manifest, &writer)
+            .await
+            .expect("next prerequisite operation should retry replacement");
+        assert!(
+            !legacy_manifest_refresh_required(directory.path(), "1.0.3.6")
+                .await
+                .expect("refreshed sidecar should match installed generation")
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_initial_v1_version_accepts_an_existing_valid_sidecar() {
+        let directory = tempdir().expect("temporary game directory");
+        store_legacy_manifest(directory.path(), &legacy_analysis_manifest(&["game.exe"]))
+            .await
+            .expect("initial sidecar should persist");
+
+        assert!(!legacy_manifest_refresh_required(directory.path(), "0.0.0")
+            .await
+            .expect("unknown fresh-install version must not refetch forever"));
+        assert!(!legacy_manifest_refresh_required(directory.path(), "")
+            .await
+            .expect("missing fresh-install version must not refetch forever"));
+    }
+
+    #[test]
+    fn readable_invalid_sidecar_is_refreshable_but_io_errors_fail_closed() {
+        assert!(
+            legacy_manifest_refresh_from_read("1.0.3.6", Ok(b"invalid json".to_vec()),)
+                .expect("readable invalid sidecar should be safely regenerable")
+        );
+        assert!(matches!(
+            legacy_manifest_refresh_from_read(
+                "1.0.3.6",
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected sidecar read failure",
+                )),
+            ),
+            Err(PrerequisiteError::Verification(_))
+        ));
     }
 
     #[tokio::test]

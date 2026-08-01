@@ -210,13 +210,7 @@ playButton?.addEventListener('click', async () => {
         status.beginStep({
             step: 'detecting', statusKey: 'status.prerequisite_detecting', operationId
         });
-        const prerequisites = await invoke('ensure_game_prerequisites', { operationId });
-        if (!prerequisites?.ready) {
-            throw {
-                code: 'prerequisite_restart_required',
-                message: 'Installed prerequisites require a Windows restart.'
-            };
-        }
+        await invoke('ensure_game_prerequisites', { operationId });
         failureKey = 'status.launch_settings_failed';
         status.beginStep({
             step: 'launch-settings', statusKey: 'status.saving_launch_settings'

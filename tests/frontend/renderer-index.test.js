@@ -294,6 +294,33 @@ describe('main renderer Tauri command contracts', () => {
         expect(document.getElementById('launcher-status').textContent).toBe('ready to launch!');
     });
 
+    it('restores a not-ready backend terminal as an exact restart failure', async () => {
+        invoke.mockImplementation(async (command) => {
+            if (command === 'get_language') return 'en';
+            if (command === 'get_current_state') return { operation: 'idle' };
+            if (command === 'get_prerequisite_state') return {
+                active: false, operationId: 'restart', outcome: 'failed',
+                error: {
+                    code: 'prerequisite_restart_required',
+                    message: 'Prerequisite restart required: restart Windows', details: null
+                }
+            };
+            if (command === 'recover_pending_install') return { recovered: false };
+            if (command === 'get_game_data') {
+                return { nickname: '', clanTag: '', launchParams: '', gamePath: 'C:\\Game' };
+            }
+            if (command === 'get_game_process_state') return { kind: 'stopped', pid: null };
+            return null;
+        });
+
+        await loadRenderer();
+
+        expect(document.getElementById('error-message').textContent)
+            .toBe('Restart Windows to finish installing the required components.');
+        expect(document.getElementById('launcher-status').textContent)
+            .toBe('failed to install a required component');
+    });
+
     it('re-delivers a terminal after reload between peek and acknowledgement', async () => {
         const terminal = {
             active: false, operationId: 'race', outcome: 'failed',

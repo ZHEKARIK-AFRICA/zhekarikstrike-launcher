@@ -8,7 +8,7 @@ use crate::models::validated_operation_id;
 use crate::services::api_client::ApiClient;
 use crate::services::config_service;
 use crate::services::prerequisite_service::{
-    backfill_legacy_manifest, legacy_manifest_backfill_required, EnsurePrerequisitesResult,
+    legacy_manifest_refresh_required, refresh_legacy_manifest, EnsurePrerequisitesResult,
     PrerequisiteService, PrerequisiteServiceProgress, RestartStatus,
 };
 use crate::state::{
@@ -151,15 +151,25 @@ pub(crate) async fn ensure_game_prerequisites_inner(
             let game_path = config_service::get_game_path()
                 .await?
                 .ok_or(AppError::GamePathNotSet)?;
-            if legacy_manifest_backfill_required(&game_path).await? {
-                let manifest = ApiClient::new()?.get_full_manifest().await?;
-                backfill_legacy_manifest(&game_path, &manifest).await?;
+            let installed_version = config_service::get_game_version().await?;
+            if legacy_manifest_refresh_required(&game_path, &installed_version).await? {
+                let client = ApiClient::new().map_err(normalize_manifest_acquisition_error)?;
+                let manifest = client
+                    .get_full_manifest()
+                    .await
+                    .map_err(normalize_manifest_acquisition_error)?;
+                refresh_legacy_manifest(&game_path, &installed_version, &manifest).await?;
             }
             let service = PrerequisiteService::windows_with_progress(callback)?;
-            Ok(service.ensure_active(&game_path, &cancel).await?.into())
+            Ok(service
+                .ensure_active_for_version(&game_path, &installed_version, &cancel)
+                .await?
+                .into())
         }
     }
     .await;
+
+    let result = finalize_prerequisite_result(result);
 
     match &result {
         Ok(value) => state.finish_prerequisite_success(&operation_id, value.into()),
@@ -170,6 +180,23 @@ pub(crate) async fn ensure_game_prerequisites_inner(
     }
     drop(lease);
     result
+}
+
+fn finalize_prerequisite_result(
+    result: Result<PrerequisiteResult, AppError>,
+) -> Result<PrerequisiteResult, AppError> {
+    result.and_then(guard_prerequisite_result)
+}
+
+fn normalize_manifest_acquisition_error(error: AppError) -> AppError {
+    match error {
+        AppError::Network(message) => AppError::PrerequisiteDownload(message),
+        AppError::InvalidData(message) => AppError::PrerequisiteVerification(message),
+        error @ (AppError::PrerequisiteDownload(_) | AppError::PrerequisiteVerification(_)) => {
+            error
+        }
+        error => AppError::PrerequisiteVerification(error.to_string()),
+    }
 }
 
 pub(crate) async fn check_game_prerequisites_fast_at(
@@ -185,9 +212,14 @@ pub(crate) async fn check_game_prerequisites_fast_at(
 
     #[cfg(not(feature = "e2e"))]
     {
+        let installed_version = config_service::get_game_version().await?;
         let service = PrerequisiteService::windows()?;
         Ok(service
-            .check_active(game_path, &tokio_util::sync::CancellationToken::new())
+            .check_active_for_version(
+                game_path,
+                &installed_version,
+                &tokio_util::sync::CancellationToken::new(),
+            )
             .await?
             .into())
     }
@@ -211,9 +243,13 @@ pub(crate) fn guard_prerequisite_result(
 
 #[cfg(test)]
 mod tests {
-    use super::{guard_prerequisite_result, PrerequisiteProgressPayload, PrerequisiteResult};
+    use super::{
+        finalize_prerequisite_result, guard_prerequisite_result,
+        normalize_manifest_acquisition_error, PrerequisiteProgressPayload, PrerequisiteResult,
+    };
     use crate::error::AppError;
     use crate::services::prerequisite_service::{EnsurePrerequisitesResult, RestartStatus};
+    use crate::state::{AppState, PrerequisiteOutcome};
 
     #[test]
     fn release_1_6_13_public_result_uses_the_frontend_contract() {
@@ -263,5 +299,51 @@ mod tests {
         .expect_err("launch must not bypass the final prerequisite check");
 
         assert!(matches!(error, AppError::PrerequisiteRestartRequired(_)));
+    }
+
+    #[test]
+    fn not_ready_restart_is_recorded_as_a_structured_failed_terminal() {
+        let state = AppState::new();
+        state.begin_prerequisite_operation("restart");
+        let result = finalize_prerequisite_result(Ok(PrerequisiteResult {
+            ready: false,
+            installed: vec!["vc2010-sp1-x86".into()],
+            already_present: Vec::new(),
+            restart_recommended: true,
+        }));
+        let error = result.expect_err("restart-required result must not become success");
+        state.finish_prerequisite_failure("restart", error.frontend_error());
+
+        let terminal = state.prerequisite_state();
+        assert_eq!(terminal.outcome, PrerequisiteOutcome::Failed);
+        assert_eq!(
+            terminal.error.as_ref().map(|error| error.code.as_str()),
+            Some("prerequisite_restart_required")
+        );
+    }
+
+    #[test]
+    fn not_ready_without_restart_is_a_structured_install_failure() {
+        let error = finalize_prerequisite_result(Ok(PrerequisiteResult {
+            ready: false,
+            installed: Vec::new(),
+            already_present: Vec::new(),
+            restart_recommended: false,
+        }))
+        .expect_err("unavailable components must not become success");
+
+        assert_eq!(error.code(), "prerequisite_install_failed");
+    }
+
+    #[test]
+    fn full_manifest_acquisition_errors_use_prerequisite_codes() {
+        assert_eq!(
+            normalize_manifest_acquisition_error(AppError::Network("offline".into())).code(),
+            "prerequisite_download_failed"
+        );
+        assert_eq!(
+            normalize_manifest_acquisition_error(AppError::InvalidData("incomplete".into())).code(),
+            "prerequisite_verification_failed"
+        );
     }
 }

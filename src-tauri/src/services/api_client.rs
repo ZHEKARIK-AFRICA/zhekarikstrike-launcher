@@ -220,18 +220,18 @@ impl ApiClient {
     }
 
     async fn fetch_manifest(&self, url: &str) -> Result<GameManifest, AppError> {
-        Ok(self
-            .metadata_get(url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?)
+        let response = self.metadata_get(url).send().await?.error_for_status()?;
+        let bytes = response.bytes().await?;
+        parse_game_manifest_body(&bytes)
     }
 
     fn metadata_get(&self, url: &str) -> reqwest::RequestBuilder {
         self.http.get(url).timeout(METADATA_REQUEST_TIMEOUT)
     }
+}
+
+fn parse_game_manifest_body(body: &[u8]) -> Result<GameManifest, AppError> {
+    serde_json::from_slice(body).map_err(AppError::from)
 }
 
 fn content_version_matches_canonical(content_version: &str, canonical_version: &str) -> bool {
@@ -289,7 +289,7 @@ fn url_encode_segment(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{content_version_matches_canonical, ApiClient};
+    use super::{content_version_matches_canonical, parse_game_manifest_body, ApiClient};
     use crate::models::{GamePatchLayer, GamePatchManifestEntry};
 
     #[test]
@@ -331,5 +331,13 @@ mod tests {
     fn release_1_6_11_v2_requires_the_canonical_v1_game_version() {
         assert!(content_version_matches_canonical("1.0.3.4", "1.0.3.4"));
         assert!(!content_version_matches_canonical("1.0.3.4", "1.0.3.16"));
+    }
+
+    #[test]
+    fn malformed_v1_manifest_body_is_invalid_data_not_a_network_error() {
+        let error = parse_game_manifest_body(b"not json")
+            .expect_err("malformed manifest body should be rejected");
+
+        assert_eq!(error.code(), "invalid-data");
     }
 }
