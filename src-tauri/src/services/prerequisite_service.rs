@@ -982,6 +982,10 @@ async fn load_prerequisite_manifest_from_state_probe_for_version(
         }
     }
 
+    let installed_version = installed_version
+        .map(require_known_legacy_version)
+        .transpose()?;
+
     let path = game_root.join(LEGACY_MANIFEST_PATH);
     let bytes = tokio::fs::read(&path).await.map_err(|error| {
         PrerequisiteError::Unsupported(format!(
@@ -991,9 +995,7 @@ async fn load_prerequisite_manifest_from_state_probe_for_version(
     let manifest: GameManifest = serde_json::from_slice(&bytes).map_err(|error| {
         PrerequisiteError::Verification(format!("legacy manifest is invalid: {error}"))
     })?;
-    if installed_version
-        .is_some_and(|version| known_legacy_version(version) && manifest.game_version != version)
-    {
+    if installed_version.is_some_and(|version| manifest.game_version != version) {
         return Err(PrerequisiteError::Verification(format!(
             "legacy prerequisite manifest version {} does not match installed version {}",
             manifest.game_version,
@@ -1006,6 +1008,18 @@ async fn load_prerequisite_manifest_from_state_probe_for_version(
 fn known_legacy_version(version: &str) -> bool {
     let version = version.trim();
     !version.is_empty() && version != "0.0.0"
+}
+
+fn require_known_legacy_version(version: &str) -> Result<&str, PrerequisiteError> {
+    let version = version.trim();
+    if known_legacy_version(version) {
+        Ok(version)
+    } else {
+        Err(PrerequisiteError::Verification(
+            "installed legacy game version is unknown; run a full game update or verification first"
+                .into(),
+        ))
+    }
 }
 
 pub trait LegacyManifestWriter: Send + Sync {
@@ -1028,12 +1042,6 @@ impl LegacyManifestWriter for AtomicLegacyManifestWriter {
     }
 }
 
-pub async fn legacy_manifest_backfill_required(
-    game_root: &Path,
-) -> Result<bool, PrerequisiteError> {
-    legacy_manifest_refresh_required(game_root, "").await
-}
-
 pub async fn legacy_manifest_refresh_required(
     game_root: &Path,
     installed_version: &str,
@@ -1047,6 +1055,7 @@ pub async fn legacy_manifest_refresh_required(
             )));
         }
     }
+    require_known_legacy_version(installed_version)?;
     let path = game_root.join(LEGACY_MANIFEST_PATH);
     match tokio::fs::try_exists(&path).await {
         Ok(false) => Ok(true),
@@ -1063,6 +1072,7 @@ fn legacy_manifest_refresh_from_read(
     installed_version: &str,
     read_result: std::io::Result<Vec<u8>>,
 ) -> Result<bool, PrerequisiteError> {
+    let installed_version = require_known_legacy_version(installed_version)?;
     let bytes = match read_result {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
@@ -1079,18 +1089,7 @@ fn legacy_manifest_refresh_from_read(
     if ActivePrerequisiteManifest::from_legacy(&manifest).is_err() {
         return Ok(true);
     }
-    Ok(
-        known_legacy_version(installed_version)
-            && manifest.game_version != installed_version.trim(),
-    )
-}
-
-pub async fn backfill_legacy_manifest_with_writer(
-    game_root: &Path,
-    manifest: &GameManifest,
-    writer: &dyn LegacyManifestWriter,
-) -> Result<(), PrerequisiteError> {
-    refresh_legacy_manifest_with_writer(game_root, "", manifest, writer).await
+    Ok(manifest.game_version != installed_version)
 }
 
 pub async fn refresh_legacy_manifest_with_writer(
@@ -1100,8 +1099,8 @@ pub async fn refresh_legacy_manifest_with_writer(
     writer: &dyn LegacyManifestWriter,
 ) -> Result<(), PrerequisiteError> {
     ActivePrerequisiteManifest::from_legacy(manifest)?;
-    if known_legacy_version(installed_version) && manifest.game_version != installed_version.trim()
-    {
+    let installed_version = require_known_legacy_version(installed_version)?;
+    if manifest.game_version != installed_version {
         return Err(PrerequisiteError::Verification(format!(
             "full legacy manifest version {} does not match installed version {}",
             manifest.game_version, installed_version
@@ -1111,13 +1110,6 @@ pub async fn refresh_legacy_manifest_with_writer(
         return Ok(());
     }
     writer.store(game_root, manifest).await
-}
-
-pub async fn backfill_legacy_manifest(
-    game_root: &Path,
-    manifest: &GameManifest,
-) -> Result<(), PrerequisiteError> {
-    backfill_legacy_manifest_with_writer(game_root, manifest, &AtomicLegacyManifestWriter).await
 }
 
 pub async fn refresh_legacy_manifest(
@@ -2768,7 +2760,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upgraded_v1_install_backfills_a_complete_manifest_without_reinstalling() {
+    async fn verified_v1_install_persists_a_complete_manifest_without_reinstalling() {
         let directory = tempdir().expect("temporary game directory");
         let manifest = legacy_analysis_manifest(&["game.exe"]);
         fs::write(
@@ -2782,8 +2774,9 @@ mod tests {
         )
         .expect("RevLoader fixture should be written");
 
-        backfill_legacy_manifest_with_writer(
+        refresh_legacy_manifest_with_writer(
             directory.path(),
+            &manifest.game_version,
             &manifest,
             &AtomicLegacyManifestWriter,
         )
@@ -2837,17 +2830,31 @@ mod tests {
             failed: std::sync::atomic::AtomicBool::new(false),
         };
 
-        backfill_legacy_manifest_with_writer(directory.path(), &manifest, &writer)
-            .await
-            .expect_err("first transient write should be reported");
+        refresh_legacy_manifest_with_writer(
+            directory.path(),
+            &manifest.game_version,
+            &manifest,
+            &writer,
+        )
+        .await
+        .expect_err("first transient write should be reported");
         assert!(!directory.path().join(LEGACY_MANIFEST_PATH).exists());
-        backfill_legacy_manifest_with_writer(directory.path(), &manifest, &writer)
-            .await
-            .expect("next ensure should retry the missing sidecar");
+        refresh_legacy_manifest_with_writer(
+            directory.path(),
+            &manifest.game_version,
+            &manifest,
+            &writer,
+        )
+        .await
+        .expect("next ensure should retry the missing sidecar");
         assert!(directory.path().join(LEGACY_MANIFEST_PATH).exists());
         assert!(
             analysis_service(Arc::new(FixedProbe { satisfied: true }))
-                .ensure_active(directory.path(), &CancellationToken::new())
+                .ensure_active_for_version(
+                    directory.path(),
+                    &manifest.game_version,
+                    &CancellationToken::new(),
+                )
                 .await
                 .expect("prerequisite-only retry should proceed without content installation")
                 .ready
@@ -2860,8 +2867,9 @@ mod tests {
         let mut manifest = legacy_analysis_manifest(&["game.exe"]);
         manifest.files.retain(|file| file.path != "RevLoader.exe");
 
-        backfill_legacy_manifest_with_writer(
+        refresh_legacy_manifest_with_writer(
             directory.path(),
+            &manifest.game_version,
             &manifest,
             &AtomicLegacyManifestWriter,
         )
@@ -2995,18 +3003,85 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_initial_v1_version_accepts_an_existing_valid_sidecar() {
+    async fn unknown_v1_generation_cannot_bind_remote_manifest_or_analysis_cache() {
+        let directory = tempdir().expect("temporary game directory");
+        fs::write(
+            directory.path().join("game.exe"),
+            fixture_pe(PeArchitecture::X86, &[]),
+        )
+        .expect("old PE fixture should be written");
+        fs::write(
+            directory.path().join("RevLoader.exe"),
+            fixture_pe(PeArchitecture::X86, &[]),
+        )
+        .expect("RevLoader fixture should be written");
+        let mut remote_manifest = legacy_analysis_manifest(&["game.exe"]);
+        remote_manifest.game_version = "1.0.3.6".into();
+
+        let error = refresh_legacy_manifest_with_writer(
+            directory.path(),
+            "0.0.0",
+            &remote_manifest,
+            &AtomicLegacyManifestWriter,
+        )
+        .await
+        .expect_err("unknown local generation must not bind a remote manifest");
+        assert!(matches!(error, PrerequisiteError::Verification(_)));
+        assert!(!directory.path().join(LEGACY_MANIFEST_PATH).exists());
+        assert!(!directory.path().join(ANALYSIS_PATH).exists());
+
+        fs::write(
+            directory.path().join("game.exe"),
+            fixture_pe(PeArchitecture::X86, &["xinput1_3.dll"]),
+        )
+        .expect("fully verified PE fixture should be written");
+        refresh_legacy_manifest_with_writer(
+            directory.path(),
+            "1.0.3.6",
+            &remote_manifest,
+            &AtomicLegacyManifestWriter,
+        )
+        .await
+        .expect("a fully verified generation may bind its matching manifest");
+
+        let service = analysis_service(Arc::new(FixedProbe { satisfied: false }));
+        let first = service
+            .check_active_for_version(directory.path(), "1.0.3.6", &CancellationToken::new())
+            .await
+            .expect("verified generation should be rescanned");
+        assert!(!first.ready);
+        let cache = fs::read_to_string(directory.path().join(ANALYSIS_PATH))
+            .expect("new-generation analysis should be cached");
+        assert!(cache.contains("xinput1_3.dll"));
+
+        fs::write(directory.path().join("game.exe"), b"not a PE")
+            .expect("fixture should prove the fast guard reuses the new cache");
+        let cached = service
+            .check_active_for_version(directory.path(), "1.0.3.6", &CancellationToken::new())
+            .await
+            .expect("fast guard should use the matching new-generation cache");
+        assert!(!cached.ready);
+    }
+
+    #[tokio::test]
+    async fn unknown_v1_generation_rejects_even_an_existing_valid_sidecar() {
         let directory = tempdir().expect("temporary game directory");
         store_legacy_manifest(directory.path(), &legacy_analysis_manifest(&["game.exe"]))
             .await
-            .expect("initial sidecar should persist");
+            .expect("sidecar fixture should persist");
 
-        assert!(!legacy_manifest_refresh_required(directory.path(), "0.0.0")
-            .await
-            .expect("unknown fresh-install version must not refetch forever"));
-        assert!(!legacy_manifest_refresh_required(directory.path(), "")
-            .await
-            .expect("missing fresh-install version must not refetch forever"));
+        assert!(matches!(
+            legacy_manifest_refresh_required(directory.path(), "0.0.0").await,
+            Err(PrerequisiteError::Verification(_))
+        ));
+        assert!(matches!(
+            analysis_service(Arc::new(FixedProbe { satisfied: true }))
+                .check_active_for_version(directory.path(), "", &CancellationToken::new())
+                .await,
+            Err(PrerequisiteError::Verification(_))
+        ));
+
+        assert!(!directory.path().join(ANALYSIS_PATH).exists());
     }
 
     #[test]
