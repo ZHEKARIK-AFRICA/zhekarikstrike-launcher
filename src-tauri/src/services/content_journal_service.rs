@@ -1,9 +1,13 @@
+use std::cmp::Reverse;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
 use crate::error::AppError;
+use crate::models::validate_game_path;
 use crate::utils::path_utils::safe_join;
 
 const CONTENT_DIRECTORY: &str = ".zhekarik/content";
@@ -15,14 +19,27 @@ pub enum ContentJournalPhase {
     Commit,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentJournalAction {
+    Replace,
+    Remove,
+}
+
+#[derive(Debug, Clone, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContentJournalEntry {
     pub path: String,
+    pub action: ContentJournalAction,
+    #[serde(default, skip_serializing_if = "is_false")]
     pub had_original: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(Debug, Clone, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContentJournal {
     pub schema_version: u8,
@@ -31,6 +48,67 @@ pub struct ContentJournal {
     pub content_sha256: String,
     pub phase: ContentJournalPhase,
     pub files: Vec<ContentJournalEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SerializedContentJournal {
+    schema_version: u8,
+    transaction_id: String,
+    release_id: String,
+    content_sha256: String,
+    phase: ContentJournalPhase,
+    files: Vec<SerializedContentJournalEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SerializedContentJournalEntry {
+    path: String,
+    #[serde(default)]
+    action: Option<ContentJournalAction>,
+    #[serde(default)]
+    had_original: bool,
+}
+
+impl<'de> Deserialize<'de> for ContentJournal {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let serialized = SerializedContentJournal::deserialize(deserializer)?;
+        let files = serialized
+            .files
+            .into_iter()
+            .map(|entry| {
+                let action = match serialized.schema_version {
+                    1 if entry.action.is_none() => ContentJournalAction::Replace,
+                    1 => {
+                        return Err(D::Error::custom(
+                            "schema v1 content journal must not contain actions",
+                        ))
+                    }
+                    2 => entry.action.ok_or_else(|| {
+                        D::Error::custom("schema v2 content journal entry is missing action")
+                    })?,
+                    _ => entry.action.unwrap_or(ContentJournalAction::Replace),
+                };
+                Ok(ContentJournalEntry {
+                    path: entry.path,
+                    action,
+                    had_original: entry.had_original,
+                })
+            })
+            .collect::<Result<Vec<_>, D::Error>>()?;
+        Ok(Self {
+            schema_version: serialized.schema_version,
+            transaction_id: serialized.transaction_id,
+            release_id: serialized.release_id,
+            content_sha256: serialized.content_sha256,
+            phase: serialized.phase,
+            files,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,7 +126,7 @@ pub struct ContentCompletionState {
 
 impl ContentJournal {
     pub fn validate(&self) -> Result<(), AppError> {
-        if self.schema_version != 1
+        if !matches!(self.schema_version, 1 | 2)
             || Uuid::parse_str(&self.transaction_id).is_err()
             || self.content_sha256.len() != 64
             || !self
@@ -58,7 +136,27 @@ impl ContentJournal {
         {
             return Err(AppError::InvalidData("invalid content journal".into()));
         }
+        let mut paths = HashSet::new();
         for entry in &self.files {
+            if self.schema_version == 1 && entry.action != ContentJournalAction::Replace {
+                return Err(AppError::InvalidData("invalid content journal".into()));
+            }
+            validate_game_path(&entry.path)?;
+            if entry
+                .path
+                .split('/')
+                .next()
+                .is_some_and(|part| part.eq_ignore_ascii_case(".zhekarik"))
+            {
+                return Err(AppError::InvalidData(
+                    "content journal path targets launcher state".into(),
+                ));
+            }
+            if !paths.insert(entry.path.to_ascii_lowercase()) {
+                return Err(AppError::InvalidData(
+                    "content journal contains duplicate paths".into(),
+                ));
+            }
             safe_join(Path::new("."), &entry.path)?;
         }
         Ok(())
@@ -87,6 +185,11 @@ pub fn backup_path(game_path: &Path, transaction_id: &str) -> PathBuf {
 
 pub async fn write_journal(game_path: &Path, journal: &ContentJournal) -> Result<(), AppError> {
     journal.validate()?;
+    if journal.schema_version != 2 {
+        return Err(AppError::InvalidData(
+            "new content journals must use schema v2".into(),
+        ));
+    }
     atomic_json(&journal_path(game_path), journal).await
 }
 
@@ -111,6 +214,8 @@ pub async fn recover_pending_content(game_path: &Path) -> Result<bool, AppError>
         });
     if !committed {
         recover_interrupted_commit(game_path, &journal).await?;
+    } else {
+        remove_empty_obsolete_directories(game_path, &journal).await?;
     }
     cleanup_transaction(game_path, &journal.transaction_id).await?;
     remove_file_if_exists(&path).await?;
@@ -141,16 +246,64 @@ pub async fn recover_interrupted_commit(
     for entry in journal.files.iter().rev() {
         let target = safe_join(game_path, &entry.path)?;
         let backup = safe_join(&backup_root, &entry.path)?;
-        if entry.had_original {
-            if tokio::fs::try_exists(&backup).await.unwrap_or(false) {
+        match entry.action {
+            ContentJournalAction::Replace if entry.had_original => {
+                if !tokio::fs::try_exists(&backup).await.unwrap_or(false) {
+                    continue;
+                }
                 remove_path_if_exists(&target).await?;
                 if let Some(parent) = target.parent() {
                     tokio::fs::create_dir_all(parent).await?;
                 }
                 tokio::fs::rename(&backup, &target).await?;
             }
-        } else {
-            remove_path_if_exists(&target).await?;
+            ContentJournalAction::Replace => remove_path_if_exists(&target).await?,
+            ContentJournalAction::Remove => {
+                if !tokio::fs::try_exists(&backup).await.unwrap_or(false) {
+                    continue;
+                }
+                remove_path_if_exists(&target).await?;
+                if let Some(parent) = target.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                tokio::fs::rename(&backup, &target).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub async fn remove_empty_obsolete_directories(
+    game_path: &Path,
+    journal: &ContentJournal,
+) -> Result<(), AppError> {
+    let mut directories = HashSet::new();
+    for entry in journal
+        .files
+        .iter()
+        .filter(|entry| entry.action == ContentJournalAction::Remove)
+    {
+        let target = safe_join(game_path, &entry.path)?;
+        let mut parent = target.parent();
+        while let Some(directory) = parent {
+            if directory == game_path || !directory.starts_with(game_path) {
+                break;
+            }
+            directories.insert(directory.to_path_buf());
+            parent = directory.parent();
+        }
+    }
+    let mut directories = directories.into_iter().collect::<Vec<_>>();
+    directories.sort_by_key(|directory| Reverse(directory.components().count()));
+    for directory in directories {
+        match tokio::fs::remove_dir(&directory).await {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                ) => {}
+            Err(error) => return Err(error.into()),
         }
     }
     Ok(())

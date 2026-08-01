@@ -27,8 +27,9 @@ use crate::services::content_download_service::{
 use crate::services::content_journal_service::{
     atomic_json, backup_path, cleanup_transaction, content_root, journal_path,
     load_completion_state, recover_interrupted_commit, recover_pending_content,
-    remove_directory_if_exists, remove_file_if_exists, staging_path, state_path, write_journal,
-    ContentCompletionState, ContentJournal, ContentJournalEntry, ContentJournalPhase,
+    remove_empty_obsolete_directories, remove_file_if_exists, staging_path, state_path,
+    write_journal, ContentCompletionState, ContentJournal, ContentJournalAction,
+    ContentJournalEntry, ContentJournalPhase,
 };
 use crate::services::disk_service::ensure_disk_space;
 use crate::services::verify_hash_service::{
@@ -276,7 +277,8 @@ pub fn required_content_install_bytes(
     manifest: &ContentManifest,
     available_raw_chunks: &HashSet<String>,
     staged_bytes: u64,
-    backup_bytes: u64,
+    replacement_backup_bytes: u64,
+    obsolete_backup_bytes: u64,
     safety_reserve: u64,
 ) -> Result<u64, AppError> {
     let missing_download = manifest
@@ -288,13 +290,18 @@ pub fn required_content_install_bytes(
                 .checked_add(chunk.compressed_size)
                 .ok_or_else(|| AppError::InvalidData("content disk requirement overflow".into()))
         })?;
-    [staged_bytes, backup_bytes, safety_reserve]
-        .into_iter()
-        .try_fold(missing_download, |total, value| {
-            total
-                .checked_add(value)
-                .ok_or_else(|| AppError::InvalidData("content disk requirement overflow".into()))
-        })
+    [
+        staged_bytes,
+        replacement_backup_bytes,
+        obsolete_backup_bytes,
+        safety_reserve,
+    ]
+    .into_iter()
+    .try_fold(missing_download, |total, value| {
+        total
+            .checked_add(value)
+            .ok_or_else(|| AppError::InvalidData("content disk requirement overflow".into()))
+    })
 }
 
 pub fn conservative_content_install_bytes(
@@ -306,6 +313,7 @@ pub fn conservative_content_install_bytes(
         &HashSet::new(),
         manifest.unpacked_size,
         backup_bytes,
+        0,
         INSTALL_SAFETY_RESERVE,
     )
 }
@@ -329,6 +337,10 @@ pub async fn estimate_existing_backup_bytes(
                 .ok_or_else(|| AppError::InvalidData("content backup size overflow".into()))?;
         }
     }
+    let obsolete = load_obsolete_content_entries(game_path, manifest).await?;
+    total = total
+        .checked_add(obsolete_existing_backup_bytes(game_path, &obsolete).await?)
+        .ok_or_else(|| AppError::InvalidData("content backup size overflow".into()))?;
     Ok(total)
 }
 
@@ -357,6 +369,7 @@ pub async fn install_or_update_content(
     let progress = ProgressEmitter::new(app, event_name, operation_id);
     progress.emit_stage(ProgressStage::Checking, Some(0.0), None)?;
     let previous = load_previous_manifest(&game_path).await?;
+    let obsolete = obsolete_content_entries(previous.as_ref(), &manifest)?;
     let prepared = files_requiring_materialization(
         &game_path,
         &manifest,
@@ -420,16 +433,18 @@ pub async fn install_or_update_content(
             .checked_add(prepared.file.size)
             .ok_or_else(|| AppError::InvalidData("content staging size overflow".into()))
     })?;
-    let backup_bytes = prepared.iter().try_fold(0_u64, |total, prepared| {
+    let replacement_backup_bytes = prepared.iter().try_fold(0_u64, |total, prepared| {
         total
             .checked_add(prepared.original_size)
             .ok_or_else(|| AppError::InvalidData("content backup size overflow".into()))
     })?;
+    let obsolete_backup_bytes = obsolete_existing_backup_bytes(&game_path, &obsolete).await?;
     let required_bytes = required_content_install_bytes(
         &manifest,
         &available,
         staged_bytes,
-        backup_bytes,
+        replacement_backup_bytes,
+        obsolete_backup_bytes,
         INSTALL_SAFETY_RESERVE,
     )?;
     ensure_disk_space(&game_path, required_bytes)?;
@@ -439,11 +454,13 @@ pub async fn install_or_update_content(
         .iter()
         .map(|prepared| ContentJournalEntry {
             path: prepared.file.path.clone(),
+            action: ContentJournalAction::Replace,
             had_original: prepared.had_original,
         })
+        .chain(obsolete)
         .collect::<Vec<_>>();
     let mut journal = ContentJournal {
-        schema_version: 1,
+        schema_version: 2,
         transaction_id: transaction_id.clone(),
         release_id: manifest.release_id.clone(),
         content_sha256: manifest.content_sha256.clone(),
@@ -510,9 +527,11 @@ pub async fn install_or_update_content(
             "committed content but could not save its display version: {error}"
         ));
     }
-    cleanup_transaction(&game_path, &transaction_id).await.ok();
-    remove_directory_if_exists(&chunk_directory).await.ok();
-    remove_file_if_exists(&journal_path(&game_path)).await.ok();
+    if let Err(error) = finalize_committed_transaction(&game_path, &journal).await {
+        crate::logger::warn(&format!(
+            "committed content but could not clean its transaction; recovery will retry: {error}"
+        ));
+    }
     if !prepared.is_empty() {
         progress.emit_stage(ProgressStage::Install, Some(100.0), None)?;
     }
@@ -561,6 +580,70 @@ async fn load_previous_manifest(game_path: &Path) -> Result<Option<ContentManife
         return Ok(None);
     }
     Ok(Some(manifest))
+}
+
+pub(crate) async fn load_obsolete_content_entries(
+    game_path: &Path,
+    manifest: &ContentManifest,
+) -> Result<Vec<ContentJournalEntry>, AppError> {
+    manifest.validate()?;
+    let previous = load_previous_manifest(game_path).await?;
+    obsolete_content_entries(previous.as_ref(), manifest)
+}
+
+fn obsolete_content_entries(
+    previous: Option<&ContentManifest>,
+    manifest: &ContentManifest,
+) -> Result<Vec<ContentJournalEntry>, AppError> {
+    let Some(previous) = previous else {
+        return Ok(Vec::new());
+    };
+    previous.validate()?;
+    manifest.validate()?;
+    let retained = manifest
+        .files
+        .iter()
+        .map(|file| file.path.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    Ok(previous
+        .files
+        .iter()
+        .filter(|file| !retained.contains(&file.path.to_ascii_lowercase()))
+        .map(|file| ContentJournalEntry {
+            path: file.path.clone(),
+            action: ContentJournalAction::Remove,
+            had_original: false,
+        })
+        .collect())
+}
+
+async fn obsolete_existing_backup_bytes(
+    game_path: &Path,
+    entries: &[ContentJournalEntry],
+) -> Result<u64, AppError> {
+    let mut total = 0_u64;
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.action == ContentJournalAction::Remove)
+    {
+        let target = safe_join(game_path, &entry.path)?;
+        match tokio::fs::symlink_metadata(target).await {
+            Ok(metadata) if !metadata.is_dir() => {
+                total = total
+                    .checked_add(metadata.len())
+                    .ok_or_else(|| AppError::InvalidData("content backup size overflow".into()))?;
+            }
+            Ok(_) => {
+                return Err(AppError::InvalidData(format!(
+                    "managed obsolete content path is not a file: {}",
+                    entry.path
+                )))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(total)
 }
 
 async fn files_requiring_materialization(
@@ -1192,7 +1275,23 @@ pub(crate) async fn wait_until_chunk_ready(
     }
 }
 
-async fn commit_staged_files(
+pub(crate) async fn cleanup_obsolete_directories(
+    game_path: &Path,
+    journal: &ContentJournal,
+) -> Result<(), AppError> {
+    remove_empty_obsolete_directories(game_path, journal).await
+}
+
+async fn finalize_committed_transaction(
+    game_path: &Path,
+    journal: &ContentJournal,
+) -> Result<(), AppError> {
+    cleanup_obsolete_directories(game_path, journal).await?;
+    cleanup_transaction(game_path, &journal.transaction_id).await?;
+    remove_file_if_exists(&journal_path(game_path)).await
+}
+
+pub(crate) async fn commit_staged_files(
     game_path: &Path,
     staging: &Path,
     journal: &ContentJournal,
@@ -1200,18 +1299,38 @@ async fn commit_staged_files(
     let backup = backup_path(game_path, &journal.transaction_id);
     for entry in &journal.files {
         let target = safe_join(game_path, &entry.path)?;
-        let staged = safe_join(staging, &entry.path)?;
-        if entry.had_original {
-            let backup_file = safe_join(&backup, &entry.path)?;
-            if let Some(parent) = backup_file.parent() {
-                tokio::fs::create_dir_all(parent).await?;
+        let backup_file = safe_join(&backup, &entry.path)?;
+        match entry.action {
+            ContentJournalAction::Replace => {
+                let staged = safe_join(staging, &entry.path)?;
+                if entry.had_original {
+                    if let Some(parent) = backup_file.parent() {
+                        tokio::fs::create_dir_all(parent).await?;
+                    }
+                    tokio::fs::rename(&target, &backup_file).await?;
+                }
+                if let Some(parent) = target.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                tokio::fs::rename(&staged, &target).await?;
             }
-            tokio::fs::rename(&target, &backup_file).await?;
+            ContentJournalAction::Remove => match tokio::fs::symlink_metadata(&target).await {
+                Ok(metadata) if !metadata.is_dir() => {
+                    if let Some(parent) = backup_file.parent() {
+                        tokio::fs::create_dir_all(parent).await?;
+                    }
+                    tokio::fs::rename(&target, &backup_file).await?;
+                }
+                Ok(_) => {
+                    return Err(AppError::InvalidData(format!(
+                        "managed obsolete content path is not a file: {}",
+                        entry.path
+                    )))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            },
         }
-        if let Some(parent) = target.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        tokio::fs::rename(&staged, &target).await?;
     }
     Ok(())
 }
