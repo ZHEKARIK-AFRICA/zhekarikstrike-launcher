@@ -196,6 +196,9 @@ impl ContentManifest {
             }
         }
         for file in &self.files {
+            if !file.path.is_ascii() {
+                return invalid("content manifest paths must be ASCII");
+            }
             validate_game_path(&file.path)?;
             if !paths.insert(file.path.to_ascii_lowercase()) {
                 return invalid("duplicate content file path");
