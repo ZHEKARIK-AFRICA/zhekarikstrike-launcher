@@ -614,6 +614,7 @@ async fn load_previous_manifest(game_path: &Path) -> Result<Option<ContentManife
     Ok(Some(manifest))
 }
 
+#[cfg(test)]
 pub(crate) async fn load_obsolete_content_entries(
     game_path: &Path,
     manifest: &ContentManifest,

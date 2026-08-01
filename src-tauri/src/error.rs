@@ -143,6 +143,22 @@ impl From<tauri::Error> for AppError {
     }
 }
 
+impl From<crate::services::prerequisite_service::PrerequisiteError> for AppError {
+    fn from(value: crate::services::prerequisite_service::PrerequisiteError) -> Self {
+        use crate::services::prerequisite_service::PrerequisiteError;
+        match value {
+            PrerequisiteError::Download(message) => Self::PrerequisiteDownload(message),
+            PrerequisiteError::Verification(message) => Self::PrerequisiteVerification(message),
+            PrerequisiteError::Install(message) => Self::PrerequisiteInstall(message),
+            PrerequisiteError::RestartRequired(message) => {
+                Self::PrerequisiteRestartRequired(message)
+            }
+            PrerequisiteError::Unsupported(message) => Self::PrerequisiteUnsupported(message),
+            PrerequisiteError::Canceled => Self::Canceled,
+        }
+    }
+}
+
 #[cfg(test)]
 mod release_1_6_11_tests {
     use super::AppError;
@@ -182,22 +198,6 @@ mod release_1_6_11_tests {
         for (error, expected) in cases {
             assert_eq!(error.code(), expected);
             assert!(error.frontend_error().message.contains(':'));
-        }
-    }
-}
-
-impl From<crate::services::prerequisite_service::PrerequisiteError> for AppError {
-    fn from(value: crate::services::prerequisite_service::PrerequisiteError) -> Self {
-        use crate::services::prerequisite_service::PrerequisiteError;
-        match value {
-            PrerequisiteError::Download(message) => Self::PrerequisiteDownload(message),
-            PrerequisiteError::Verification(message) => Self::PrerequisiteVerification(message),
-            PrerequisiteError::Install(message) => Self::PrerequisiteInstall(message),
-            PrerequisiteError::RestartRequired(message) => {
-                Self::PrerequisiteRestartRequired(message)
-            }
-            PrerequisiteError::Unsupported(message) => Self::PrerequisiteUnsupported(message),
-            PrerequisiteError::Canceled => Self::Canceled,
         }
     }
 }

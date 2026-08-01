@@ -1822,7 +1822,7 @@ fn windows_file_version(path: &Path) -> Result<Option<String>, PrerequisiteError
             return Ok(None);
         }
         let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        return Ok((!value.is_empty()).then_some(value));
+        Ok((!value.is_empty()).then_some(value))
     }
     #[cfg(not(windows))]
     {
@@ -1916,7 +1916,7 @@ fn signer_subject(path: &Path) -> Result<String, PrerequisiteError> {
         if !output.status.success() {
             return verification("installer has no readable Authenticode signer");
         }
-        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
     #[cfg(not(windows))]
     {
@@ -2631,7 +2631,7 @@ mod tests {
             vc.sha256,
             "99dce3c841cc6028560830f7866c9ce2928c98cf3256892ef8e6cf755147b0d8"
         );
-        assert_eq!(vc.required_version.as_deref(), Some("10.0.40219.325"));
+        assert_eq!(vc.required_version, Some("10.0.40219.325"));
 
         let directx = catalog_component("directx-june-2010").unwrap();
         assert_eq!(directx.size, 100_271_992);

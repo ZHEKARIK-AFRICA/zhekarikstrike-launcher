@@ -729,14 +729,18 @@ async fn restore_backup(
     guarded_content_rename(game_path, backup, target, hooks).await
 }
 
+struct ContentReleaseBinding<'a> {
+    content_sha256: &'a str,
+    release_id: &'a str,
+}
+
 async fn rollback_replace_entry(
     game_path: &Path,
     staging_root: &Path,
     backup_root: &Path,
     entry: &ContentJournalEntry,
     schema_version: u8,
-    content_sha256: &str,
-    release_id: &str,
+    binding: &ContentReleaseBinding<'_>,
     hooks: &dyn ContentFsHooks,
 ) -> Result<(), AppError> {
     let target = safe_join(game_path, &entry.path)?;
@@ -861,8 +865,8 @@ async fn rollback_replace_entry(
     if schema_version == 1 {
         let target_expected = load_trusted_legacy_target_identity(
             game_path,
-            content_sha256,
-            release_id,
+            binding.content_sha256,
+            binding.release_id,
             &entry.path,
             hooks,
         )
@@ -1027,6 +1031,10 @@ async fn rollback_content_transaction_with_hooks(
     let schema_version = journal.schema_version;
     let staging_root = staging_path(game_path, &journal.transaction_id);
     let backup_root = backup_path(game_path, &journal.transaction_id);
+    let binding = ContentReleaseBinding {
+        content_sha256: &journal.content_sha256,
+        release_id: &journal.release_id,
+    };
     for entry in journal.files.iter().rev() {
         match entry.action {
             ContentJournalAction::Replace => {
@@ -1036,8 +1044,7 @@ async fn rollback_content_transaction_with_hooks(
                     &backup_root,
                     entry,
                     schema_version,
-                    &journal.content_sha256,
-                    &journal.release_id,
+                    &binding,
                     hooks,
                 )
                 .await?;
