@@ -74,18 +74,31 @@ function restoreOperation(operation) {
     return true;
 }
 
+async function acknowledgePrerequisite(operationId) {
+    if (!operationId) return false;
+    try {
+        return await invoke('acknowledge_prerequisite_state', { operationId });
+    } catch (error) {
+        console.error('Failed to acknowledge prerequisite state:', error);
+        return false;
+    }
+}
+
 async function handlePrerequisiteTerminal(prerequisite) {
     if (prerequisite?.outcome === 'failed') {
         status.fail('status.prerequisite_failed');
         handleError(null, prerequisite.error);
+        await acknowledgePrerequisite(prerequisite.operationId);
         return true;
     }
     if (prerequisite?.outcome === 'canceled') {
         status.cancel('status.launch_canceled');
+        await acknowledgePrerequisite(prerequisite.operationId);
         return true;
     }
     if (prerequisite?.outcome === 'succeeded') {
         await syncIdleState();
+        await acknowledgePrerequisite(prerequisite.operationId);
         return true;
     }
     return false;
@@ -155,8 +168,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         try {
             const pendingPrerequisiteError = sessionStorage.getItem('pending-prerequisite-error');
             if (pendingPrerequisiteError) {
+                const handoff = JSON.parse(pendingPrerequisiteError);
+                handleError(null, handoff.error || handoff);
                 sessionStorage.removeItem('pending-prerequisite-error');
-                handleError(null, JSON.parse(pendingPrerequisiteError));
+                await acknowledgePrerequisite(handoff.operationId);
             }
         } catch (error) {
             sessionStorage.removeItem('pending-prerequisite-error');
@@ -196,18 +211,17 @@ playButton?.addEventListener('click', async () => {
             step: 'detecting', statusKey: 'status.prerequisite_detecting', operationId
         });
         const prerequisites = await invoke('ensure_game_prerequisites', { operationId });
-        await invoke('get_prerequisite_state');
         if (!prerequisites?.ready) {
             throw {
                 code: 'prerequisite_restart_required',
                 message: 'Installed prerequisites require a Windows restart.'
             };
         }
-
         failureKey = 'status.launch_settings_failed';
         status.beginStep({
             step: 'launch-settings', statusKey: 'status.saving_launch_settings'
         });
+        await acknowledgePrerequisite(operationId);
         await invoke('update_rev_ini', {
             launchParams: document.getElementById('launch-params').value,
             clanTag: document.getElementById('clan-tag').value,
@@ -219,9 +233,6 @@ playButton?.addEventListener('click', async () => {
         status.beginStep({ step: 'prepare-game', statusKey: 'status.preparing_game', operationId });
         await invoke('launch_game', { operationId });
     } catch (error) {
-        if (String(error?.code || '').startsWith('prerequisite_')) {
-            try { await invoke('get_prerequisite_state'); } catch (_) { /* preserve original */ }
-        }
         if (error?.code === 'canceled') {
             status.cancel('status.launch_canceled');
         } else if (error?.code === 'game_already_running') {
@@ -235,6 +246,7 @@ playButton?.addEventListener('click', async () => {
             if (prerequisiteFailure) handleError(null, error);
             else handleError(null, error, { contextKey: failureKey });
         }
+        await acknowledgePrerequisite(operationId);
     }
 });
 

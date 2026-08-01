@@ -83,8 +83,11 @@ describe('install prerequisite flow', () => {
             expect(navigateToPage).toHaveBeenCalledWith('./public/index.html');
             expect(JSON.parse(sessionStorage.getItem('pending-prerequisite-error')))
                 .toMatchObject({
-                    code: 'prerequisite_install_failed',
-                    message: expect.stringContaining('code 1603')
+                    operationId: expect.any(String),
+                    error: {
+                        code: 'prerequisite_install_failed',
+                        message: expect.stringContaining('code 1603')
+                    }
                 });
         });
     });
@@ -166,7 +169,10 @@ describe('install prerequisite flow', () => {
 
         expect(navigateToPage).toHaveBeenCalledWith('./public/index.html');
         expect(JSON.parse(sessionStorage.getItem('pending-prerequisite-error')))
-            .toMatchObject({ code: 'prerequisite_verification_failed' });
+            .toMatchObject({
+                operationId: 'failed',
+                error: { code: 'prerequisite_verification_failed' }
+            });
     });
 
     it('restores a canceled prerequisite terminal on install reload', async () => {
@@ -205,5 +211,43 @@ describe('install prerequisite flow', () => {
         await loadRenderer();
 
         expect(navigateToPage).toHaveBeenCalledWith('./public/index.html');
+    });
+
+    it('persists a failed handoff before ack and resumes routing after a reload', async () => {
+        let acknowledgeCalls = 0;
+        invoke.mockImplementation(async (command, args) => {
+            if (command === 'get_language') return 'en';
+            if (command === 'get_current_state') return { operation: 'idle' };
+            if (command === 'get_prerequisite_state') return {
+                active: false, operationId: 'race', outcome: 'failed',
+                error: {
+                    code: 'prerequisite_verification_failed',
+                    message: 'Prerequisite verification failed: durable race detail', details: null
+                }
+            };
+            if (command === 'acknowledge_prerequisite_state') {
+                expect(args).toEqual({ operationId: 'race' });
+                acknowledgeCalls += 1;
+                return new Promise(() => {});
+            }
+            if (command === 'get_game_path') return 'C:\\Game';
+            if (command === 'recover_pending_install') return { recovered: false };
+            return null;
+        });
+
+        await loadRenderer();
+        await vi.waitFor(() => expect(acknowledgeCalls).toBe(1));
+        expect(JSON.parse(sessionStorage.getItem('pending-prerequisite-error')))
+            .toMatchObject({
+                operationId: 'race',
+                error: { code: 'prerequisite_verification_failed' }
+            });
+        expect(navigateToPage).not.toHaveBeenCalled();
+
+        renderInstallPage();
+        await loadRenderer();
+        await vi.waitFor(() => {
+            expect(navigateToPage).toHaveBeenCalledWith('./public/index.html');
+        });
     });
 });

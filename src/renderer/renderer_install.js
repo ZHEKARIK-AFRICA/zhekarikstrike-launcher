@@ -46,23 +46,43 @@ function stopStatePolling() {
     statePoll = null;
 }
 
+async function acknowledgePrerequisite(operationId) {
+    if (!operationId) return false;
+    try {
+        return await invoke('acknowledge_prerequisite_state', { operationId });
+    } catch (error) {
+        console.error('Failed to acknowledge prerequisite state:', error);
+        return false;
+    }
+}
+
 async function handlePrerequisiteTerminal(prerequisite) {
     if (prerequisite?.outcome === 'failed') {
         try {
-            sessionStorage.setItem('pending-prerequisite-error', JSON.stringify(prerequisite.error));
+            sessionStorage.setItem('pending-prerequisite-error', JSON.stringify({
+                operationId: prerequisite.operationId,
+                error: prerequisite.error
+            }));
         } catch (error) {
             console.error('Failed to carry prerequisite error to the main page:', error);
+            status.fail('status.prerequisite_failed');
+            handleError(null, prerequisite.error);
+            return true;
         }
+        await acknowledgePrerequisite(prerequisite.operationId);
         await navigateToPage('./public/index.html');
         return true;
     }
     if (prerequisite?.outcome === 'canceled') {
         installing = false;
         status.cancel('status.installation_canceled');
+        await acknowledgePrerequisite(prerequisite.operationId);
         return true;
     }
     if (prerequisite?.outcome === 'succeeded') {
         installing = false;
+        status.succeed('status.installation_complete');
+        await acknowledgePrerequisite(prerequisite.operationId);
         await navigateToPage('./public/index.html');
         return true;
     }
@@ -146,6 +166,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         await initializeLanguage();
         status.rerender();
         const current = await invoke('get_current_state');
+        if (sessionStorage.getItem('pending-prerequisite-error')) {
+            await navigateToPage('./public/index.html');
+            return;
+        }
         const prerequisite = await invoke('get_prerequisite_state');
         const terminal = await handlePrerequisiteTerminal(prerequisite);
         const restored = terminal || await restoreCurrentOperation(current.operation, prerequisite);
@@ -182,27 +206,35 @@ startInstallButton?.addEventListener('click', async () => {
     });
     try {
         await invoke('install_game', { gamePath, operationId });
-        await invoke('get_prerequisite_state');
         status.succeed('status.installation_complete');
+        await acknowledgePrerequisite(operationId);
         document.body.classList.remove('fade-in');
         document.body.classList.add('fade-out');
         await navigateToPage('./public/index.html');
     } catch (error) {
         if (error?.code === 'canceled') {
             status.cancel('status.installation_canceled');
+            await acknowledgePrerequisite(operationId);
         } else if (String(error?.code || '').startsWith('prerequisite_')) {
             status.fail('status.prerequisite_failed');
             handleError(null, error);
             let carriedError = error;
+            let carriedOperationId = operationId;
             try {
                 const terminal = await invoke('get_prerequisite_state');
                 carriedError = terminal?.error || error;
+                carriedOperationId = terminal?.operationId || operationId;
             } catch (_) { /* preserve original */ }
             try {
-                sessionStorage.setItem('pending-prerequisite-error', JSON.stringify(carriedError));
+                sessionStorage.setItem('pending-prerequisite-error', JSON.stringify({
+                    operationId: carriedOperationId,
+                    error: carriedError
+                }));
             } catch (storageError) {
                 console.error('Failed to carry prerequisite error to the main page:', storageError);
+                return;
             }
+            await acknowledgePrerequisite(carriedOperationId);
             await navigateToPage('./public/index.html');
         } else {
             status.fail('status.installation_failed');

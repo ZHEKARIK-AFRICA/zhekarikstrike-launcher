@@ -174,14 +174,20 @@ describe('main renderer Tauri command contracts', () => {
 
     it('shows the exact prerequisite error carried from the install page', async () => {
         sessionStorage.setItem('pending-prerequisite-error', JSON.stringify({
-            code: 'prerequisite_install_failed',
-            message: 'Prerequisite install failed: installer exited with code 1603'
+            operationId: 'handoff',
+            error: {
+                code: 'prerequisite_install_failed',
+                message: 'Prerequisite install failed: installer exited with code 1603'
+            }
         }));
         await loadRenderer();
 
         expect(document.getElementById('error-technical-message').textContent)
             .toContain('installer exited with code 1603');
         expect(sessionStorage.getItem('pending-prerequisite-error')).toBeNull();
+        expect(invoke).toHaveBeenCalledWith(
+            'acknowledge_prerequisite_state', { operationId: 'handoff' }
+        );
     });
 
     it('preserves the localized prerequisite restart message after game-starting', async () => {
@@ -286,6 +292,49 @@ describe('main renderer Tauri command contracts', () => {
         await loadRenderer();
 
         expect(document.getElementById('launcher-status').textContent).toBe('ready to launch!');
+    });
+
+    it('re-delivers a terminal after reload between peek and acknowledgement', async () => {
+        const terminal = {
+            active: false, operationId: 'race', outcome: 'failed',
+            error: {
+                code: 'prerequisite_install_failed',
+                message: 'Prerequisite install failed: durable race detail', details: null
+            }
+        };
+        let acknowledgeCalls = 0;
+        let terminalPresent = true;
+        invoke.mockImplementation(async (command, args) => {
+            if (command === 'get_language') return 'en';
+            if (command === 'get_current_state') return { operation: 'idle' };
+            if (command === 'get_prerequisite_state') {
+                return terminalPresent ? terminal : { active: false, outcome: 'none' };
+            }
+            if (command === 'acknowledge_prerequisite_state') {
+                expect(args).toEqual({ operationId: 'race' });
+                acknowledgeCalls += 1;
+                if (acknowledgeCalls === 1) return new Promise(() => {});
+                terminalPresent = false;
+                return true;
+            }
+            if (command === 'recover_pending_install') return { recovered: false };
+            if (command === 'get_game_data') {
+                return { nickname: '', clanTag: '', launchParams: '', gamePath: 'C:\Game' };
+            }
+            if (command === 'get_game_process_state') return { kind: 'stopped', pid: null };
+            return null;
+        });
+
+        await loadRenderer();
+        await vi.waitFor(() => expect(acknowledgeCalls).toBe(1));
+        expect(document.getElementById('error-technical-message').textContent)
+            .toContain('durable race detail');
+
+        renderMainPage();
+        await loadRenderer();
+        await vi.waitFor(() => expect(acknowledgeCalls).toBe(2));
+        expect(document.getElementById('error-technical-message').textContent)
+            .toContain('durable race detail');
     });
 
     it('release_1_6_12_replaces_searching_updates_with_a_terminal_network_error', async () => {

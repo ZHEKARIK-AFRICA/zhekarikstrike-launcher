@@ -5,9 +5,11 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::error::AppError;
 use crate::models::validated_operation_id;
+use crate::services::api_client::ApiClient;
 use crate::services::config_service;
 use crate::services::prerequisite_service::{
-    EnsurePrerequisitesResult, PrerequisiteService, PrerequisiteServiceProgress, RestartStatus,
+    backfill_legacy_manifest, legacy_manifest_backfill_required, EnsurePrerequisitesResult,
+    PrerequisiteService, PrerequisiteServiceProgress, RestartStatus,
 };
 use crate::state::{
     AppState, CancellationSlot, OperationKind, PrerequisiteOperationState, PrerequisiteOutcome,
@@ -99,7 +101,12 @@ pub async fn ensure_game_prerequisites(
 
 #[tauri::command]
 pub fn get_prerequisite_state(state: State<'_, AppState>) -> PrerequisiteOperationState {
-    state.consume_prerequisite_state()
+    state.prerequisite_state()
+}
+
+#[tauri::command]
+pub fn acknowledge_prerequisite_state(state: State<'_, AppState>, operation_id: String) -> bool {
+    state.acknowledge_prerequisite_state(&operation_id)
 }
 
 pub(crate) async fn ensure_game_prerequisites_inner(
@@ -144,6 +151,10 @@ pub(crate) async fn ensure_game_prerequisites_inner(
             let game_path = config_service::get_game_path()
                 .await?
                 .ok_or(AppError::GamePathNotSet)?;
+            if legacy_manifest_backfill_required(&game_path).await? {
+                let manifest = ApiClient::new()?.get_full_manifest().await?;
+                backfill_legacy_manifest(&game_path, &manifest).await?;
+            }
             let service = PrerequisiteService::windows_with_progress(callback)?;
             Ok(service.ensure_active(&game_path, &cancel).await?.into())
         }

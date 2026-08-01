@@ -14,7 +14,6 @@ use crate::services::disk_service::ensure_disk_space;
 use crate::services::download_service::download_file;
 use crate::services::elevation_service;
 use crate::services::manifest_service::VerifyMode;
-use crate::services::prerequisite_service;
 use crate::services::verify_service::verify_game_files;
 
 fn required_install_bytes(archive_size: u64, unpacked_size: u64) -> Result<u64, AppError> {
@@ -101,7 +100,6 @@ pub async fn install_game(
     )
     .await?;
 
-    prerequisite_service::store_legacy_manifest(&game_path, &manifest).await?;
     if let Err(error) = config_service::set_game_version("0.0.0".to_string()).await {
         crate::logger::warn(&format!(
             "installed legacy content but could not save its version: {error}"

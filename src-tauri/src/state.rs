@@ -171,18 +171,23 @@ impl AppState {
         cancel_slot(&self.prerequisite_cancel_token)
     }
 
-    pub fn consume_prerequisite_state(&self) -> PrerequisiteOperationState {
+    pub fn prerequisite_state(&self) -> PrerequisiteOperationState {
+        lock_unpoisoned(&self.prerequisite_state).clone()
+    }
+
+    pub fn acknowledge_prerequisite_state(&self, operation_id: &str) -> bool {
         let mut state = lock_unpoisoned(&self.prerequisite_state);
-        let snapshot = state.clone();
-        if matches!(
-            snapshot.outcome,
+        let terminal = matches!(
+            state.outcome,
             PrerequisiteOutcome::Succeeded
                 | PrerequisiteOutcome::Failed
                 | PrerequisiteOutcome::Canceled
-        ) {
-            *state = PrerequisiteOperationState::default();
+        );
+        if !terminal || state.operation_id.as_deref() != Some(operation_id) {
+            return false;
         }
-        snapshot
+        *state = PrerequisiteOperationState::default();
+        true
     }
 
     pub fn begin_prerequisite_operation(&self, operation_id: &str) {
@@ -496,7 +501,7 @@ mod tests {
     }
 
     #[test]
-    fn prerequisite_terminal_outcome_is_keyed_and_consumed_once() {
+    fn prerequisite_terminal_outcome_is_peeked_until_matching_acknowledgement() {
         let state = AppState::new();
         state.begin_prerequisite_operation("operation-1");
         state.finish_prerequisite_failure(
@@ -504,7 +509,7 @@ mod tests {
             AppError::PrerequisiteInstall("exit 1603".into()).frontend_error(),
         );
 
-        let terminal = state.consume_prerequisite_state();
+        let terminal = state.prerequisite_state();
         assert_eq!(terminal.operation_id.as_deref(), Some("operation-1"));
         assert_eq!(terminal.outcome, PrerequisiteOutcome::Failed);
         assert_eq!(
@@ -512,8 +517,36 @@ mod tests {
             Some("prerequisite_install_failed")
         );
         assert_eq!(
-            state.consume_prerequisite_state().outcome,
+            state.prerequisite_state().outcome,
+            PrerequisiteOutcome::Failed
+        );
+        assert!(state.acknowledge_prerequisite_state("operation-1"));
+        assert_eq!(
+            state.prerequisite_state().outcome,
             PrerequisiteOutcome::None
+        );
+    }
+
+    #[test]
+    fn stale_acknowledgement_never_clears_a_newer_or_running_operation() {
+        let state = AppState::new();
+        state.begin_prerequisite_operation("old");
+        state.finish_prerequisite_failure("old", AppError::Canceled.frontend_error());
+        state.begin_prerequisite_operation("new");
+
+        assert!(!state.acknowledge_prerequisite_state("old"));
+        assert_eq!(
+            state.prerequisite_state().operation_id.as_deref(),
+            Some("new")
+        );
+        assert_eq!(
+            state.prerequisite_state().outcome,
+            PrerequisiteOutcome::Running
+        );
+        assert!(!state.acknowledge_prerequisite_state("new"));
+        assert_eq!(
+            state.prerequisite_state().outcome,
+            PrerequisiteOutcome::Running
         );
     }
 
@@ -531,14 +564,15 @@ mod tests {
             },
         );
         assert_eq!(
-            state.consume_prerequisite_state().outcome,
+            state.prerequisite_state().outcome,
             PrerequisiteOutcome::Succeeded
         );
+        assert!(state.acknowledge_prerequisite_state("success"));
 
         state.begin_prerequisite_operation("cancel");
         state.finish_prerequisite_canceled("cancel", AppError::Canceled.frontend_error());
         assert_eq!(
-            state.consume_prerequisite_state().outcome,
+            state.prerequisite_state().outcome,
             PrerequisiteOutcome::Canceled
         );
     }

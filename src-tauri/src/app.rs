@@ -99,6 +99,7 @@ pub fn run() {
             recover_pending_install,
             ensure_game_prerequisites,
             get_prerequisite_state,
+            acknowledge_prerequisite_state,
             verify_files,
             update_game,
             cancel_verify,

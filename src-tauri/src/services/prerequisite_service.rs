@@ -917,13 +917,26 @@ pub async fn load_active_manifest(game_root: &Path) -> Result<ContentManifest, P
 async fn load_prerequisite_manifest(
     game_root: &Path,
 ) -> Result<ActivePrerequisiteManifest, PrerequisiteError> {
-    if tokio::fs::try_exists(state_path(game_root))
-        .await
-        .unwrap_or(false)
-    {
-        return load_active_manifest(game_root)
-            .await
-            .map(|manifest| ActivePrerequisiteManifest::from_content(&manifest));
+    let state_probe = tokio::fs::try_exists(state_path(game_root)).await;
+    load_prerequisite_manifest_from_state_probe(game_root, state_probe).await
+}
+
+async fn load_prerequisite_manifest_from_state_probe(
+    game_root: &Path,
+    state_probe: std::io::Result<bool>,
+) -> Result<ActivePrerequisiteManifest, PrerequisiteError> {
+    match state_probe {
+        Ok(true) => {
+            return load_active_manifest(game_root)
+                .await
+                .map(|manifest| ActivePrerequisiteManifest::from_content(&manifest));
+        }
+        Ok(false) => {}
+        Err(error) => {
+            return Err(PrerequisiteError::Verification(format!(
+                "could not probe active content state: {error}"
+            )));
+        }
     }
 
     let path = game_root.join(LEGACY_MANIFEST_PATH);
@@ -936,6 +949,65 @@ async fn load_prerequisite_manifest(
         PrerequisiteError::Verification(format!("legacy manifest is invalid: {error}"))
     })?;
     ActivePrerequisiteManifest::from_legacy(&manifest)
+}
+
+pub trait LegacyManifestWriter: Send + Sync {
+    fn store<'a>(
+        &'a self,
+        game_root: &'a Path,
+        manifest: &'a GameManifest,
+    ) -> ServiceFuture<'a, ()>;
+}
+
+pub struct AtomicLegacyManifestWriter;
+
+impl LegacyManifestWriter for AtomicLegacyManifestWriter {
+    fn store<'a>(
+        &'a self,
+        game_root: &'a Path,
+        manifest: &'a GameManifest,
+    ) -> ServiceFuture<'a, ()> {
+        Box::pin(store_legacy_manifest(game_root, manifest))
+    }
+}
+
+pub async fn legacy_manifest_backfill_required(
+    game_root: &Path,
+) -> Result<bool, PrerequisiteError> {
+    match tokio::fs::try_exists(state_path(game_root)).await {
+        Ok(true) => return Ok(false),
+        Ok(false) => {}
+        Err(error) => {
+            return Err(PrerequisiteError::Verification(format!(
+                "could not probe active content state: {error}"
+            )));
+        }
+    }
+    match tokio::fs::try_exists(game_root.join(LEGACY_MANIFEST_PATH)).await {
+        Ok(exists) => Ok(!exists),
+        Err(error) => Err(PrerequisiteError::Verification(format!(
+            "could not probe legacy prerequisite manifest: {error}"
+        ))),
+    }
+}
+
+pub async fn backfill_legacy_manifest_with_writer(
+    game_root: &Path,
+    manifest: &GameManifest,
+    writer: &dyn LegacyManifestWriter,
+) -> Result<(), PrerequisiteError> {
+    ActivePrerequisiteManifest::from_legacy(manifest)?;
+    if !legacy_manifest_backfill_required(game_root).await? {
+        return Ok(());
+    }
+    writer.store(game_root, manifest).await
+}
+
+pub async fn backfill_legacy_manifest(
+    game_root: &Path,
+    manifest: &GameManifest,
+) -> Result<(), PrerequisiteError> {
+    backfill_legacy_manifest_with_writer(game_root, manifest, &AtomicLegacyManifestWriter).await
 }
 
 pub async fn store_legacy_manifest(
@@ -2548,6 +2620,151 @@ mod tests {
         ) -> Result<bool, PrerequisiteError> {
             Ok(self.satisfied.load(Ordering::SeqCst))
         }
+    }
+
+    struct FailOnceLegacyWriter {
+        failed: std::sync::atomic::AtomicBool,
+    }
+
+    impl LegacyManifestWriter for FailOnceLegacyWriter {
+        fn store<'a>(
+            &'a self,
+            game_root: &'a Path,
+            manifest: &'a GameManifest,
+        ) -> ServiceFuture<'a, ()> {
+            Box::pin(async move {
+                if !self.failed.swap(true, Ordering::SeqCst) {
+                    return Err(PrerequisiteError::Verification(
+                        "transient sidecar write failure".into(),
+                    ));
+                }
+                store_legacy_manifest(game_root, manifest).await
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn upgraded_v1_install_backfills_a_complete_manifest_without_reinstalling() {
+        let directory = tempdir().expect("temporary game directory");
+        let manifest = legacy_analysis_manifest(&["game.exe"]);
+        fs::write(
+            directory.path().join("game.exe"),
+            fixture_pe(PeArchitecture::X86, &["msvcr100.dll"]),
+        )
+        .expect("PE fixture should be written");
+        fs::write(
+            directory.path().join("RevLoader.exe"),
+            fixture_pe(PeArchitecture::X86, &[]),
+        )
+        .expect("RevLoader fixture should be written");
+
+        backfill_legacy_manifest_with_writer(
+            directory.path(),
+            &manifest,
+            &AtomicLegacyManifestWriter,
+        )
+        .await
+        .expect("full manifest should backfill the upgraded install");
+
+        let result = analysis_service(Arc::new(FixedProbe { satisfied: true }))
+            .check_active(directory.path(), &CancellationToken::new())
+            .await
+            .expect("backfilled install should support prerequisite checks");
+        assert!(result.ready);
+    }
+
+    #[tokio::test]
+    async fn fast_guard_without_a_v1_sidecar_fails_closed_without_installing() {
+        let directory = tempdir().expect("temporary game directory");
+        let downloader = Arc::new(RecordingDownloader::default());
+        let runner = Arc::new(RecordingRunner::default());
+        let service = PrerequisiteService::new(
+            downloader.clone(),
+            Arc::new(AcceptingTrust),
+            Arc::new(FixedProbe { satisfied: true }),
+            runner.clone(),
+        );
+
+        let error = service
+            .check_active(directory.path(), &CancellationToken::new())
+            .await
+            .expect_err("fast guard must not backfill missing v1 metadata");
+
+        assert!(matches!(error, PrerequisiteError::Unsupported(_)));
+        assert_eq!(downloader.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_v1_sidecar_write_is_retried_by_the_next_ensure() {
+        let directory = tempdir().expect("temporary game directory");
+        let manifest = legacy_analysis_manifest(&["game.exe"]);
+        fs::write(
+            directory.path().join("game.exe"),
+            fixture_pe(PeArchitecture::X86, &["msvcr100.dll"]),
+        )
+        .expect("PE fixture should be written");
+        fs::write(
+            directory.path().join("RevLoader.exe"),
+            fixture_pe(PeArchitecture::X86, &[]),
+        )
+        .expect("RevLoader fixture should be written");
+        let writer = FailOnceLegacyWriter {
+            failed: std::sync::atomic::AtomicBool::new(false),
+        };
+
+        backfill_legacy_manifest_with_writer(directory.path(), &manifest, &writer)
+            .await
+            .expect_err("first transient write should be reported");
+        assert!(!directory.path().join(LEGACY_MANIFEST_PATH).exists());
+        backfill_legacy_manifest_with_writer(directory.path(), &manifest, &writer)
+            .await
+            .expect("next ensure should retry the missing sidecar");
+        assert!(directory.path().join(LEGACY_MANIFEST_PATH).exists());
+        assert!(
+            analysis_service(Arc::new(FixedProbe { satisfied: true }))
+                .ensure_active(directory.path(), &CancellationToken::new())
+                .await
+                .expect("prerequisite-only retry should proceed without content installation")
+                .ready
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_v1_manifest_is_never_persisted_as_a_fallback() {
+        let directory = tempdir().expect("temporary game directory");
+        let mut manifest = legacy_analysis_manifest(&["game.exe"]);
+        manifest.files.retain(|file| file.path != "RevLoader.exe");
+
+        backfill_legacy_manifest_with_writer(
+            directory.path(),
+            &manifest,
+            &AtomicLegacyManifestWriter,
+        )
+        .await
+        .expect_err("partial manifest must be rejected");
+
+        assert!(!directory.path().join(LEGACY_MANIFEST_PATH).exists());
+    }
+
+    #[tokio::test]
+    async fn v2_state_probe_error_never_uses_a_valid_stale_legacy_manifest() {
+        let directory = tempdir().expect("temporary game directory");
+        store_legacy_manifest(directory.path(), &legacy_analysis_manifest(&["game.exe"]))
+            .await
+            .expect("stale legacy fixture should be valid");
+
+        let error = load_prerequisite_manifest_from_state_probe(
+            directory.path(),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected state metadata failure",
+            )),
+        )
+        .await
+        .expect_err("state probe errors must fail closed");
+
+        assert!(matches!(error, PrerequisiteError::Verification(_)));
     }
 
     #[tokio::test]
