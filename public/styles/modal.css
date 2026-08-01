@@ -125,9 +125,12 @@
     color: #d98585 !important;
 }
 
-[data-status-kind="success"],
-[data-status-kind="running"] {
+[data-status-kind="success"] {
     color: #91b69a !important;
+}
+
+[data-status-kind="running"] {
+    color: var(--grey-color) !important;
 }
 
 #progress-bar.indeterminate {

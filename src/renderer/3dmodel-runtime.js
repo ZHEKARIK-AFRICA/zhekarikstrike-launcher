@@ -1,4 +1,4 @@
-export const BASE_SPIN_DURATION_MS = 1400;
+export const BASE_SPIN_DURATION_MS = 1400 / 1.5;
 
 export function advanceSpin(progress, elapsedMs, speedMultiplier = 1) {
     if (!Number.isFinite(progress) || !Number.isFinite(elapsedMs)) return progress;

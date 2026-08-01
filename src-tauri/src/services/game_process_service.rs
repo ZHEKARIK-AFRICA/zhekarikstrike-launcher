@@ -162,8 +162,18 @@ pub fn monitor_game_process(app: AppHandle, state: AppState, pid: u32) {
 }
 
 pub async fn stop_game_process(pid: u32) -> Result<(), AppError> {
-    Command::new("taskkill")
+    let mut command = Command::new("taskkill");
+    command
         .args(["/PID", &pid.to_string(), "/F"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.as_std_mut().creation_flags(0x0800_0000);
+    }
+    command
         .spawn()
         .map_err(|error| AppError::Unknown(error.to_string()))?
         .wait()

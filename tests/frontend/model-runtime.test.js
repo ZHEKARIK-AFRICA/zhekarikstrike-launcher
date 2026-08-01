@@ -9,14 +9,14 @@ import {
 } from '../../src/renderer/3dmodel-runtime.js';
 
 describe('3D model runtime', () => {
-    it.each([30, 60, 144])('completes the base spin in 1.4 seconds at %i FPS', (fps) => {
+    it.each([30, 60, 144])('completes the base spin 1.5x faster at %i FPS', (fps) => {
         let progress = 0;
         const frameMs = 1000 / fps;
         for (let elapsed = 0; elapsed < BASE_SPIN_DURATION_MS; elapsed += frameMs) {
             progress = advanceSpin(progress, Math.min(frameMs, BASE_SPIN_DURATION_MS - elapsed), 1);
         }
 
-        expect(BASE_SPIN_DURATION_MS).toBe(1400);
+        expect(BASE_SPIN_DURATION_MS).toBeCloseTo(1400 / 1.5, 6);
         expect(progress).toBeCloseTo(1, 6);
     });
 

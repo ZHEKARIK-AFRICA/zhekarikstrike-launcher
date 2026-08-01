@@ -58,7 +58,10 @@ async fn cleanup_runtime_inner(
     }
     crate::logger::info("shutdown patch cancellation finished");
 
-    if let Some(pid) = finished_process.pid.filter(|_| finished_process.owned) {
+    if should_stop_owned_process(finished_process.pid, finished_process.owned, expected_pid) {
+        let pid = finished_process
+            .pid
+            .expect("an owned process selected for termination must have a pid");
         if let Err(error) = game_process_service::stop_game_process(pid).await {
             crate::logger::warn(&format!("failed to stop game process {pid}: {error}"));
         }
@@ -98,9 +101,17 @@ fn cleanup_matches_expected_pid(current_pid: Option<u32>, expected_pid: Option<u
     expected_pid.is_none() || current_pid == expected_pid
 }
 
+fn should_stop_owned_process(
+    current_pid: Option<u32>,
+    owned: bool,
+    expected_finished_pid: Option<u32>,
+) -> bool {
+    current_pid.is_some() && owned && expected_finished_pid.is_none()
+}
+
 #[cfg(test)]
 mod release_1_6_11_tests {
-    use super::cleanup_matches_expected_pid;
+    use super::{cleanup_matches_expected_pid, should_stop_owned_process};
 
     #[test]
     fn release_1_6_11_stale_process_monitor_cannot_clean_up_a_new_game() {
@@ -108,5 +119,13 @@ mod release_1_6_11_tests {
         assert!(!cleanup_matches_expected_pid(Some(43), Some(42)));
         assert!(!cleanup_matches_expected_pid(None, Some(42)));
         assert!(cleanup_matches_expected_pid(Some(43), None));
+    }
+
+    #[test]
+    fn closed_process_monitor_never_runs_taskkill_for_the_disappeared_pid() {
+        assert!(!should_stop_owned_process(Some(42), true, Some(42)));
+        assert!(should_stop_owned_process(Some(42), true, None));
+        assert!(!should_stop_owned_process(Some(42), false, None));
+        assert!(!should_stop_owned_process(None, true, None));
     }
 }
