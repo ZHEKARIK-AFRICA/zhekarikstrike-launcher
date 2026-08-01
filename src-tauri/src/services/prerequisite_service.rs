@@ -1126,6 +1126,46 @@ pub async fn refresh_legacy_manifest(
     .await
 }
 
+pub async fn bind_verified_legacy_manifest(
+    game_root: &Path,
+    manifest: &GameManifest,
+) -> Result<(), PrerequisiteError> {
+    bind_verified_legacy_manifest_from_state_probe(
+        game_root,
+        manifest,
+        tokio::fs::try_exists(state_path(game_root)).await,
+    )
+    .await
+}
+
+async fn bind_verified_legacy_manifest_from_state_probe(
+    game_root: &Path,
+    manifest: &GameManifest,
+    state_probe: std::io::Result<bool>,
+) -> Result<(), PrerequisiteError> {
+    match state_probe {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(error) => {
+            return Err(PrerequisiteError::Verification(format!(
+                "could not probe active content state: {error}"
+            )));
+        }
+    }
+
+    ActivePrerequisiteManifest::from_legacy(manifest)?;
+    match tokio::fs::remove_file(game_root.join(ANALYSIS_PATH)).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(PrerequisiteError::Verification(format!(
+                "could not invalidate prerequisite analysis: {error}"
+            )));
+        }
+    }
+    store_legacy_manifest(game_root, manifest).await
+}
+
 pub async fn store_legacy_manifest(
     game_root: &Path,
     manifest: &GameManifest,
@@ -3003,8 +3043,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_v1_generation_cannot_bind_remote_manifest_or_analysis_cache() {
+    async fn full_verification_rebinds_matching_sidecar_and_invalidates_poisoned_cache() {
         let directory = tempdir().expect("temporary game directory");
+        let mut verified_manifest = legacy_analysis_manifest(&["game.exe"]);
+        verified_manifest.game_version = "1.0.3.6".into();
         fs::write(
             directory.path().join("game.exe"),
             fixture_pe(PeArchitecture::X86, &[]),
@@ -3015,41 +3057,44 @@ mod tests {
             fixture_pe(PeArchitecture::X86, &[]),
         )
         .expect("RevLoader fixture should be written");
-        let mut remote_manifest = legacy_analysis_manifest(&["game.exe"]);
-        remote_manifest.game_version = "1.0.3.6".into();
-
-        let error = refresh_legacy_manifest_with_writer(
-            directory.path(),
-            "0.0.0",
-            &remote_manifest,
-            &AtomicLegacyManifestWriter,
-        )
-        .await
-        .expect_err("unknown local generation must not bind a remote manifest");
-        assert!(matches!(error, PrerequisiteError::Verification(_)));
-        assert!(!directory.path().join(LEGACY_MANIFEST_PATH).exists());
-        assert!(!directory.path().join(ANALYSIS_PATH).exists());
+        store_legacy_manifest(directory.path(), &verified_manifest)
+            .await
+            .expect("matching but untrusted sidecar should persist");
+        let service = analysis_service(Arc::new(FixedProbe { satisfied: true }));
+        assert!(
+            service
+                .check_active(directory.path(), &CancellationToken::new())
+                .await
+                .expect("old PE should seed the poisoned cache")
+                .ready
+        );
+        let poisoned_cache = fs::read_to_string(directory.path().join(ANALYSIS_PATH))
+            .expect("poisoned cache should exist");
+        assert!(!poisoned_cache.contains("xinput1_3.dll"));
+        assert!(service
+            .check_active_for_version(directory.path(), "0.0.0", &CancellationToken::new())
+            .await
+            .is_err());
 
         fs::write(
             directory.path().join("game.exe"),
             fixture_pe(PeArchitecture::X86, &["xinput1_3.dll"]),
         )
         .expect("fully verified PE fixture should be written");
-        refresh_legacy_manifest_with_writer(
+        bind_verified_legacy_manifest_from_state_probe(
             directory.path(),
-            "1.0.3.6",
-            &remote_manifest,
-            &AtomicLegacyManifestWriter,
+            &verified_manifest,
+            Ok(false),
         )
         .await
-        .expect("a fully verified generation may bind its matching manifest");
+        .expect("full verification should rebind its exact manifest");
+        assert!(!directory.path().join(ANALYSIS_PATH).exists());
 
-        let service = analysis_service(Arc::new(FixedProbe { satisfied: false }));
         let first = service
-            .check_active_for_version(directory.path(), "1.0.3.6", &CancellationToken::new())
+            .ensure_active_for_version(directory.path(), "1.0.3.6", &CancellationToken::new())
             .await
-            .expect("verified generation should be rescanned");
-        assert!(!first.ready);
+            .expect("ensure should rescan the fully verified generation");
+        assert!(first.ready);
         let cache = fs::read_to_string(directory.path().join(ANALYSIS_PATH))
             .expect("new-generation analysis should be cached");
         assert!(cache.contains("xinput1_3.dll"));
@@ -3060,7 +3105,7 @@ mod tests {
             .check_active_for_version(directory.path(), "1.0.3.6", &CancellationToken::new())
             .await
             .expect("fast guard should use the matching new-generation cache");
-        assert!(!cached.ready);
+        assert!(cached.ready);
     }
 
     #[tokio::test]
@@ -3082,6 +3127,37 @@ mod tests {
         ));
 
         assert!(!directory.path().join(ANALYSIS_PATH).exists());
+    }
+
+    #[tokio::test]
+    async fn verified_legacy_binding_is_a_v2_noop_and_state_probe_errors_fail_closed() {
+        let directory = tempdir().expect("temporary game directory");
+        let manifest = legacy_analysis_manifest(&["game.exe"]);
+        fs::create_dir_all(directory.path().join(ANALYSIS_PATH).parent().unwrap())
+            .expect("analysis directory should exist");
+        fs::write(directory.path().join(ANALYSIS_PATH), b"v2 analysis")
+            .expect("v2 analysis fixture should exist");
+
+        bind_verified_legacy_manifest_from_state_probe(directory.path(), &manifest, Ok(true))
+            .await
+            .expect("v2 state should make legacy binding a no-op");
+        assert!(!directory.path().join(LEGACY_MANIFEST_PATH).exists());
+        assert_eq!(
+            fs::read(directory.path().join(ANALYSIS_PATH)).unwrap(),
+            b"v2 analysis"
+        );
+
+        let error = bind_verified_legacy_manifest_from_state_probe(
+            directory.path(),
+            &manifest,
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected state probe failure",
+            )),
+        )
+        .await
+        .expect_err("state probe I/O must fail closed");
+        assert!(matches!(error, PrerequisiteError::Verification(_)));
     }
 
     #[test]

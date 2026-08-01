@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::constants::REV_LOADER_EXE;
 use crate::error::AppError;
-use crate::models::{GameManifest, ProgressEmitter, ProgressStage};
+use crate::models::{ProgressEmitter, ProgressStage};
 use crate::services::api_client::ApiClient;
 use crate::services::archive_service::extract_zip;
 use crate::services::config_service;
@@ -20,10 +20,6 @@ fn required_install_bytes(archive_size: u64, unpacked_size: u64) -> Result<u64, 
     archive_size
         .checked_add(unpacked_size)
         .ok_or_else(|| AppError::InvalidData("installation size overflow".to_string()))
-}
-
-fn verified_legacy_install_version(manifest: &GameManifest) -> String {
-    manifest.game_version.clone()
 }
 
 pub async fn install_game(
@@ -104,42 +100,17 @@ pub async fn install_game(
     )
     .await?;
 
-    if let Err(error) =
-        config_service::set_game_version(verified_legacy_install_version(&manifest)).await
-    {
-        crate::logger::warn(&format!(
-            "installed legacy content but could not save its version: {error}"
-        ));
-    }
     progress.emit_stage(ProgressStage::Complete, Some(100.0), None)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{required_install_bytes, verified_legacy_install_version};
-    use crate::models::{GameArchiveManifest, GameManifest};
+    use super::required_install_bytes;
 
     #[test]
     fn installation_reserves_archive_and_unpacked_bytes_at_the_same_time() {
         assert_eq!(required_install_bytes(10, 25).unwrap(), 35);
         assert!(required_install_bytes(u64::MAX, 1).is_err());
-    }
-
-    #[test]
-    fn fresh_v1_install_keeps_the_fully_verified_manifest_version() {
-        let manifest = GameManifest {
-            game_version: "1.0.3.6".into(),
-            generated_at: "2026-08-01T00:00:00Z".into(),
-            files: Vec::new(),
-            archive: GameArchiveManifest {
-                url: "https://api.zhekarik.africa/launcher/game/archive".into(),
-                size: 1,
-                sha256: "a".repeat(64),
-                unpacked_size: 1,
-            },
-        };
-
-        assert_eq!(verified_legacy_install_version(&manifest), "1.0.3.6");
     }
 }
