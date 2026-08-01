@@ -19,7 +19,7 @@ use crate::services::content_journal_service::{atomic_json, content_root, load_c
 use crate::utils::path_utils::safe_join;
 
 pub const PREREQUISITE_CATALOG_VERSION: u32 = 1;
-const ANALYSIS_SCHEMA_VERSION: u8 = 1;
+const ANALYSIS_SCHEMA_VERSION: u8 = 2;
 const ANALYSIS_PATH: &str = ".zhekarik/prerequisites/analysis-v1.json";
 
 pub type ServiceFuture<'a, T> =
@@ -54,7 +54,7 @@ impl PrerequisiteError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PeArchitecture {
     X86,
@@ -104,6 +104,7 @@ impl CatalogComponent {
 #[serde(deny_unknown_fields)]
 pub struct PrerequisiteRequirement {
     pub component_id: String,
+    pub architecture: PeArchitecture,
     pub imports: Vec<String>,
 }
 
@@ -130,7 +131,31 @@ pub struct EnsurePrerequisitesResult {
     pub ready: bool,
     pub installed: Vec<String>,
     pub already_present: Vec<String>,
-    pub restart_recommended: bool,
+    pub restart_status: RestartStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestartStatus {
+    None,
+    Recommended,
+    Initiated,
+}
+
+impl RestartStatus {
+    fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Initiated, _) | (_, Self::Initiated) => Self::Initiated,
+            (Self::Recommended, _) | (_, Self::Recommended) => Self::Recommended,
+            (Self::None, Self::None) => Self::None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InstallCompletion {
+    ready: bool,
+    restart_status: RestartStatus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,15 +179,18 @@ pub trait TrustVerifier: Send + Sync {
 }
 
 pub trait RuntimeProbe: Send + Sync {
-    fn system_import_satisfied(
+    fn system_dependency_path(
         &self,
         import: &str,
         architecture: PeArchitecture,
-    ) -> Result<bool, PrerequisiteError>;
+    ) -> Result<Option<PathBuf>, PrerequisiteError>;
+
+    fn dependency_file_version(&self, path: &Path) -> Result<Option<String>, PrerequisiteError>;
 
     fn component_satisfied(
         &self,
         component: &CatalogComponent,
+        architecture: PeArchitecture,
         imports: &[String],
     ) -> Result<bool, PrerequisiteError>;
 }
@@ -234,7 +262,7 @@ impl PrerequisiteService {
             }
         }
 
-        let mut requirements = BTreeMap::<String, BTreeSet<String>>::new();
+        let mut requirements = BTreeMap::<(String, PeArchitecture), BTreeSet<String>>::new();
         for file in manifest.files.iter().filter(|file| {
             Path::new(&file.path).extension().is_some_and(|ext| {
                 ext.eq_ignore_ascii_case("exe") || ext.eq_ignore_ascii_case("dll")
@@ -256,19 +284,46 @@ impl PrerequisiteService {
                 let Some(component_id) = component_id_for_import(&import) else {
                     continue;
                 };
-                if app_local_dependency_satisfied(
-                    game_root,
-                    &module_path,
-                    &import,
-                    image.architecture,
-                )? || self
+                let component = catalog_component(component_id)
+                    .ok_or_else(|| PrerequisiteError::Unsupported(component_id.to_string()))?;
+                let app_local = app_local_dependency_paths(game_root, &module_path, &import)?;
+                let system = self
                     .runtime
-                    .system_import_satisfied(&import, image.architecture)?
-                {
+                    .system_dependency_path(&import, image.architecture)?;
+                let mut app_local_satisfied = false;
+                for path in &app_local {
+                    if dependency_satisfies(
+                        path,
+                        &component,
+                        image.architecture,
+                        self.runtime.as_ref(),
+                    )? {
+                        app_local_satisfied = true;
+                        break;
+                    }
+                }
+                let system_satisfied = match system.as_deref() {
+                    Some(path) => dependency_satisfies(
+                        path,
+                        &component,
+                        image.architecture,
+                        self.runtime.as_ref(),
+                    )?,
+                    None => false,
+                };
+                if app_local_satisfied || system_satisfied {
                     continue;
                 }
+                if component.architecture != image.architecture {
+                    return Err(PrerequisiteError::Unsupported(format!(
+                        "{} has no {:?} catalog entry required by {}",
+                        component_id,
+                        image.architecture,
+                        module_path.display()
+                    )));
+                }
                 requirements
-                    .entry(component_id.to_string())
+                    .entry((component_id.to_string(), image.architecture))
                     .or_default()
                     .insert(import.to_ascii_lowercase());
             }
@@ -279,10 +334,13 @@ impl PrerequisiteService {
             catalog_version: PREREQUISITE_CATALOG_VERSION,
             requirements: requirements
                 .into_iter()
-                .map(|(component_id, imports)| PrerequisiteRequirement {
-                    component_id,
-                    imports: imports.into_iter().collect(),
-                })
+                .map(
+                    |((component_id, architecture), imports)| PrerequisiteRequirement {
+                        component_id,
+                        architecture,
+                        imports: imports.into_iter().collect(),
+                    },
+                )
                 .collect(),
         };
         atomic_json(&cache_path, &cache)
@@ -311,7 +369,7 @@ impl PrerequisiteService {
             ready: true,
             installed: Vec::new(),
             already_present: Vec::new(),
-            restart_recommended: false,
+            restart_status: RestartStatus::None,
         };
         for requirement in analysis.requirements {
             if cancel.is_cancelled() {
@@ -319,10 +377,17 @@ impl PrerequisiteService {
             }
             let component = catalog_component(&requirement.component_id)
                 .ok_or_else(|| PrerequisiteError::Unsupported(requirement.component_id.clone()))?;
-            if self
-                .runtime
-                .component_satisfied(&component, &requirement.imports)?
-            {
+            if component.architecture != requirement.architecture {
+                return Err(PrerequisiteError::Unsupported(format!(
+                    "{} has no {:?} catalog entry",
+                    requirement.component_id, requirement.architecture
+                )));
+            }
+            if self.runtime.component_satisfied(
+                &component,
+                requirement.architecture,
+                &requirement.imports,
+            )? {
                 result.already_present.push(requirement.component_id);
                 continue;
             }
@@ -335,11 +400,16 @@ impl PrerequisiteService {
                     cancel,
                 )
                 .await?;
-            let component_ready = self
-                .complete_install(&component, &requirement.imports, exit)
+            let completion = self
+                .complete_install(
+                    &component,
+                    requirement.architecture,
+                    &requirement.imports,
+                    exit,
+                )
                 .await?;
-            result.restart_recommended |= exit != InstallerExit::Success;
-            result.ready &= component_ready;
+            result.restart_status = result.restart_status.merge(completion.restart_status);
+            result.ready &= completion.ready;
             result.installed.push(requirement.component_id);
         }
         Ok(result)
@@ -457,19 +527,28 @@ impl PrerequisiteService {
     async fn complete_install(
         &self,
         component: &CatalogComponent,
+        architecture: PeArchitecture,
         imports: &[String],
         exit: InstallerExit,
-    ) -> Result<bool, PrerequisiteError> {
-        if self.runtime.component_satisfied(component, imports)? {
-            return Ok(true);
-        }
-        match exit {
-            InstallerExit::Success => Err(PrerequisiteError::Install(format!(
+    ) -> Result<InstallCompletion, PrerequisiteError> {
+        let ready = self
+            .runtime
+            .component_satisfied(component, architecture, imports)?;
+        if !ready && exit == InstallerExit::Success {
+            return Err(PrerequisiteError::Install(format!(
                 "{} completed but the required DLL architecture/version is still unavailable",
                 component.id
-            ))),
-            InstallerExit::RestartRecommended | InstallerExit::RestartInitiated => Ok(false),
+            )));
         }
+        let restart_status = match exit {
+            InstallerExit::Success => RestartStatus::None,
+            InstallerExit::RestartRecommended => RestartStatus::Recommended,
+            InstallerExit::RestartInitiated => RestartStatus::Initiated,
+        };
+        Ok(InstallCompletion {
+            ready,
+            restart_status,
+        })
     }
 }
 
@@ -720,6 +799,19 @@ pub fn app_local_dependency_satisfied(
     import: &str,
     architecture: PeArchitecture,
 ) -> Result<bool, PrerequisiteError> {
+    for path in app_local_dependency_paths(game_root, module_path, import)? {
+        if inspect_pe_file(&path)?.architecture == architecture {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn app_local_dependency_paths(
+    game_root: &Path,
+    module_path: &Path,
+    import: &str,
+) -> Result<Vec<PathBuf>, PrerequisiteError> {
     if import.is_empty()
         || import.contains('/')
         || import.contains('\\')
@@ -734,16 +826,28 @@ pub fn app_local_dependency_satisfied(
     }
     candidates.push(game_root.join(import));
     candidates.push(game_root.join("bin").join(import));
-    for candidate in candidates {
-        if !candidate.is_file() {
-            continue;
-        }
-        let image = inspect_pe_file(&candidate)?;
-        if image.architecture == architecture {
-            return Ok(true);
-        }
+    Ok(candidates
+        .into_iter()
+        .filter(|candidate| candidate.is_file())
+        .collect())
+}
+
+fn dependency_satisfies(
+    path: &Path,
+    component: &CatalogComponent,
+    architecture: PeArchitecture,
+    runtime: &dyn RuntimeProbe,
+) -> Result<bool, PrerequisiteError> {
+    if inspect_pe_file(path)?.architecture != architecture {
+        return Ok(false);
     }
-    Ok(false)
+    let Some(required) = component.required_version else {
+        return Ok(true);
+    };
+    let Some(actual) = runtime.dependency_file_version(path)? else {
+        return Ok(false);
+    };
+    Ok(version_at_least(&actual, required))
 }
 
 fn inspect_pe_file(path: &Path) -> Result<PeImage, PrerequisiteError> {
@@ -1032,31 +1136,33 @@ impl InstallerRunner for ProcessInstallerRunner {
 pub struct SystemRuntimeProbe;
 
 impl RuntimeProbe for SystemRuntimeProbe {
-    fn system_import_satisfied(
+    fn system_dependency_path(
         &self,
         import: &str,
         architecture: PeArchitecture,
-    ) -> Result<bool, PrerequisiteError> {
-        let Some(path) = system_dll_path(import, architecture) else {
-            return Ok(false);
-        };
-        Ok(inspect_pe_file(&path)?.architecture == architecture)
+    ) -> Result<Option<PathBuf>, PrerequisiteError> {
+        Ok(system_dll_path(import, architecture))
+    }
+
+    fn dependency_file_version(&self, path: &Path) -> Result<Option<String>, PrerequisiteError> {
+        windows_file_version(path)
     }
 
     fn component_satisfied(
         &self,
         component: &CatalogComponent,
+        architecture: PeArchitecture,
         imports: &[String],
     ) -> Result<bool, PrerequisiteError> {
         for import in imports {
-            let Some(path) = system_dll_path(import, component.architecture) else {
+            let Some(path) = system_dll_path(import, architecture) else {
                 return Ok(false);
             };
-            if inspect_pe_file(&path)?.architecture != component.architecture {
+            if inspect_pe_file(&path)?.architecture != architecture {
                 return Ok(false);
             }
             if let Some(required) = component.required_version {
-                let Some(actual) = windows_file_version(&path)? else {
+                let Some(actual) = self.dependency_file_version(&path)? else {
                     return Ok(false);
                 };
                 if !version_at_least(&actual, required) {
@@ -1231,6 +1337,7 @@ fn signer_subject(path: &Path) -> Result<String, PrerequisiteError> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1241,6 +1348,48 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
+    use crate::models::{
+        ContentChunking, ContentCompression, ContentDelivery, ContentFile, ContentManifest,
+    };
+
+    fn analysis_manifest(content_sha256: &str, paths: &[&str]) -> ContentManifest {
+        ContentManifest {
+            schema_version: 2,
+            content_sha256: content_sha256.to_string(),
+            release_id: "1.0.0-r1".into(),
+            game_version: "1.0.0".into(),
+            generated_at: "2026-08-01T00:00:00Z".into(),
+            source_archive_sha256: "f".repeat(64),
+            delivery: ContentDelivery {
+                chunk_base_url: "https://zhekarik.africa/chunks".into(),
+                recommended_concurrency: 1,
+            },
+            chunking: ContentChunking {
+                profile: "fixed-v1".into(),
+                chunk_size: crate::models::CONTENT_CHUNK_SIZE,
+            },
+            compression: ContentCompression {
+                profile: "zstd-v1".into(),
+                level: 6,
+                frame_checksum: true,
+            },
+            download_size: 0,
+            unpacked_size: 0,
+            chunks: HashMap::new(),
+            files: paths
+                .iter()
+                .map(|path| ContentFile {
+                    path: (*path).to_string(),
+                    size: 0,
+                    sha256: "e".repeat(64),
+                    excluded_from_hash_check: false,
+                    temporary: false,
+                    additional_check: false,
+                    chunks: Vec::new(),
+                })
+                .collect(),
+        }
+    }
 
     fn fixture_pe(architecture: PeArchitecture, imports: &[&str]) -> Vec<u8> {
         let pe_offset = 0x80_usize;
@@ -1330,7 +1479,7 @@ mod tests {
     #[test]
     fn analysis_cache_requires_matching_content_and_catalog_versions() {
         let cache = AnalysisCache {
-            schema_version: 1,
+            schema_version: ANALYSIS_SCHEMA_VERSION,
             content_sha256: "a".repeat(64),
             catalog_version: PREREQUISITE_CATALOG_VERSION,
             requirements: vec![],
@@ -1357,6 +1506,223 @@ mod tests {
 
         assert!(load_active_manifest(directory.path()).await.is_err());
         assert!(!cache_path.exists());
+    }
+
+    struct VersionedDependencyProbe {
+        system_path: Option<PathBuf>,
+        versions: HashMap<PathBuf, String>,
+    }
+
+    impl RuntimeProbe for VersionedDependencyProbe {
+        fn system_dependency_path(
+            &self,
+            _import: &str,
+            _architecture: PeArchitecture,
+        ) -> Result<Option<PathBuf>, PrerequisiteError> {
+            Ok(self.system_path.clone())
+        }
+
+        fn dependency_file_version(
+            &self,
+            path: &Path,
+        ) -> Result<Option<String>, PrerequisiteError> {
+            Ok(self.versions.get(path).cloned())
+        }
+
+        fn component_satisfied(
+            &self,
+            _component: &CatalogComponent,
+            _architecture: PeArchitecture,
+            _imports: &[String],
+        ) -> Result<bool, PrerequisiteError> {
+            Ok(false)
+        }
+    }
+
+    fn analysis_service(runtime: Arc<dyn RuntimeProbe>) -> PrerequisiteService {
+        PrerequisiteService::new(
+            Arc::new(RecordingDownloader::default()),
+            Arc::new(AcceptingTrust),
+            runtime,
+            Arc::new(RecordingRunner::default()),
+        )
+    }
+
+    #[tokio::test]
+    async fn outdated_system_vc100_dll_does_not_satisfy_analysis() {
+        let directory = tempdir().expect("temp directory should exist");
+        let importer = directory.path().join("game.exe");
+        let system_dll = directory.path().join("system/msvcr100.dll");
+        fs::create_dir_all(system_dll.parent().unwrap()).expect("system fixture should exist");
+        fs::write(
+            &importer,
+            fixture_pe(PeArchitecture::X86, &["msvcr100.dll"]),
+        )
+        .expect("importer should be written");
+        fs::write(&system_dll, fixture_pe(PeArchitecture::X86, &[]))
+            .expect("system DLL should be written");
+        let runtime = VersionedDependencyProbe {
+            system_path: Some(system_dll.clone()),
+            versions: HashMap::from([(system_dll, "10.0.30319.1".into())]),
+        };
+
+        let analysis = analysis_service(Arc::new(runtime))
+            .analyze(
+                directory.path(),
+                &analysis_manifest(&"a".repeat(64), &["game.exe"]),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("analysis should succeed");
+
+        assert_eq!(analysis.requirements.len(), 1);
+        assert_eq!(analysis.requirements[0].component_id, "vc2010-sp1-x86");
+    }
+
+    #[tokio::test]
+    async fn outdated_app_local_vc100_dll_does_not_satisfy_analysis() {
+        let directory = tempdir().expect("temp directory should exist");
+        let importer = directory.path().join("game.exe");
+        let local_dll = directory.path().join("bin/msvcr100.dll");
+        fs::create_dir_all(local_dll.parent().unwrap()).expect("bin fixture should exist");
+        fs::write(
+            &importer,
+            fixture_pe(PeArchitecture::X86, &["msvcr100.dll"]),
+        )
+        .expect("importer should be written");
+        fs::write(&local_dll, fixture_pe(PeArchitecture::X86, &[]))
+            .expect("local DLL should be written");
+        let runtime = VersionedDependencyProbe {
+            system_path: None,
+            versions: HashMap::from([(local_dll, "10.0.30319.1".into())]),
+        };
+
+        let analysis = analysis_service(Arc::new(runtime))
+            .analyze(
+                directory.path(),
+                &analysis_manifest(&"b".repeat(64), &["game.exe"]),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("analysis should succeed");
+
+        assert_eq!(analysis.requirements.len(), 1);
+        assert_eq!(analysis.requirements[0].component_id, "vc2010-sp1-x86");
+    }
+
+    #[tokio::test]
+    async fn analysis_uses_a_later_current_app_local_vc100_candidate() {
+        let directory = tempdir().expect("temp directory should exist");
+        let importer = directory.path().join("game/game.exe");
+        let adjacent_dll = directory.path().join("game/msvcr100.dll");
+        let bin_dll = directory.path().join("bin/msvcr100.dll");
+        fs::create_dir_all(importer.parent().unwrap()).expect("game directory should exist");
+        fs::create_dir_all(bin_dll.parent().unwrap()).expect("bin directory should exist");
+        fs::write(
+            &importer,
+            fixture_pe(PeArchitecture::X86, &["msvcr100.dll"]),
+        )
+        .expect("importer should be written");
+        fs::write(&adjacent_dll, fixture_pe(PeArchitecture::X86, &[]))
+            .expect("adjacent DLL should be written");
+        fs::write(&bin_dll, fixture_pe(PeArchitecture::X86, &[]))
+            .expect("bin DLL should be written");
+        let runtime = VersionedDependencyProbe {
+            system_path: None,
+            versions: HashMap::from([
+                (adjacent_dll, "10.0.30319.1".into()),
+                (bin_dll, "10.0.40219.325".into()),
+            ]),
+        };
+
+        let analysis = analysis_service(Arc::new(runtime))
+            .analyze(
+                directory.path(),
+                &analysis_manifest(&"f".repeat(64), &["game/game.exe"]),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("analysis should succeed");
+
+        assert!(analysis.requirements.is_empty());
+    }
+
+    #[tokio::test]
+    async fn x86_requirement_preserves_importer_architecture_in_cache() {
+        let directory = tempdir().expect("temp directory should exist");
+        fs::write(
+            directory.path().join("game.exe"),
+            fixture_pe(PeArchitecture::X86, &["msvcr100.dll"]),
+        )
+        .expect("importer should be written");
+
+        let analysis = analysis_service(Arc::new(VersionedDependencyProbe {
+            system_path: None,
+            versions: HashMap::new(),
+        }))
+        .analyze(
+            directory.path(),
+            &analysis_manifest(&"c".repeat(64), &["game.exe"]),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("x86 prerequisite should be supported");
+
+        assert_eq!(analysis.requirements.len(), 1);
+        assert_eq!(analysis.requirements[0].architecture, PeArchitecture::X86);
+        let serialized = serde_json::to_value(&analysis).expect("cache should serialize");
+        assert_eq!(serialized["requirements"][0]["architecture"], "x86");
+    }
+
+    #[tokio::test]
+    async fn x64_importer_with_only_x86_catalog_entry_is_explicitly_unsupported() {
+        let directory = tempdir().expect("temp directory should exist");
+        fs::write(
+            directory.path().join("game.exe"),
+            fixture_pe(PeArchitecture::X64, &["msvcr100.dll"]),
+        )
+        .expect("importer should be written");
+
+        let result = analysis_service(Arc::new(VersionedDependencyProbe {
+            system_path: None,
+            versions: HashMap::new(),
+        }))
+        .analyze(
+            directory.path(),
+            &analysis_manifest(&"d".repeat(64), &["game.exe"]),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(PrerequisiteError::Unsupported(_))));
+    }
+
+    #[tokio::test]
+    async fn mixed_x86_and_x64_importers_are_explicitly_unsupported() {
+        let directory = tempdir().expect("temp directory should exist");
+        fs::write(
+            directory.path().join("game-x86.exe"),
+            fixture_pe(PeArchitecture::X86, &["msvcr100.dll"]),
+        )
+        .expect("x86 importer should be written");
+        fs::write(
+            directory.path().join("game-x64.exe"),
+            fixture_pe(PeArchitecture::X64, &["msvcr100.dll"]),
+        )
+        .expect("x64 importer should be written");
+
+        let result = analysis_service(Arc::new(VersionedDependencyProbe {
+            system_path: None,
+            versions: HashMap::new(),
+        }))
+        .analyze(
+            directory.path(),
+            &analysis_manifest(&"e".repeat(64), &["game-x86.exe", "game-x64.exe"]),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(PrerequisiteError::Unsupported(_))));
     }
 
     #[test]
@@ -1410,6 +1776,25 @@ mod tests {
             InstallerExit::RestartInitiated
         );
         assert!(classify_installer_exit(1603).is_err());
+    }
+
+    #[test]
+    fn public_result_serializes_3010_and_1641_as_distinct_restart_statuses() {
+        let result_with = |restart_status| EnsurePrerequisitesResult {
+            ready: false,
+            installed: vec!["vc2010-sp1-x86".into()],
+            already_present: Vec::new(),
+            restart_status,
+        };
+
+        let recommended = serde_json::to_value(result_with(RestartStatus::Recommended))
+            .expect("3010 result should serialize");
+        let initiated = serde_json::to_value(result_with(RestartStatus::Initiated))
+            .expect("1641 result should serialize");
+
+        assert_eq!(recommended["restartStatus"], "recommended");
+        assert_eq!(initiated["restartStatus"], "initiated");
+        assert_ne!(recommended, initiated);
     }
 
     struct RejectingTrust;
@@ -1482,17 +1867,25 @@ mod tests {
     }
 
     impl RuntimeProbe for FixedProbe {
-        fn system_import_satisfied(
+        fn system_dependency_path(
             &self,
             _import: &str,
             _architecture: PeArchitecture,
-        ) -> Result<bool, PrerequisiteError> {
-            Ok(false)
+        ) -> Result<Option<PathBuf>, PrerequisiteError> {
+            Ok(None)
+        }
+
+        fn dependency_file_version(
+            &self,
+            _path: &Path,
+        ) -> Result<Option<String>, PrerequisiteError> {
+            Ok(None)
         }
 
         fn component_satisfied(
             &self,
             _component: &CatalogComponent,
+            _architecture: PeArchitecture,
             _imports: &[String],
         ) -> Result<bool, PrerequisiteError> {
             Ok(self.satisfied)
@@ -1556,12 +1949,49 @@ mod tests {
         let result = service
             .complete_install(
                 &catalog_component("vc2010-sp1-x86").unwrap(),
+                PeArchitecture::X86,
                 &["msvcr100.dll".into()],
                 InstallerExit::Success,
             )
             .await;
 
         assert!(matches!(result, Err(PrerequisiteError::Install(_))));
+    }
+
+    #[tokio::test]
+    async fn complete_install_preserves_distinct_3010_and_1641_statuses() {
+        let service = PrerequisiteService::new(
+            Arc::new(RecordingDownloader::default()),
+            Arc::new(AcceptingTrust),
+            Arc::new(FixedProbe { satisfied: false }),
+            Arc::new(RecordingRunner::default()),
+        );
+        let component = catalog_component("vc2010-sp1-x86").unwrap();
+        let imports = ["msvcr100.dll".into()];
+
+        let recommended = service
+            .complete_install(
+                &component,
+                PeArchitecture::X86,
+                &imports,
+                InstallerExit::RestartRecommended,
+            )
+            .await
+            .expect("3010 should remain observable while post-check is pending");
+        let initiated = service
+            .complete_install(
+                &component,
+                PeArchitecture::X86,
+                &imports,
+                InstallerExit::RestartInitiated,
+            )
+            .await
+            .expect("1641 should remain observable while post-check is pending");
+
+        assert!(!recommended.ready);
+        assert_eq!(recommended.restart_status, RestartStatus::Recommended);
+        assert!(!initiated.ready);
+        assert_eq!(initiated.restart_status, RestartStatus::Initiated);
     }
 
     #[test]
