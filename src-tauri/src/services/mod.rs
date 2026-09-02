@@ -5,6 +5,7 @@ pub mod close_service;
 pub mod config_service;
 pub mod content_download_service;
 pub mod content_install_service;
+pub mod content_inventory_service;
 pub mod content_journal_service;
 pub mod discord_rpc_service;
 pub mod disk_service;

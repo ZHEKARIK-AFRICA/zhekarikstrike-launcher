@@ -6,8 +6,8 @@ use serde::Deserialize;
 use crate::constants::MODERN_API_BASE_URL;
 use crate::error::AppError;
 use crate::models::{
-    validate_game_path, ContentManifest, ContentMirrorIndex, GameManifest, GamePatchManifest,
-    GamePatchManifestEntry, LauncherUpdateManifest,
+    validate_game_path, ContentManifest, ContentMirrorIndex, DrivePackManifest, GameManifest,
+    GamePatchManifest, GamePatchManifestEntry, LauncherUpdateManifest,
 };
 
 const METADATA_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -64,6 +64,29 @@ impl ApiClient {
         let status = response.status();
         let body = response.bytes().await?;
         parse_content_manifest_response(status, &body)
+    }
+
+    pub async fn get_compatible_pack_manifest(
+        &self,
+    ) -> Result<Option<DrivePackManifest>, AppError> {
+        let response = self
+            .metadata_get(Self::content_pack_manifest_url())
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.bytes().await?;
+        let Some(manifest) = parse_content_pack_manifest_response(status, &body)? else {
+            return Ok(None);
+        };
+
+        let canonical = self.get_updates_from(&manifest.game_version).await?;
+        if !content_version_matches_canonical(&manifest.game_version, &canonical.game_version) {
+            return Err(AppError::InvalidData(format!(
+                "content v3 game version {} does not match canonical v1 version {}",
+                manifest.game_version, canonical.game_version
+            )));
+        }
+        Ok(Some(manifest))
     }
 
     pub async fn get_compatible_content_manifest(
@@ -201,6 +224,10 @@ impl ApiClient {
         "https://api.zhekarik.africa/launcher/game/v2/manifest"
     }
 
+    pub fn content_pack_manifest_url() -> &'static str {
+        "https://api.zhekarik.africa/launcher/game/v3/manifest"
+    }
+
     pub fn content_drive_mirror_url(content_sha256: &str) -> String {
         format!(
             "https://api.zhekarik.africa/launcher/game/v2/mirrors/google-drive/{content_sha256}"
@@ -271,6 +298,25 @@ pub(crate) fn parse_content_manifest_response(
     }
     let manifest: ContentManifest = serde_json::from_slice(body)
         .map_err(|error| AppError::InvalidData(format!("invalid content manifest: {error}")))?;
+    manifest.validate()?;
+    Ok(Some(manifest))
+}
+
+pub(crate) fn parse_content_pack_manifest_response(
+    status: StatusCode,
+    body: &[u8],
+) -> Result<Option<DrivePackManifest>, AppError> {
+    if status == StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        return Err(AppError::Network(format!(
+            "content pack manifest request failed with HTTP {status}"
+        )));
+    }
+    let manifest: DrivePackManifest = serde_json::from_slice(body).map_err(|error| {
+        AppError::InvalidData(format!("invalid content pack manifest: {error}"))
+    })?;
     manifest.validate()?;
     Ok(Some(manifest))
 }
