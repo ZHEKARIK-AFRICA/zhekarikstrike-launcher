@@ -130,6 +130,12 @@ $releaseSource = Get-Content -LiteralPath "$PSScriptRoot\..\scripts\release.ps1"
 if ($releaseSource -match '(?i)--clobber') {
     throw 'Published launcher assets must never be overwritten with --clobber'
 }
+if ($releaseSource -notmatch '\$expectedRepository\s*=\s*''ZHEKARIK-AFRICA/zhekarikstrike-launcher''') {
+    throw 'Release publication must target the organization repository.'
+}
+if ($releaseSource -notmatch '\$downloadRepository\s*=\s*''d3affy/zhekarikstrike-launcher''') {
+    throw 'Updater download URLs must retain the legacy repository redirect for installed launchers.'
+}
 
 $tauriConfig = Get-Content -LiteralPath "$PSScriptRoot\..\src-tauri\tauri.conf.json" -Raw | ConvertFrom-Json
 if ($tauriConfig.app.windows[0].resizable -ne $true) {
