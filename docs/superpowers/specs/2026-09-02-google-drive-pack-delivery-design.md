@@ -79,6 +79,8 @@ Zhekarik Strike Launcher Releases/
 
 Each replica has identical bytes and a different Drive file ID. The launcher downloads only one replica. Three replicas spread per-file public-download pressure and allow immediate failover without changing content identity. They use about 26.3 GB for the current 8.76 GB compressed release; the old disabled loose mirror temporarily adds about 8.76 GB during the cleanup-safety window but is never selected by launcher `1.6.16`.
 
+For the current manifest, the deterministic layout produces exactly 136 packs at the 64 MiB limit (average 61.41 MiB). The previously considered 128 MiB limit would produce 67 packs. The selected 64 MiB profile deliberately trades 69 additional Drive requests for faster worker rebalancing and at most half as much retransmission after an unusable partial.
+
 The NY publisher creates and uploads one pack at a time, verifies it, then removes the local pack. Peak additional server disk use is bounded to one pack plus small metadata rather than another complete content copy.
 
 ## Deterministic Pack Construction
@@ -87,7 +89,7 @@ The publisher traverses the existing validated content manifest in file order an
 
 Pack profile `drive-pack-v1` has these fixed properties:
 
-- target and maximum pack size: 134,217,728 bytes;
+- target and maximum pack size: 67,108,864 bytes;
 - ordering: manifest file order, chunk order, first occurrence only;
 - payload: byte-for-byte concatenated existing independent zstd frames;
 - no recompression and no change to raw or compressed chunk hashes;
@@ -144,7 +146,7 @@ The active response is structurally equivalent to:
   },
   "pack_profile": {
     "name": "drive-pack-v1",
-    "max_pack_size": 134217728,
+    "max_pack_size": 67108864,
     "replica_count": 3
   },
   "packs": {
