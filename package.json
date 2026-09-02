@@ -9,7 +9,7 @@
     "build:frontend": "vite build",
     "lint": "eslint src scripts/*.mjs",
     "test:unit": "vitest run --dir tests/frontend --maxWorkers=2",
-    "test:release-script": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/release-password.ps1 && powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/release-publication.ps1",
+    "test:release-script": "pwsh -NoProfile -File tests/release-password.ps1 && pwsh -NoProfile -File tests/release-publication.ps1",
     "test:e2e:browser": "cross-env VITE_TAURI_E2E=browser node scripts/browser-e2e-runner.mjs",
     "wdio:browser": "wdio run wdio.browser.conf.js",
     "test:e2e:tauri": "npm run build:e2e:tauri && wdio run wdio.tauri.conf.js",
