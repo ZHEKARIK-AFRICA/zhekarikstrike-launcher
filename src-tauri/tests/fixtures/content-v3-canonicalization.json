@@ -1,0 +1,57 @@
+{
+  "jcs": {
+    "input": {
+      "z": "Жекарик",
+      "a": [
+        3,
+        {
+          "b": true,
+          "a": "é"
+        }
+      ]
+    },
+    "canonical_utf8_base64": "eyJhIjpbMyx7ImEiOiLDqSIsImIiOnRydWV9XSwieiI6ItCW0LXQutCw0YDQuNC6In0=",
+    "sha256": "a9eb440d609d1c200afdd060ccb1f7f8ed950cbe430ca507f34be14aea785a30"
+  },
+  "legacy_content": {
+    "document": {
+      "schema_version": 2,
+      "release_id": "1.0.3.6-r1",
+      "game_version": "1.0.3.6",
+      "generated_at": "2026-09-02T00:00:00Z",
+      "source_archive_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "chunking": {
+        "profile": "fixed-v1",
+        "chunk_size": 8388608
+      },
+      "compression": {
+        "profile": "zstd-v1",
+        "level": 6,
+        "frame_checksum": true
+      },
+      "download_size": 3,
+      "unpacked_size": 2,
+      "chunks": {
+        "1111111111111111111111111111111111111111111111111111111111111111": {
+          "uncompressed_size": 2,
+          "compressed_size": 3,
+          "compressed_sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+        }
+      },
+      "files": [
+        {
+          "path": "путь/é.bin",
+          "size": 2,
+          "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+          "excluded_from_hash_check": false,
+          "temporary": false,
+          "additional_check": true,
+          "chunks": [
+            "1111111111111111111111111111111111111111111111111111111111111111"
+          ]
+        }
+      ]
+    },
+    "sha256": "aff45b7ff48dbc87f7ae9a40c508e3b8284307a6431d60a709d7d31f94c51298"
+  }
+}
