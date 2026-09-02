@@ -11,7 +11,7 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::AppError;
-use crate::models::{ContentChunk, ContentManifest, ContentMirrorIndex};
+use crate::models::{legacy_json_identity, ContentChunk, ContentManifest, ContentMirrorIndex};
 use crate::services::api_client::{parse_content_manifest_response, parse_content_mirror_response};
 use crate::services::content_download_service::{
     decode_verified_chunk, download_content_chunk, read_verified_local_chunk, DriveCircuitBreaker,
@@ -128,7 +128,6 @@ fn content_deletion_manifest(
     let loader = format!("loader-{content_marker}").into_bytes();
     let loader_compressed = encoded(&loader);
     let mut document = manifest_json(&loader, &loader_compressed);
-    document["content_sha256"] = json!(content_marker.to_string().repeat(64));
     document["release_id"] = json!(release_id);
     document["game_version"] = json!(game_version);
     document["source_archive_sha256"] = json!("f".repeat(64));
@@ -156,6 +155,20 @@ fn content_deletion_manifest(
     }
     document["unpacked_size"] = json!(unpacked_size);
     document["download_size"] = json!(download_size);
+    let identity = json!({
+        "schema_version": document["schema_version"].clone(),
+        "release_id": document["release_id"].clone(),
+        "game_version": document["game_version"].clone(),
+        "generated_at": document["generated_at"].clone(),
+        "source_archive_sha256": document["source_archive_sha256"].clone(),
+        "chunking": document["chunking"].clone(),
+        "compression": document["compression"].clone(),
+        "download_size": document["download_size"].clone(),
+        "unpacked_size": document["unpacked_size"].clone(),
+        "chunks": document["chunks"].clone(),
+        "files": document["files"].clone(),
+    });
+    document["content_sha256"] = json!(legacy_json_identity(&identity).unwrap());
     let manifest: ContentManifest = serde_json::from_value(document).unwrap();
     manifest.validate().unwrap();
     manifest

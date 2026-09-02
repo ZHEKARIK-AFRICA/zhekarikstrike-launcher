@@ -624,18 +624,22 @@ pub(crate) async fn load_previous_manifest(
         Ok(Some(state)) if state.schema_version == 1 => state,
         Ok(_) | Err(_) => return Ok(None),
     };
-    if let Some(inventory) =
-        crate::services::content_inventory_service::migrate_persisted_v2_manifest(
-            game_path,
-            &state.content_sha256,
-            &state.release_id,
-        )
-        .await?
+    match crate::services::content_inventory_service::migrate_persisted_v2_manifest(
+        game_path,
+        &state.content_sha256,
+        &state.release_id,
+    )
+    .await
     {
-        if inventory.game_version == state.game_version {
-            return Ok(Some(inventory.as_v2_manifest()));
+        Ok(Some(inventory)) => {
+            if inventory.game_version == state.game_version {
+                return Ok(Some(inventory.as_v2_manifest()));
+            }
+            return Ok(None);
         }
-        return Ok(None);
+        Ok(None) => {}
+        // A corrupt or untrusted ownership record must never authorize deletion.
+        Err(_) => return Ok(None),
     }
     let manifest = match load_persisted_content_manifest_with_hooks(
         game_path,
