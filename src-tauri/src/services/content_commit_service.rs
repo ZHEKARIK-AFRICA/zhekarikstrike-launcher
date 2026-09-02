@@ -241,8 +241,8 @@ async fn commit_artifact(
         })
         .ok_or_else(|| AppError::InvalidData("unrecognized verified content artifact".into()))?;
     let entry_path = context.journal.files[entry_index].path.clone();
-    if artifact.relative_path
-        != PathBuf::from(entry_path.replace('/', std::path::MAIN_SEPARATOR_STR))
+    let expected_relative_path = entry_path.replace('/', std::path::MAIN_SEPARATOR_STR);
+    if artifact.relative_path != Path::new(&expected_relative_path)
         || context.journal.files[entry_index].target_size != Some(artifact.size)
         || context.journal.files[entry_index].target_sha256.as_deref()
             != Some(artifact.sha256.as_str())

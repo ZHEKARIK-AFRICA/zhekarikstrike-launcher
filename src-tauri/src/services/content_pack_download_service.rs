@@ -275,15 +275,17 @@ async fn download_pack_job(
                     )
                     .await;
                     match download_full_attempt(
-                        &client,
-                        &url,
+                        FullDownloadAttempt {
+                            client: &client,
+                            url: &url,
+                            pack_sha256: &plan.pack_sha256,
+                            replica_index,
+                            cancellation: &cancellation,
+                            preempt: &preempt,
+                            active_attempts: &active_attempts,
+                        },
                         &partial,
                         pack.size,
-                        &plan.pack_sha256,
-                        replica_index,
-                        &cancellation,
-                        &preempt,
-                        &active_attempts,
                     )
                     .await
                     {
@@ -460,35 +462,45 @@ async fn download_pack_job(
         .unwrap_or_else(|| AppError::Network("all Google Drive pack replicas failed".into())))
 }
 
+struct FullDownloadAttempt<'a> {
+    client: &'a Client,
+    url: &'a Url,
+    pack_sha256: &'a str,
+    replica_index: usize,
+    cancellation: &'a CancellationToken,
+    preempt: &'a CancellationToken,
+    active_attempts: &'a Mutex<BTreeMap<String, ActiveAttempt>>,
+}
+
 async fn download_full_attempt(
-    client: &Client,
-    url: &Url,
+    attempt: FullDownloadAttempt<'_>,
     partial: &Path,
     pack_size: u64,
-    pack_sha256: &str,
-    replica_index: usize,
-    cancellation: &CancellationToken,
-    preempt: &CancellationToken,
-    active_attempts: &Mutex<BTreeMap<String, ActiveAttempt>>,
 ) -> Result<u64, AttemptError> {
     let (offset, mut hasher) = inspect_full_partial(partial, pack_size).await?;
     if offset == pack_size {
-        if hex::encode(hasher.finalize()) == pack_sha256 {
+        if hex::encode(hasher.finalize()) == attempt.pack_sha256 {
             return Ok(0);
         }
         PackCache::discard(partial).await.map_err(fatal)?;
         return Err(integrity("completed pack partial failed SHA-256", 0));
     }
-    let mut request = client
-        .get(url.clone())
+    let mut request = attempt
+        .client
+        .get(attempt.url.clone())
         .header(header::ACCEPT_ENCODING, "identity");
     if offset > 0 {
         request = request.header(header::RANGE, format!("bytes={offset}-"));
     }
     let started = Instant::now();
-    let response = send_attempt(request, cancellation, preempt).await?;
-    update_header_latency(active_attempts, pack_sha256, started.elapsed()).await;
-    validate_common_response(&response, url, pack_sha256)?;
+    let response = send_attempt(request, attempt.cancellation, attempt.preempt).await?;
+    update_header_latency(
+        attempt.active_attempts,
+        attempt.pack_sha256,
+        started.elapsed(),
+    )
+    .await;
+    validate_common_response(&response, attempt.url, attempt.pack_sha256)?;
     if offset == 0 {
         validate_full_headers(&response, pack_size)?;
     } else {
@@ -507,15 +519,15 @@ async fn download_full_attempt(
         offset,
         pack_size,
         0,
-        pack_sha256,
-        replica_index,
-        cancellation,
-        preempt,
-        active_attempts,
+        attempt.pack_sha256,
+        attempt.replica_index,
+        attempt.cancellation,
+        attempt.preempt,
+        attempt.active_attempts,
         &mut hasher,
     )
     .await?;
-    if hex::encode(hasher.finalize()) != pack_sha256 {
+    if hex::encode(hasher.finalize()) != attempt.pack_sha256 {
         return Err(integrity(
             "downloaded Google Drive pack failed SHA-256",
             pack_size.saturating_sub(offset),

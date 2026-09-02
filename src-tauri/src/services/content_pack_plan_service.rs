@@ -124,8 +124,7 @@ fn coalesced_ranges(
         };
         let gap = span
             .start
-            .checked_sub(previous.end_inclusive.saturating_add(1))
-            .unwrap_or_default();
+            .saturating_sub(previous.end_inclusive.saturating_add(1));
         let combined_size = span
             .end_inclusive
             .checked_sub(previous.start)

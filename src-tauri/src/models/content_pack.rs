@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+#[cfg(test)]
+use std::collections::HashMap;
 
 use chrono::DateTime;
 use reqwest::Url;
@@ -7,9 +10,11 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::error::AppError;
+#[cfg(test)]
+use crate::models::GameManifest;
 use crate::models::{
     validate_game_path, ContentChunk, ContentChunking, ContentCompression, ContentFile,
-    GameManifest, CONTENT_CHUNK_SIZE,
+    CONTENT_CHUNK_SIZE,
 };
 
 pub const DRIVE_PACK_MAX_SIZE: u64 = 64 * 1024 * 1024;
@@ -240,6 +245,7 @@ impl DrivePackManifest {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn validate_against_v1(&self, v1: &GameManifest) -> Result<(), AppError> {
         v1.validate_complete()?;
         if self.game_version != v1.game_version
