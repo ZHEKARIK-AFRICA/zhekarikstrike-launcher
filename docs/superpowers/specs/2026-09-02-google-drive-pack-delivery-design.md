@@ -64,6 +64,19 @@ The publisher stores only manifests and publication state locally after upload:
 /srv/zhekarik-game/publications/1.0.3.6/v3-state.json
 ```
 
+The atomic `content-v3/current.json` pointer is:
+
+```json
+{
+  "schema_version": 1,
+  "release_id": "1.0.3.6-r1",
+  "manifest": "manifests/<manifest_sha256>.json",
+  "sha256": "exact lowercase SHA-256 of the stored manifest file bytes"
+}
+```
+
+The manifest path stem and the manifest body's `manifest_sha256` are the RFC 8785 identity calculated with the top-level field omitted. The pointer's `sha256` is deliberately different: it authenticates the exact complete JSON file bytes, including the `manifest_sha256` member. Backend activation and loading verify both identities.
+
 Drive stores immutable pack replicas:
 
 ```text
@@ -98,7 +111,7 @@ Pack profile `drive-pack-v1` has these fixed properties:
 - spans are ordered, non-overlapping, in bounds, and exactly cover every pack;
 - pack identity is lowercase SHA-256 of the complete pack bytes.
 
-The existing game `content_sha256` remains the content identity. It is recomputed without reading or requesting v2: publisher, backend, and launcher project the v3 data into the legacy transport-neutral schema-2 content document by removing pack-only fields from chunks, then hash its existing canonical bytes (`json.dumps(..., ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"`). The result must equal the declared `content_sha256`. This preserves the already published game identity while keeping v2 out of runtime and allowing old v2 manifests to be deleted.
+The existing game `content_sha256` remains the content identity; for `1.0.3.6-r1` it is `01a13dfb3448ce6c55ec2051d70ad61775cbe1c2fa322330542d3b879d9675db`. It is recomputed without reading or requesting v2: publisher, backend, and launcher project the v3 data into the legacy transport-neutral schema-2 content document by removing pack-only fields from chunks, then hash its existing canonical bytes (`json.dumps(..., ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"`). The result must equal the declared `content_sha256`. This preserves the already published game identity while keeping v2 out of runtime and allowing old v2 manifests to be deleted.
 
 The v3 manifest has its own `manifest_sha256` and pack profile, so transport changes cannot impersonate a different game release. `manifest_sha256` is calculated using RFC 8785 JSON Canonicalization Scheme after removing the top-level `manifest_sha256` member. Publisher, backend, and launcher independently recompute it and reject a mismatch. Shared Python/Rust fixtures include reordered objects and Unicode strings so serializer behavior cannot create different identities.
 
@@ -153,7 +166,7 @@ The active response is structurally equivalent to:
   },
   "packs": {
     "<pack_sha256>": {
-      "size": 123456789,
+      "size": 67108864,
       "replica_file_ids": ["drive-id-1", "drive-id-2", "drive-id-3"]
     }
   },
