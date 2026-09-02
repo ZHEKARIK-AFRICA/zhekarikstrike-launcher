@@ -6623,7 +6623,7 @@ dependencies = [
 
 [[package]]
 name = "zhekarikstrike_launcher"
-version = "1.6.13"
+version = "1.6.14"
 dependencies = [
  "anyhow",
  "chrono",

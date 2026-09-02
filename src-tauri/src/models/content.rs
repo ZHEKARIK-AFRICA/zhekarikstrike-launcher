@@ -124,7 +124,7 @@ impl ContentMirrorIndex {
             .get(compressed_sha256)
             .ok_or_else(|| AppError::InvalidData("missing Google Drive content chunk".into()))?;
         Ok(format!(
-            "https://drive.usercontent.google.com/download?id={file_id}&export=download"
+            "https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t"
         ))
     }
 }
