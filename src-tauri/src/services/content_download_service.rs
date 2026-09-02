@@ -562,7 +562,7 @@ fn validate_drive_url(value: &str) -> Result<(), AppError> {
     let url = Url::parse(value)
         .map_err(|_| AppError::InvalidData("invalid Google Drive content URL".into()))?;
     let query = url.query_pairs().collect::<Vec<_>>();
-    let valid_query = query.len() == 2
+    let valid_query = query.len() == 3
         && query.iter().any(|(key, value)| {
             key == "id"
                 && (10..=128).contains(&value.len())
@@ -572,7 +572,10 @@ fn validate_drive_url(value: &str) -> Result<(), AppError> {
         })
         && query
             .iter()
-            .any(|(key, value)| key == "export" && value == "download");
+            .any(|(key, value)| key == "export" && value == "download")
+        && query
+            .iter()
+            .any(|(key, value)| key == "confirm" && value == "t");
     if url.scheme() != "https"
         || url.host_str() != Some("drive.usercontent.google.com")
         || url.path() != "/download"
@@ -668,4 +671,25 @@ pub async fn verified_compressed_file(path: &Path, chunk: &ContentChunk) -> Resu
         return Ok(false);
     }
     Ok(sha256_file(path).await? == chunk.compressed_sha256)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_drive_url;
+
+    #[test]
+    fn drive_url_allows_only_the_fixed_google_download_confirmation() {
+        assert!(validate_drive_url(
+            "https://drive.usercontent.google.com/download?id=1O6eniBjd9dd1ES-j1OKuVRXmKL6ke4vE&export=download&confirm=t"
+        )
+        .is_ok());
+        assert!(validate_drive_url(
+            "https://drive.usercontent.google.com/download?id=1O6eniBjd9dd1ES-j1OKuVRXmKL6ke4vE&export=download&confirm=false"
+        )
+        .is_err());
+        assert!(validate_drive_url(
+            "https://drive.usercontent.google.com/download?id=1O6eniBjd9dd1ES-j1OKuVRXmKL6ke4vE&export=download&confirm=t&next=https://attacker.invalid"
+        )
+        .is_err());
+    }
 }

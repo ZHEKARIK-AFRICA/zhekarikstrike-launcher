@@ -272,7 +272,7 @@ fn content_drive_mirror_requires_exact_chunk_closure_and_builds_only_the_fixed_h
     mirror.validate(&manifest).unwrap();
     assert_eq!(
         mirror.chunk_url(&compressed_sha).unwrap(),
-        "https://drive.usercontent.google.com/download?id=1O6eniBjd9dd1ES-j1OKuVRXmKL6ke4vE&export=download"
+        "https://drive.usercontent.google.com/download?id=1O6eniBjd9dd1ES-j1OKuVRXmKL6ke4vE&export=download&confirm=t"
     );
 
     let mut incomplete = mirror.clone();
