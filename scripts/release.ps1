@@ -277,14 +277,17 @@ try {
         }
         $repository = $Matches[1]
     }
-    $expectedRepository = 'd3affy/zhekarikstrike-launcher'
+    $expectedRepository = 'ZHEKARIK-AFRICA/zhekarikstrike-launcher'
     if ($repository -ne $expectedRepository) {
         throw "Release repository mismatch: expected $expectedRepository, got $repository"
     }
 
     $sha256 = (Get-FileHash -LiteralPath $updateAsset -Algorithm SHA256).Hash.ToLowerInvariant()
     $signature = Read-ReleaseTextFile -Path $signaturePath
-    $downloadUrl = "https://github.com/$repository/releases/download/$expectedTag/$updateAssetName"
+    # Installed launchers only allow the original repository URL. GitHub keeps
+    # this URL as a redirect after the repository transfer to the organization.
+    $downloadRepository = 'd3affy/zhekarikstrike-launcher'
+    $downloadUrl = "https://github.com/$downloadRepository/releases/download/$expectedTag/$updateAssetName"
     $manifest = [ordered]@{
         version = $Version
         notes = ''
