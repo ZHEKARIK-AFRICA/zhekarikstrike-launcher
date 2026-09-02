@@ -323,7 +323,9 @@ The failed launcher `v1.6.15` GitHub release remains a private draft and its imm
 
 ## Test Strategy
 
-Tests remain batched rather than running after every function.
+Testing is deliberately sparse and stage-batched. No tests run after an individual file, function, small commit, or isolated refactor. New automated tests are added only for failures that could corrupt installed data, activate an invalid publication, break resume, or silently select the wrong transport. Closely related cases use table-driven fixtures inside one cohesive test instead of one test function per field or status.
+
+Do not add tests for trivial constructors/getters, serde fields individually, progress wording, logs, constants already exercised by a boundary test, or thin delegating functions. The expected new-test budget is approximately two publisher tests, two backend endpoint tests, and five focused Rust test functions; exceeding it requires identifying a distinct high-risk behavior not covered by an existing table.
 
 Publisher tests cover:
 
@@ -358,7 +360,17 @@ Focused Rust tests cover:
 - post-state cache rename and startup cleanup retry;
 - direct v3-404-to-v1 behavior and proof that v2 is never requested as fallback.
 
-The existing full frontend/Rust/release gates run once after the completed batches. A real Windows E2E must measure phase timings and demonstrate:
+Tests run at only these implementation checkpoints:
+
+1. After publisher and backend code are both complete, run their affected Python suites once as one checkpoint.
+2. After the entire launcher transport, cache, materialization, commit, recovery, and inventory batch is complete, run formatting plus one focused Rust scope once. Do not run separate full `cargo check`, `cargo test`, or `clippy` here when that focused scope compiled the changed crate.
+3. After all repositories and batches are integrated, run the existing complete local release gate exactly once. Do not duplicate its full frontend or Rust commands before or after it.
+4. Run one real cold-cache Windows E2E after the local gate.
+5. The tagged GitHub Actions publication performs the second and final complete release gate.
+
+When a checkpoint fails, fix the whole related group and rerun only the failed scope. A complete checkpoint is repeated only if subsequent code changed something that it directly covers.
+
+The one real Windows E2E must measure phase timings and demonstrate:
 
 - fresh `1.0.3.6` installation from Drive packs;
 - cancel/resume across different Drive replicas;
@@ -372,7 +384,7 @@ The existing full frontend/Rust/release gates run once after the completed batch
 - deactivated v2 is not requested;
 - successful install leaves no active 8.16 GiB chunk cache.
 
-The performance baseline is the recorded cold-cache `3,625` seconds on the same Windows PC, target disk, and connection. A trial starts immediately before the frontend invokes installation and ends only after durable `state.json` plus the resolved success response; background deletion after the atomic cache-to-cleanup rename is excluded. Before each trial, only the disposable E2E game/state/cache directories are removed and the launcher process is restarted. Run three cold v3 trials with the same signed build and use their median. Publication requires a median of at most `1,812.5` seconds, no interval longer than 120 seconds between the final received network byte and durable state/success, and no regression in cancel/resume or integrity guarantees.
+The performance baseline is the recorded cold-cache `3,625` seconds on the same Windows PC, target disk, and connection. The single performance run starts immediately before the frontend invokes installation and ends only after durable `state.json` plus the resolved success response; background deletion after the atomic cache-to-cleanup rename is excluded. Before it starts, only the disposable E2E game/state/cache directories are removed and the launcher process is restarted. Publication requires at most `1,812.5` seconds, no interval longer than 120 seconds between the final received network byte and durable state/success, and no regression in cancel/resume or integrity guarantees. If the result is within 10% of the time limit or is invalidated by a demonstrated environmental failure, do not publish; repeat it only after a concrete implementation adjustment or a confirmed environment correction, not merely to obtain a better sample.
 
 ## Rollout and Rollback
 
