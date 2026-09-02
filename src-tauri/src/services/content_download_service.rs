@@ -1,3 +1,5 @@
+#![allow(dead_code)] // Loose v2 transport is retained only for recovery/downgrade compatibility.
+
 use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Mutex};

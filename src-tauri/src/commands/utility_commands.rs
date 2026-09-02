@@ -39,12 +39,18 @@ pub async fn check_disk_space_for_install(
     game_path: String,
 ) -> Result<disk_service::DiskSpaceStatus, AppError> {
     let api = ApiClient::new()?;
-    if let Some(manifest) = api.get_compatible_content_manifest().await? {
+    if let Some(manifest) = api.get_compatible_pack_manifest().await? {
         let game_path = std::path::Path::new(&game_path);
-        let backup =
-            content_install_service::estimate_existing_backup_bytes(game_path, &manifest).await?;
+        let inventory = crate::models::ContentInventory::from_v3(&manifest)?;
+        let backup = content_install_service::estimate_existing_backup_bytes(
+            game_path,
+            &inventory.as_v2_manifest(),
+        )
+        .await?;
         let required =
-            content_install_service::conservative_content_install_bytes(&manifest, backup)?;
+            crate::services::content_pack_install_service::conservative_packed_install_bytes(
+                &manifest, backup,
+            )?;
         return disk_service::check_disk_space(game_path, required).await;
     }
     let archive = api.get_full_manifest().await?.archive;

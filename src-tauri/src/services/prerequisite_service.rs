@@ -15,9 +15,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::models::{ContentManifest, GameManifest};
-use crate::services::content_journal_service::{
-    atomic_json, content_root, load_completion_state, state_path,
-};
+use crate::services::content_journal_service::{atomic_json, load_completion_state, state_path};
 use crate::utils::path_utils::safe_join;
 
 pub const PREREQUISITE_CATALOG_VERSION: u32 = 1;
@@ -903,17 +901,17 @@ pub async fn load_active_manifest(game_root: &Path) -> Result<ContentManifest, P
                 "active content state is invalid".into(),
             ));
         }
-        let path = content_root(game_root)
-            .join("manifests")
-            .join(format!("{}.json", state.content_sha256));
-        let bytes = tokio::fs::read(&path).await.map_err(|error| {
-            PrerequisiteError::Verification(format!(
-                "active content manifest is unavailable: {error}"
-            ))
-        })?;
-        let manifest: ContentManifest = serde_json::from_slice(&bytes).map_err(|error| {
-            PrerequisiteError::Verification(format!("active content manifest is invalid: {error}"))
-        })?;
+        let manifest = crate::services::content_inventory_service::migrate_persisted_v2_manifest(
+            game_root,
+            &state.content_sha256,
+            &state.release_id,
+        )
+        .await
+        .map_err(|error| PrerequisiteError::Verification(error.to_string()))?
+        .ok_or_else(|| {
+            PrerequisiteError::Verification("active content inventory is unavailable".into())
+        })?
+        .as_v2_manifest();
         manifest
             .validate()
             .map_err(|error| PrerequisiteError::Verification(error.to_string()))?;

@@ -129,6 +129,23 @@ pub fn run() {
 
             logger::set_app_handle(app.handle().clone());
 
+            if let Ok(Some(game_path)) =
+                tauri::async_runtime::block_on(crate::services::config_service::get_game_path())
+            {
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) =
+                        crate::services::content_commit_service::retry_background_cleanup(
+                            &game_path,
+                        )
+                        .await
+                    {
+                        crate::logger::warn(&format!(
+                            "startup content cleanup retry failed: {error}"
+                        ));
+                    }
+                });
+            }
+
             #[cfg(feature = "e2e")]
             let show_update = false;
             #[cfg(not(feature = "e2e"))]

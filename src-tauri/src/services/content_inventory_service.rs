@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::AppError;
-use crate::models::{ContentInventory, ContentManifest, DrivePackManifest};
+use crate::models::{ContentInventory, ContentManifest};
 use crate::services::content_journal_service::{atomic_json, content_root};
 
 pub fn inventory_path(game_path: &Path, content_sha256: &str) -> PathBuf {
@@ -43,15 +43,6 @@ pub async fn load_content_inventory(
         ));
     }
     Ok(Some(inventory))
-}
-
-pub async fn persist_v3_inventory(
-    game_path: &Path,
-    manifest: &DrivePackManifest,
-) -> Result<ContentInventory, AppError> {
-    let inventory = ContentInventory::from_v3(manifest)?;
-    save_content_inventory(game_path, &inventory).await?;
-    Ok(inventory)
 }
 
 pub async fn migrate_persisted_v2_manifest(

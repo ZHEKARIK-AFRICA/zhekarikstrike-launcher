@@ -36,12 +36,13 @@ pub async fn install_game(
     config_service::set_game_path(game_path.clone()).await?;
 
     let api = ApiClient::new()?;
-    if let Some(manifest) = api.get_compatible_content_manifest().await? {
-        content_install_service::install_or_update_content(
+    if let Some(manifest) = api.get_compatible_pack_manifest().await? {
+        crate::services::content_pack_install_service::install_or_update_packed_content(
             app,
             game_path.clone(),
             api,
             manifest,
+            content_install_service::IntegrityMode::FastUpdate,
             cancel,
             "install-progress",
             operation_id,

@@ -41,6 +41,7 @@ impl ContentFsHooks for NoContentFsHooks {}
 pub enum ContentJournalPhase {
     Materialize,
     Commit,
+    StreamingCommit,
     RolledBack,
 }
 
@@ -348,7 +349,7 @@ pub(crate) async fn recover_pending_content_with_hooks(
             cleanup_transaction_with_hooks(game_path, &journal.transaction_id, hooks).await?;
             guarded_remove_file_if_exists(game_path, &path, hooks).await?;
         }
-        ContentJournalPhase::Commit => {
+        ContentJournalPhase::Commit | ContentJournalPhase::StreamingCommit => {
             let committed = load_completion_state_with_hooks(game_path, hooks)
                 .await?
                 .is_some_and(|state| {
@@ -438,6 +439,7 @@ pub(crate) async fn remove_empty_obsolete_directories_with_hooks(
     Ok(())
 }
 
+#[allow(dead_code)] // Used by the retained v2 transactional implementation.
 pub async fn cleanup_transaction(game_path: &Path, transaction_id: &str) -> Result<(), AppError> {
     cleanup_transaction_with_hooks(game_path, transaction_id, &NoContentFsHooks).await
 }
@@ -1023,7 +1025,10 @@ async fn rollback_content_transaction_with_hooks(
         cleanup_transaction_with_hooks(game_path, &journal.transaction_id, hooks).await?;
         return guarded_remove_file_if_exists(game_path, &journal_path(game_path), hooks).await;
     }
-    if journal.phase != ContentJournalPhase::Commit {
+    if !matches!(
+        journal.phase,
+        ContentJournalPhase::Commit | ContentJournalPhase::StreamingCommit
+    ) {
         return Err(AppError::InvalidData(
             "content rollback requires commit phase".into(),
         ));

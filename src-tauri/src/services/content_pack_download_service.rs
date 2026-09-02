@@ -148,7 +148,7 @@ pub async fn download_pack_fetches(
 
         tokio::select! {
             _ = cancellation.cancelled() => {
-                jobs.abort_all();
+                pending.clear();
                 while jobs.join_next().await.is_some() {}
                 return Err(AppError::Canceled);
             }
@@ -187,9 +187,21 @@ pub async fn download_pack_fetches(
                 }
             }
             result = jobs.join_next(), if !jobs.is_empty() => {
-                let result = result
-                    .ok_or_else(|| AppError::Unknown("pack download task disappeared".into()))?
-                    .map_err(|error| AppError::Unknown(format!("pack download task failed: {error}")))??;
+                let joined = result
+                    .ok_or_else(|| AppError::Unknown("pack download task disappeared".into()))?;
+                let result = match joined {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(error)) => {
+                        cancellation.cancel();
+                        while jobs.join_next().await.is_some() {}
+                        return Err(error);
+                    }
+                    Err(error) => {
+                        cancellation.cancel();
+                        while jobs.join_next().await.is_some() {}
+                        return Err(AppError::Unknown(format!("pack download task failed: {error}")));
+                    }
+                };
                 remaining_backlog.fetch_sub(
                     result.planned_bytes,
                     Ordering::Relaxed,
@@ -230,6 +242,7 @@ async fn download_pack_job(
         .collect::<Vec<_>>();
     let mut network_bytes = 0_u64;
     let mut last_error = None;
+    let mut disabled_replicas = std::collections::HashSet::new();
 
     match &plan.mode {
         PackTransferMode::Full => {
@@ -247,6 +260,9 @@ async fn download_pack_job(
             PackCache::discard(&verified).await?;
             let partial = cache.full_partial_path(&plan.pack_sha256)?;
             for replica_index in replica_order {
+                if disabled_replicas.contains(&replica_index) {
+                    continue;
+                }
                 let url = DrivePackManifest::drive_url(&pack.replica_file_ids[replica_index])?;
                 for retry in 0..MAX_REPLICA_ATTEMPTS {
                     let preempt = CancellationToken::new();
@@ -287,11 +303,20 @@ async fn download_pack_job(
                         }
                         Err(failure) => {
                             network_bytes = network_bytes.saturating_add(failure.network_bytes);
+                            if matches!(&failure.error, AppError::Canceled) {
+                                return Err(AppError::Canceled);
+                            }
                             record_pressure(&pressure, &failure).await;
                             let retryable = matches!(failure.class, AttemptClass::Retryable);
                             let preempted = matches!(failure.class, AttemptClass::Preempted);
                             if matches!(failure.class, AttemptClass::Integrity) {
                                 PackCache::discard(&partial).await?;
+                            }
+                            if matches!(
+                                failure.class,
+                                AttemptClass::Permanent | AttemptClass::Integrity
+                            ) {
+                                disabled_replicas.insert(replica_index);
                             }
                             let retry_after = failure.retry_after;
                             last_error = Some(failure.error);
@@ -318,6 +343,9 @@ async fn download_pack_job(
                     PackCache::discard(&partial).await?;
                     let mut downloaded = false;
                     for &replica_index in &replica_order {
+                        if disabled_replicas.contains(&replica_index) {
+                            continue;
+                        }
                         let url =
                             DrivePackManifest::drive_url(&pack.replica_file_ids[replica_index])?;
                         for retry in 0..MAX_REPLICA_ATTEMPTS {
@@ -359,6 +387,7 @@ async fn download_pack_job(
                                             "downloaded pack range failed chunk verification"
                                                 .into(),
                                         ));
+                                        disabled_replicas.insert(replica_index);
                                         break;
                                     }
                                     PackCache::promote(&partial, &verified).await?;
@@ -375,12 +404,22 @@ async fn download_pack_job(
                                 Err(failure) => {
                                     network_bytes =
                                         network_bytes.saturating_add(failure.network_bytes);
+                                    if matches!(&failure.error, AppError::Canceled) {
+                                        PackCache::discard(&partial).await?;
+                                        return Err(AppError::Canceled);
+                                    }
                                     record_pressure(&pressure, &failure).await;
                                     let retryable =
                                         matches!(failure.class, AttemptClass::Retryable);
                                     let preempted =
                                         matches!(failure.class, AttemptClass::Preempted);
                                     let retry_after = failure.retry_after;
+                                    if matches!(
+                                        failure.class,
+                                        AttemptClass::Permanent | AttemptClass::Integrity
+                                    ) {
+                                        disabled_replicas.insert(replica_index);
+                                    }
                                     last_error = Some(failure.error);
                                     PackCache::discard(&partial).await?;
                                     if preempted {
@@ -467,6 +506,7 @@ async fn download_full_attempt(
         partial,
         offset,
         pack_size,
+        0,
         pack_sha256,
         replica_index,
         cancellation,
@@ -515,6 +555,7 @@ async fn download_range_attempt(
         partial,
         0,
         range.len().map_err(fatal)?,
+        range.start,
         pack_sha256,
         replica_index,
         cancellation,
@@ -628,6 +669,7 @@ async fn stream_response(
     partial: &Path,
     offset: u64,
     expected_size: u64,
+    reported_base_offset: u64,
     pack_sha256: &str,
     replica_index: usize,
     cancellation: &CancellationToken,
@@ -680,7 +722,7 @@ async fn stream_response(
             active_attempts,
             pack_sha256,
             replica_index,
-            written,
+            reported_base_offset.saturating_add(written),
             bytes.len() as u64,
         )
         .await;

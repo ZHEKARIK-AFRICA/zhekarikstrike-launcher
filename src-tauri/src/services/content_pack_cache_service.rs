@@ -83,6 +83,16 @@ impl PackCache {
         Ok(PackClaim { path })
     }
 
+    pub async fn has_resume_data(&self) -> Result<bool, AppError> {
+        for directory in [self.root.join("full"), self.root.join("ranges")] {
+            let mut entries = tokio::fs::read_dir(directory).await?;
+            if entries.next_entry().await?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn full_path(&self, pack_sha256: &str) -> Result<PathBuf, AppError> {
         validate_sha256(pack_sha256, "cached content pack")?;
         Ok(self.root.join("full").join(format!("{pack_sha256}.pack")))

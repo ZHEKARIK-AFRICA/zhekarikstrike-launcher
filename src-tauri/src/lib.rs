@@ -16,6 +16,9 @@ mod utils;
 #[cfg(test)]
 mod content_tests;
 
+#[cfg(test)]
+mod drive_pack_tests;
+
 pub fn run() {
     app::run();
 }

@@ -14,6 +14,7 @@ pub enum PackSource {
 
 #[derive(Debug, Clone)]
 pub struct AttemptProgress {
+    #[allow(dead_code)] // Kept explicit so future source controllers cannot mix measurements.
     pub source: PackSource,
     pub pack_sha256: String,
     pub replica_index: usize,

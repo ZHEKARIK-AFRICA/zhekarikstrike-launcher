@@ -74,12 +74,13 @@ pub async fn update_game(
             .await?
             .ok_or(AppError::GamePathNotSet)?;
         let api = ApiClient::new()?;
-        if let Some(manifest) = api.get_compatible_content_manifest().await? {
-            return content_install_service::install_or_update_content(
+        if let Some(manifest) = api.get_compatible_pack_manifest().await? {
+            return crate::services::content_pack_install_service::install_or_update_packed_content(
                 app,
                 game_path,
                 api,
                 manifest,
+                content_install_service::IntegrityMode::FastUpdate,
                 cancel,
                 "verify-progress",
                 operation_id,
@@ -119,6 +120,23 @@ async fn run_verify(
     let game_path = config_service::get_game_path()
         .await?
         .ok_or(AppError::GamePathNotSet)?;
+
+    if mode == VerifyMode::Full {
+        let api = ApiClient::new()?;
+        if let Some(manifest) = api.get_compatible_pack_manifest().await? {
+            return crate::services::content_pack_install_service::install_or_update_packed_content(
+                app,
+                game_path,
+                api,
+                manifest,
+                content_install_service::IntegrityMode::FullIntegrity,
+                cancel,
+                "verify-progress",
+                operation_id,
+            )
+            .await;
+        }
+    }
 
     verify_service::verify_game_files(
         app.clone(),

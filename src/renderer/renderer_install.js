@@ -275,7 +275,9 @@ chooseFolderButton?.addEventListener('click', async () => {
 });
 
 void listenUntilPageHide('install-progress', ({ payload }) => {
-    const progressStatus = payload.stage === 'checking'
+    const progressStatus = payload.message === 'resume'
+        ? 'status.resuming_install'
+        : payload.stage === 'checking'
         ? 'status.verifying_files'
         : 'status.installing';
     status.applyProgress(payload, progressStatus);

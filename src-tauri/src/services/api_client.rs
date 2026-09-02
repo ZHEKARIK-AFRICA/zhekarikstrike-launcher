@@ -56,6 +56,7 @@ impl ApiClient {
         Ok(manifest)
     }
 
+    #[allow(dead_code)] // Kept for one release cycle so old v2 state remains inspectable.
     pub async fn get_content_manifest(&self) -> Result<Option<ContentManifest>, AppError> {
         let response = self
             .metadata_get(Self::content_manifest_url())
@@ -89,6 +90,7 @@ impl ApiClient {
         Ok(Some(manifest))
     }
 
+    #[allow(dead_code)] // Launcher 1.6.16 deliberately never discovers v2 at runtime.
     pub async fn get_compatible_content_manifest(
         &self,
     ) -> Result<Option<ContentManifest>, AppError> {
@@ -121,6 +123,7 @@ impl ApiClient {
         }
     }
 
+    #[allow(dead_code)] // Legacy loose-object mirror support is retained for downgrade only.
     pub async fn get_content_drive_mirror(
         &self,
         manifest: &ContentManifest,
@@ -220,6 +223,7 @@ impl ApiClient {
         "https://api.zhekarik.africa/launcher/game/manifest"
     }
 
+    #[allow(dead_code)]
     pub fn content_manifest_url() -> &'static str {
         "https://api.zhekarik.africa/launcher/game/v2/manifest"
     }
@@ -228,6 +232,7 @@ impl ApiClient {
         "https://api.zhekarik.africa/launcher/game/v3/manifest"
     }
 
+    #[allow(dead_code)]
     pub fn content_drive_mirror_url(content_sha256: &str) -> String {
         format!(
             "https://api.zhekarik.africa/launcher/game/v2/mirrors/google-drive/{content_sha256}"
