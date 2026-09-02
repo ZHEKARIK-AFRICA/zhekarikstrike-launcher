@@ -98,7 +98,9 @@ Pack profile `drive-pack-v1` has these fixed properties:
 - spans are ordered, non-overlapping, in bounds, and exactly cover every pack;
 - pack identity is lowercase SHA-256 of the complete pack bytes.
 
-The existing game `content_sha256` remains the content identity. The v3 manifest has its own `manifest_sha256` and pack profile, so transport changes cannot impersonate a different game release. `manifest_sha256` is calculated using RFC 8785 JSON Canonicalization Scheme after removing the top-level `manifest_sha256` member. Publisher, backend, and launcher independently recompute it and reject a mismatch. Shared Python/Rust fixtures include reordered objects and Unicode strings so serializer behavior cannot create different identities.
+The existing game `content_sha256` remains the content identity. It is recomputed without reading or requesting v2: publisher, backend, and launcher project the v3 data into the legacy transport-neutral schema-2 content document by removing pack-only fields from chunks, then hash its existing canonical bytes (`json.dumps(..., ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"`). The result must equal the declared `content_sha256`. This preserves the already published game identity while keeping v2 out of runtime and allowing old v2 manifests to be deleted.
+
+The v3 manifest has its own `manifest_sha256` and pack profile, so transport changes cannot impersonate a different game release. `manifest_sha256` is calculated using RFC 8785 JSON Canonicalization Scheme after removing the top-level `manifest_sha256` member. Publisher, backend, and launcher independently recompute it and reject a mismatch. Shared Python/Rust fixtures include reordered objects and Unicode strings so serializer behavior cannot create different identities.
 
 For every pack, `prepare`:
 
@@ -176,6 +178,7 @@ The backend and launcher both validate the complete manifest before accepting it
 
 - safe unique case-insensitive file paths;
 - exact file/chunk closure and accumulated raw sizes;
+- exact legacy content projection and `content_sha256`, without consulting a v2 pointer, endpoint, or retained v2 manifest;
 - exact pack/chunk closure using checked arithmetic: for each pack, sort chunk spans by offset, require the first offset to be `0`, every next offset to equal the previous end, `end = offset + compressed_size`, and the final end to equal the pack size;
 - `0 < pack.size <= pack_profile.max_pack_size`, every declared chunk and pack is referenced, and no undeclared span is tolerated;
 - `download_size == sum(pack.size) == sum(unique chunk.compressed_size)`;
