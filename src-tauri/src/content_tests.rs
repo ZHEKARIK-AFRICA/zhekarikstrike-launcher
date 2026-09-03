@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use reqwest::StatusCode;
 use serde_json::json;
@@ -45,6 +46,27 @@ impl ContentFsHooks for FailContentFsOperation {
                 std::io::ErrorKind::PermissionDenied,
                 "injected content filesystem failure",
             ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct RecoveryConcurrencyProbe {
+    second_started: AtomicBool,
+    first_removed_after_second_started: AtomicBool,
+}
+
+impl ContentFsHooks for RecoveryConcurrencyProbe {
+    fn check(&self, operation: ContentFsOperation, path: &Path) -> std::io::Result<()> {
+        if operation == ContentFsOperation::Boundary && path.ends_with("second.bin") {
+            self.second_started.store(true, Ordering::Release);
+        }
+        if operation == ContentFsOperation::RemoveFile && path.ends_with("first.bin") {
+            self.first_removed_after_second_started.store(
+                self.second_started.load(Ordering::Acquire),
+                Ordering::Release,
+            );
         }
         Ok(())
     }
@@ -532,6 +554,40 @@ async fn release_1_6_12_recovery_rolls_back_an_interrupted_commit() {
     assert!(recover_pending_content(game).await.unwrap());
     assert_eq!(tokio::fs::read(target).await.unwrap(), b"later-user-file");
     assert!(!tokio::fs::try_exists(added).await.unwrap());
+}
+
+#[tokio::test]
+async fn content_recovery_pipelines_independent_entry_checks() {
+    let directory = tempdir().unwrap();
+    let game = directory.path();
+    let transaction_id = uuid::Uuid::new_v4().to_string();
+    let payload = vec![7_u8; 1024 * 1024];
+    tokio::fs::write(game.join("first.bin"), &payload)
+        .await
+        .unwrap();
+    tokio::fs::write(game.join("second.bin"), &payload)
+        .await
+        .unwrap();
+    let journal = ContentJournal {
+        schema_version: 2,
+        transaction_id,
+        release_id: "release-1".to_string(),
+        content_sha256: "a".repeat(64),
+        phase: ContentJournalPhase::StreamingCommit,
+        files: vec![
+            replace_journal_entry("second.bin", &payload, None),
+            replace_journal_entry("first.bin", &payload, None),
+        ],
+    };
+    write_journal(game, &journal).await.unwrap();
+    let probe = RecoveryConcurrencyProbe::default();
+
+    assert!(recover_pending_content_with_hooks(game, &probe)
+        .await
+        .unwrap());
+    assert!(probe
+        .first_removed_after_second_started
+        .load(Ordering::Acquire));
 }
 
 #[tokio::test]

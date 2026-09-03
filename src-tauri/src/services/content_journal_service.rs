@@ -2,6 +2,7 @@ use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use futures_util::{stream, StreamExt, TryStreamExt};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
@@ -12,6 +13,7 @@ use crate::utils::hash_utils::sha256_file;
 use crate::utils::path_utils::{ensure_safe_descendant, safe_join};
 
 const CONTENT_DIRECTORY: &str = ".zhekarik/content";
+const RECOVERY_ENTRY_CONCURRENCY: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ContentFsOperation {
@@ -1040,25 +1042,34 @@ async fn rollback_content_transaction_with_hooks(
         content_sha256: &journal.content_sha256,
         release_id: &journal.release_id,
     };
-    for entry in journal.files.iter().rev() {
-        match entry.action {
-            ContentJournalAction::Replace => {
-                rollback_replace_entry(
-                    game_path,
-                    &staging_root,
-                    &backup_root,
-                    entry,
-                    schema_version,
-                    &binding,
-                    hooks,
-                )
-                .await?;
+    stream::iter(journal.files.iter().rev().cloned())
+        .map(|entry| {
+            let staging_root = &staging_root;
+            let backup_root = &backup_root;
+            let binding = &binding;
+            async move {
+                match entry.action {
+                    ContentJournalAction::Replace => {
+                        rollback_replace_entry(
+                            game_path,
+                            staging_root,
+                            backup_root,
+                            &entry,
+                            schema_version,
+                            binding,
+                            hooks,
+                        )
+                        .await
+                    }
+                    ContentJournalAction::Remove => {
+                        rollback_remove_entry(game_path, backup_root, &entry, hooks).await
+                    }
+                }
             }
-            ContentJournalAction::Remove => {
-                rollback_remove_entry(game_path, &backup_root, entry, hooks).await?;
-            }
-        }
-    }
+        })
+        .buffer_unordered(RECOVERY_ENTRY_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?;
     journal.schema_version = 2;
     journal.phase = ContentJournalPhase::RolledBack;
     write_journal_with_hooks(game_path, journal, hooks).await?;
