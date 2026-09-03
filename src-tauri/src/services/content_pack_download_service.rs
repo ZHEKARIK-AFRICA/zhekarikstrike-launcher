@@ -70,7 +70,6 @@ struct AttemptError {
 struct JobResult {
     pack_sha256: String,
     network_bytes: u64,
-    planned_bytes: u64,
     chunks: Vec<VerifiedPackedChunk>,
 }
 
@@ -95,16 +94,11 @@ pub async fn download_pack_fetches(
     operation_id: &str,
     cancellation: CancellationToken,
     events: mpsc::Sender<PackDownloadEvent>,
+    ready_backlog: Arc<AtomicU64>,
 ) -> Result<PackDownloadSummary, AppError> {
     manifest.validate()?;
     let operation_id = operation_id.to_string();
     let mut pending = VecDeque::from(plans);
-    let total_backlog = pending.iter().try_fold(0_u64, |total, plan| {
-        total
-            .checked_add(plan_download_bytes(&manifest, plan)?)
-            .ok_or_else(|| AppError::InvalidData("pack download backlog overflow".into()))
-    })?;
-    let remaining_backlog = Arc::new(AtomicU64::new(total_backlog));
     let useful_bytes = Arc::new(AtomicU64::new(0));
     let active_attempts = Arc::new(Mutex::new(BTreeMap::<String, ActiveAttempt>::new()));
     let pressure = Arc::new(Mutex::new(PressureAccumulator::default()));
@@ -161,9 +155,10 @@ pub async fn download_pack_fetches(
                     .map(|attempt| attempt.progress.clone())
                     .collect::<Vec<_>>();
                 let mut current_pressure = pressure.lock().await;
+                let ready_backlog_bytes = ready_backlog.load(Ordering::Relaxed);
                 let sample = ControllerSample {
                     useful_bytes: useful_bytes.load(Ordering::Relaxed),
-                    backlog_bytes: remaining_backlog.load(Ordering::Relaxed),
+                    ready_backlog_bytes,
                     pressure: PressureWindow {
                         throttled: current_pressure.throttled,
                         timeout_or_server_errors: current_pressure.failures,
@@ -175,8 +170,8 @@ pub async fn download_pack_fetches(
                 let decision = controller.observe(Instant::now(), sample);
                 if decision.changed {
                     crate::logger::info(&format!(
-                        "Google Drive pack concurrency changed to {}",
-                        decision.target
+                        "Google Drive pack concurrency changed to {}; ready backlog={} bytes; pending packs={}",
+                        decision.target, ready_backlog_bytes, pending.len()
                     ));
                 }
                 if let Some(preempt) = decision.preempt {
@@ -203,10 +198,6 @@ pub async fn download_pack_fetches(
                         return Err(AppError::Unknown(format!("pack download task failed: {error}")));
                     }
                 };
-                remaining_backlog.fetch_sub(
-                    result.planned_bytes,
-                    Ordering::Relaxed,
-                );
                 summary.network_bytes = summary.network_bytes.saturating_add(result.network_bytes);
                 for chunk in result.chunks {
                     summary.chunks.insert(chunk.raw_sha256.clone(), chunk);
@@ -232,7 +223,6 @@ async fn download_pack_job(
     useful_bytes: Arc<AtomicU64>,
 ) -> Result<JobResult, AppError> {
     let _claim = cache.claim(&plan.pack_sha256).await?;
-    let planned_bytes = plan_download_bytes(&manifest, &plan)?;
     let pack = manifest
         .packs
         .get(&plan.pack_sha256)
@@ -254,7 +244,6 @@ async fn download_pack_job(
                 return Ok(JobResult {
                     pack_sha256: plan.pack_sha256,
                     network_bytes,
-                    planned_bytes,
                     chunks,
                 });
             }
@@ -300,7 +289,6 @@ async fn download_pack_job(
                             return Ok(JobResult {
                                 pack_sha256: plan.pack_sha256,
                                 network_bytes,
-                                planned_bytes,
                                 chunks,
                             });
                         }
@@ -453,7 +441,6 @@ async fn download_pack_job(
             return Ok(JobResult {
                 pack_sha256: plan.pack_sha256,
                 network_bytes,
-                planned_bytes,
                 chunks: ready,
             });
         }
@@ -931,20 +918,6 @@ async fn publish_useful_bytes(
         })
         .await
         .map_err(|_| AppError::Canceled)
-}
-
-fn plan_download_bytes(
-    manifest: &DrivePackManifest,
-    plan: &PackFetchPlan,
-) -> Result<u64, AppError> {
-    match &plan.mode {
-        PackTransferMode::Full => Ok(manifest.packs[&plan.pack_sha256].size),
-        PackTransferMode::Ranges(ranges) => ranges.iter().try_fold(0_u64, |total, range| {
-            total
-                .checked_add(range.len()?)
-                .ok_or_else(|| AppError::InvalidData("pack plan size overflow".into()))
-        }),
-    }
 }
 
 fn stable_replica_index(operation_id: &str, pack_sha256: &str) -> usize {

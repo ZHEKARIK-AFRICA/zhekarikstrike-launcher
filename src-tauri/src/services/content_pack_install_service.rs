@@ -301,6 +301,9 @@ async fn run_packed_pipeline(
     commit_context.committed = committed_tx;
 
     let download_cancel = cancellation.clone();
+    // The dispatcher adds verified chunks and materializers subtract their
+    // first consumption. Share this queue, not the remaining download plan.
+    let download_ready_backlog = ready_backlog.clone();
     let download = async {
         let result = download_pack_fetches(
             api.direct_http().clone(),
@@ -310,6 +313,7 @@ async fn run_packed_pipeline(
             &operation_id,
             download_cancel.clone(),
             pack_events_tx,
+            download_ready_backlog,
         )
         .await;
         if result.is_err() {

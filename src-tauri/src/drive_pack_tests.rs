@@ -248,7 +248,7 @@ fn drive_pack_adaptive_controller_trial_pressure_and_cooldown_matrix() {
             started + Duration::from_secs(tick * 2),
             ControllerSample {
                 useful_bytes: tick * 32 * 1024 * 1024,
-                backlog_bytes: 128 * 1024 * 1024,
+                ready_backlog_bytes: 128 * 1024 * 1024,
                 pressure: PressureWindow::default(),
                 active_attempts: Vec::new(),
             },
@@ -259,7 +259,7 @@ fn drive_pack_adaptive_controller_trial_pressure_and_cooldown_matrix() {
         started + Duration::from_secs(8),
         ControllerSample {
             useful_bytes: 128 * 1024 * 1024,
-            backlog_bytes: 128 * 1024 * 1024,
+            ready_backlog_bytes: 128 * 1024 * 1024,
             pressure: PressureWindow {
                 throttled: true,
                 timeout_or_server_errors: 0,
@@ -269,6 +269,66 @@ fn drive_pack_adaptive_controller_trial_pressure_and_cooldown_matrix() {
     );
     assert!(decision.changed);
     assert_eq!(decision.target, 1);
+}
+
+#[test]
+fn drive_pack_adaptive_controller_waits_for_materialization_then_trials_and_rejects_no_gain() {
+    let mut controller = AdaptivePackController::new(6);
+    let started = Instant::now();
+    let mib = 1024 * 1024;
+
+    // Downloads may be far from complete: only verified bytes waiting for the
+    // materializer should inhibit a higher-concurrency trial.
+    for tick in 1..=3 {
+        controller.observe(
+            started + Duration::from_secs(tick * 2),
+            ControllerSample {
+                useful_bytes: tick * 32 * mib,
+                ready_backlog_bytes: 256 * mib,
+                pressure: PressureWindow::default(),
+                active_attempts: Vec::new(),
+            },
+        );
+    }
+    assert_eq!(
+        controller.target(),
+        2,
+        "do not outrun a backed-up materializer"
+    );
+
+    for tick in 4..=6 {
+        controller.observe(
+            started + Duration::from_secs(tick * 2),
+            ControllerSample {
+                useful_bytes: tick * 32 * mib,
+                ready_backlog_bytes: 32 * mib,
+                pressure: PressureWindow::default(),
+                active_attempts: Vec::new(),
+            },
+        );
+    }
+    assert_eq!(
+        controller.target(),
+        3,
+        "trial once the materializer catches up"
+    );
+
+    for tick in 7..=9 {
+        controller.observe(
+            started + Duration::from_secs(tick * 2),
+            ControllerSample {
+                useful_bytes: tick * 32 * mib,
+                ready_backlog_bytes: 0,
+                pressure: PressureWindow::default(),
+                active_attempts: Vec::new(),
+            },
+        );
+    }
+    assert_eq!(
+        controller.target(),
+        2,
+        "extra workers without a speed gain are rolled back"
+    );
 }
 
 #[test]

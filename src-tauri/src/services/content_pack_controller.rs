@@ -33,7 +33,9 @@ pub struct PressureWindow {
 #[derive(Debug, Clone)]
 pub struct ControllerSample {
     pub useful_bytes: u64,
-    pub backlog_bytes: u64,
+    /// Verified compressed bytes not yet consumed by a materializer; never the
+    /// amount of content still waiting to be downloaded.
+    pub ready_backlog_bytes: u64,
     pub pressure: PressureWindow,
     pub active_attempts: Vec<AttemptProgress>,
 }
@@ -150,7 +152,7 @@ impl AdaptivePackController {
                     let cooldown_complete =
                         self.cooldown_until.is_none_or(|cooldown| now >= cooldown);
                     if self.target < self.maximum
-                        && sample.backlog_bytes < MAX_TRIAL_BACKLOG
+                        && sample.ready_backlog_bytes < MAX_TRIAL_BACKLOG
                         && cooldown_complete
                     {
                         self.trial = Some(ControllerTrial {

@@ -449,7 +449,7 @@ pub struct AttemptProgress {
 }
 pub struct ControllerSample {
     pub useful_bytes: u64,
-    pub backlog_bytes: u64,
+    pub ready_backlog_bytes: u64, // verified compressed bytes not yet consumed by materializers
     pub pressure: PressureWindow,
     pub active_attempts: Vec<AttemptProgress>,
 }
