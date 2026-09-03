@@ -26,9 +26,11 @@ use crate::services::content_journal_service::{
 use crate::services::content_pack_controller::{
     AdaptivePackController, ControllerSample, PressureWindow,
 };
-use crate::services::content_pack_download_service::VerifiedPackedChunk;
+use crate::services::content_pack_download_service::{
+    full_pack_request_range, VerifiedPackedChunk,
+};
 use crate::services::content_pack_install_service::read_packed_chunk;
-use crate::services::content_pack_plan_service::{plan_pack_fetches, PackTransferMode};
+use crate::services::content_pack_plan_service::{plan_pack_fetches, ByteRange, PackTransferMode};
 
 fn sha(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
@@ -267,6 +269,34 @@ fn drive_pack_adaptive_controller_trial_pressure_and_cooldown_matrix() {
     );
     assert!(decision.changed);
     assert_eq!(decision.target, 1);
+}
+
+#[test]
+fn drive_pack_full_download_uses_bounded_ranges() {
+    let slice = 16 * 1024 * 1024;
+    let pack_size = 64 * 1024 * 1024 - 17;
+
+    assert_eq!(
+        full_pack_request_range(0, pack_size).unwrap(),
+        ByteRange {
+            start: 0,
+            end_inclusive: slice - 1,
+        }
+    );
+    assert_eq!(
+        full_pack_request_range(slice, pack_size).unwrap(),
+        ByteRange {
+            start: slice,
+            end_inclusive: (2 * slice) - 1,
+        }
+    );
+    assert_eq!(
+        full_pack_request_range(3 * slice, pack_size).unwrap(),
+        ByteRange {
+            start: 3 * slice,
+            end_inclusive: pack_size - 1,
+        }
+    );
 }
 
 #[tokio::test]

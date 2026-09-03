@@ -24,6 +24,7 @@ use crate::utils::hash_utils::sha256_file;
 const HEADER_TIMEOUT: Duration = Duration::from_secs(20);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REPLICA_ATTEMPTS: usize = 2;
+const FULL_PACK_REQUEST_SIZE: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct VerifiedPackedChunk {
@@ -477,7 +478,7 @@ async fn download_full_attempt(
     partial: &Path,
     pack_size: u64,
 ) -> Result<u64, AttemptError> {
-    let (offset, mut hasher) = inspect_full_partial(partial, pack_size).await?;
+    let (mut offset, mut hasher) = inspect_full_partial(partial, pack_size).await?;
     if offset == pack_size {
         if hex::encode(hasher.finalize()) == attempt.pack_sha256 {
             return Ok(0);
@@ -485,55 +486,87 @@ async fn download_full_attempt(
         PackCache::discard(partial).await.map_err(fatal)?;
         return Err(integrity("completed pack partial failed SHA-256", 0));
     }
-    let mut request = attempt
-        .client
-        .get(attempt.url.clone())
-        .header(header::ACCEPT_ENCODING, "identity");
-    if offset > 0 {
-        request = request.header(header::RANGE, format!("bytes={offset}-"));
-    }
-    let started = Instant::now();
-    let response = send_attempt(request, attempt.cancellation, attempt.preempt).await?;
-    update_header_latency(
-        attempt.active_attempts,
-        attempt.pack_sha256,
-        started.elapsed(),
-    )
-    .await;
-    validate_common_response(&response, attempt.url, attempt.pack_sha256)?;
-    if offset == 0 {
-        validate_full_headers(&response, pack_size)?;
-    } else {
-        validate_range_headers(
-            &response,
-            ByteRange {
-                start: offset,
-                end_inclusive: pack_size - 1,
-            },
-            pack_size,
+    let initial_offset = offset;
+    while offset < pack_size {
+        let range = full_pack_request_range(offset, pack_size).map_err(fatal)?;
+        let completed_bytes = offset.saturating_sub(initial_offset);
+        let request = attempt
+            .client
+            .get(attempt.url.clone())
+            .header(header::ACCEPT_ENCODING, "identity")
+            .header(
+                header::RANGE,
+                format!("bytes={}-{}", range.start, range.end_inclusive),
+            );
+        let started = Instant::now();
+        let response = add_completed_bytes(
+            send_attempt(request, attempt.cancellation, attempt.preempt).await,
+            completed_bytes,
         )?;
+        update_header_latency(
+            attempt.active_attempts,
+            attempt.pack_sha256,
+            started.elapsed(),
+        )
+        .await;
+        add_completed_bytes(
+            validate_common_response(&response, attempt.url, attempt.pack_sha256),
+            completed_bytes,
+        )?;
+        add_completed_bytes(
+            validate_range_headers(&response, range, pack_size),
+            completed_bytes,
+        )?;
+        add_completed_bytes(
+            stream_response(
+                response,
+                partial,
+                offset,
+                range.end_inclusive + 1,
+                0,
+                attempt.pack_sha256,
+                attempt.replica_index,
+                attempt.cancellation,
+                attempt.preempt,
+                attempt.active_attempts,
+                &mut hasher,
+            )
+            .await,
+            completed_bytes,
+        )?;
+        offset = range.end_inclusive + 1;
     }
-    stream_response(
-        response,
-        partial,
-        offset,
-        pack_size,
-        0,
-        attempt.pack_sha256,
-        attempt.replica_index,
-        attempt.cancellation,
-        attempt.preempt,
-        attempt.active_attempts,
-        &mut hasher,
-    )
-    .await?;
     if hex::encode(hasher.finalize()) != attempt.pack_sha256 {
         return Err(integrity(
             "downloaded Google Drive pack failed SHA-256",
-            pack_size.saturating_sub(offset),
+            pack_size.saturating_sub(initial_offset),
         ));
     }
-    Ok(pack_size.saturating_sub(offset))
+    Ok(pack_size.saturating_sub(initial_offset))
+}
+
+pub(crate) fn full_pack_request_range(offset: u64, pack_size: u64) -> Result<ByteRange, AppError> {
+    if offset >= pack_size {
+        return Err(AppError::InvalidData(
+            "full pack request offset is outside the pack".into(),
+        ));
+    }
+    Ok(ByteRange {
+        start: offset,
+        end_inclusive: offset
+            .saturating_add(FULL_PACK_REQUEST_SIZE - 1)
+            .min(pack_size - 1),
+    })
+}
+
+fn add_completed_bytes<T>(
+    result: Result<T, AttemptError>,
+    completed_bytes: u64,
+) -> Result<T, AttemptError> {
+    result.map_err(|mut failure| {
+        failure.network_bytes = failure.network_bytes.saturating_add(completed_bytes);
+        failure
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -641,13 +674,6 @@ fn validate_common_response(
         return Err(permanent(
             "Google Drive pack response used unexpected content encoding",
         ));
-    }
-    Ok(())
-}
-
-fn validate_full_headers(response: &Response, expected_size: u64) -> Result<(), AttemptError> {
-    if response.status() != StatusCode::OK || content_length(response) != Some(expected_size) {
-        return Err(permanent("invalid full Google Drive pack response"));
     }
     Ok(())
 }
