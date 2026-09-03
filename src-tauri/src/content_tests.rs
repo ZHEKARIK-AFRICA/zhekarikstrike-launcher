@@ -557,6 +557,169 @@ async fn release_1_6_12_recovery_rolls_back_an_interrupted_commit() {
 }
 
 #[tokio::test]
+async fn content_recovery_discards_partial_streaming_staging_without_losing_originals() {
+    for partial in [b"".as_slice(), b"partial".as_slice()] {
+        for original_location in ["none", "target", "backup"] {
+            let directory = tempdir().unwrap();
+            let game = directory.path();
+            let transaction_id = uuid::Uuid::new_v4().to_string();
+            let target = game.join("csgo/maps/de_resort.txt");
+            let staged = staging_path(game, &transaction_id).join("csgo/maps/de_resort.txt");
+            let backup = backup_path(game, &transaction_id).join("csgo/maps/de_resort.txt");
+            let pack = content_root(game).join("packs/verified.pack");
+            let part = content_root(game).join("packs/downloading.pack.part");
+            for path in [&staged, &pack, &part] {
+                tokio::fs::create_dir_all(path.parent().unwrap())
+                    .await
+                    .unwrap();
+            }
+            tokio::fs::write(&staged, partial).await.unwrap();
+            tokio::fs::write(&pack, b"verified pack").await.unwrap();
+            tokio::fs::write(&part, b"download prefix").await.unwrap();
+            let original = match original_location {
+                "target" => Some(&target),
+                "backup" => Some(&backup),
+                _ => None,
+            };
+            if let Some(path) = original {
+                tokio::fs::create_dir_all(path.parent().unwrap())
+                    .await
+                    .unwrap();
+                tokio::fs::write(path, b"original").await.unwrap();
+            }
+            let journal = ContentJournal {
+                schema_version: 2,
+                transaction_id: transaction_id.clone(),
+                release_id: "release-1".into(),
+                content_sha256: "a".repeat(64),
+                phase: ContentJournalPhase::StreamingCommit,
+                files: vec![replace_journal_entry(
+                    "csgo/maps/de_resort.txt",
+                    b"complete new file",
+                    original.map(|_| b"original".as_slice()),
+                )],
+            };
+            write_journal(game, &journal).await.unwrap();
+
+            assert!(recover_pending_content(game).await.unwrap());
+            if original.is_some() {
+                assert_eq!(tokio::fs::read(&target).await.unwrap(), b"original");
+            } else {
+                assert!(!target.exists());
+            }
+            assert!(!staging_path(game, &transaction_id).exists());
+            assert!(!backup_path(game, &transaction_id).exists());
+            assert!(!journal_path(game).exists());
+            assert_eq!(tokio::fs::read(&pack).await.unwrap(), b"verified pack");
+            assert_eq!(tokio::fs::read(&part).await.unwrap(), b"download prefix");
+        }
+    }
+}
+
+#[tokio::test]
+async fn content_recovery_partial_staging_does_not_relax_target_or_backup_validation() {
+    for scenario in [
+        "commit",
+        "unexpected-target",
+        "changed-original",
+        "changed-backup",
+        "both",
+    ] {
+        let directory = tempdir().unwrap();
+        let game = directory.path();
+        let transaction_id = uuid::Uuid::new_v4().to_string();
+        let target = game.join("managed.bin");
+        let staged = staging_path(game, &transaction_id).join("managed.bin");
+        let backup = backup_path(game, &transaction_id).join("managed.bin");
+        tokio::fs::create_dir_all(staged.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&staged, b"partial").await.unwrap();
+        let target_bytes = match scenario {
+            "unexpected-target" | "changed-original" => Some(b"user file".as_slice()),
+            "both" => Some(b"new".as_slice()),
+            _ => None,
+        };
+        let backup_bytes = match scenario {
+            "changed-backup" => Some(b"wrong backup".as_slice()),
+            "both" => Some(b"original".as_slice()),
+            _ => None,
+        };
+        for (path, bytes) in [(&target, target_bytes), (&backup, backup_bytes)] {
+            if let Some(bytes) = bytes {
+                tokio::fs::create_dir_all(path.parent().unwrap())
+                    .await
+                    .unwrap();
+                tokio::fs::write(path, bytes).await.unwrap();
+            }
+        }
+        let had_original = matches!(scenario, "changed-original" | "changed-backup" | "both");
+        let journal = ContentJournal {
+            schema_version: 2,
+            transaction_id,
+            release_id: "release-1".into(),
+            content_sha256: "a".repeat(64),
+            phase: if scenario == "commit" {
+                ContentJournalPhase::Commit
+            } else {
+                ContentJournalPhase::StreamingCommit
+            },
+            files: vec![replace_journal_entry(
+                "managed.bin",
+                b"new",
+                had_original.then_some(b"original"),
+            )],
+        };
+        write_journal(game, &journal).await.unwrap();
+
+        assert!(recover_pending_content(game).await.is_err(), "{scenario}");
+        assert!(journal_path(game).exists());
+        assert_eq!(tokio::fs::read(&staged).await.unwrap(), b"partial");
+        for (path, bytes) in [(&target, target_bytes), (&backup, backup_bytes)] {
+            if let Some(bytes) = bytes {
+                assert_eq!(tokio::fs::read(path).await.unwrap(), bytes, "{scenario}");
+            } else {
+                assert!(!path.exists(), "{scenario}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn content_recovery_drains_started_entries_before_returning_an_error() {
+    let directory = tempdir().unwrap();
+    let game = directory.path();
+    let payload = vec![7_u8; 1024 * 1024];
+    let target = game.join("started.bin");
+    tokio::fs::write(&target, &payload).await.unwrap();
+    let journal = ContentJournal {
+        schema_version: 2,
+        transaction_id: uuid::Uuid::new_v4().to_string(),
+        release_id: "release-1".into(),
+        content_sha256: "a".repeat(64),
+        phase: ContentJournalPhase::StreamingCommit,
+        files: vec![
+            replace_journal_entry("inaccessible.bin", b"new", None),
+            replace_journal_entry("started.bin", &payload, None),
+        ],
+    };
+    write_journal(game, &journal).await.unwrap();
+    let hooks = FailContentFsOperation {
+        operation: ContentFsOperation::Boundary,
+        path: game.join("inaccessible.bin"),
+    };
+
+    assert!(recover_pending_content_with_hooks(game, &hooks)
+        .await
+        .is_err());
+    assert!(
+        !target.exists(),
+        "already-started rollback must finish before the operation lease is released"
+    );
+    assert!(journal_path(game).exists());
+}
+
+#[tokio::test]
 async fn content_recovery_pipelines_independent_entry_checks() {
     let directory = tempdir().unwrap();
     let game = directory.path();
