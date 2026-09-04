@@ -226,7 +226,8 @@ async fn drive_pack_planning_cache_spans_and_integrity_matrix() {
         VerifiedPackedChunk {
             raw_sha256: raw_sha.clone(),
             compressed_sha256: chunk.compressed_sha256.clone(),
-            path: pack,
+            source: crate::services::content_pack_stream::PackGeneration::open(&pack).unwrap(),
+            baseline_read: false,
             offset: 0,
             compressed_size: chunk.compressed_size,
             uncompressed_size: chunk.uncompressed_size,

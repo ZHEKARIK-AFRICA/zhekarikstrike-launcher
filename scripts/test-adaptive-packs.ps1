@@ -26,7 +26,7 @@ function Invoke-NativeChecked {
     }
 }
 
-Write-Host 'Adaptive pack probe uses <=2GiB received pack bodies in fixed2/adaptive/adaptive/fixed2 order.'
+Write-Host 'Adaptive pack probe compares baseline-adaptive versus optimized in ABBA order.'
 Write-Host 'Reports live under D:\zhekarik-adaptive-pack-probe; user installation untouched.'
 
 try {

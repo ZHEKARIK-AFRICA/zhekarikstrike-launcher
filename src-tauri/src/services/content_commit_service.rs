@@ -62,6 +62,9 @@ impl StagingBudget {
             ));
         }
         loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             {
                 let mut available = self.available.lock().await;
                 if *available >= bytes {
@@ -71,7 +74,7 @@ impl StagingBudget {
             }
             tokio::select! {
                 _ = cancellation.cancelled() => return Err(AppError::Canceled),
-                _ = self.changed.notified() => {}
+                _ = &mut notified => {}
             }
         }
     }
@@ -93,9 +96,19 @@ pub struct CommitContext {
 }
 
 pub async fn run_streaming_commit(
+    context: CommitContext,
+    artifacts: mpsc::Receiver<VerifiedArtifact>,
+    cancellation: CancellationToken,
+) -> Result<ContentCompletionState, AppError> {
+    run_streaming_commit_verified(context, artifacts, cancellation, None).await
+}
+
+/// Files can be committed early; final inventory/state requires every pack hash.
+pub async fn run_streaming_commit_verified(
     mut context: CommitContext,
     mut artifacts: mpsc::Receiver<VerifiedArtifact>,
     cancellation: CancellationToken,
+    mut download_done: Option<tokio::sync::oneshot::Receiver<bool>>,
 ) -> Result<ContentCompletionState, AppError> {
     context.inventory.validate()?;
     context.journal.validate()?;
@@ -164,11 +177,21 @@ pub async fn run_streaming_commit(
         if let Err(error) = result {
             cancellation.cancel();
             drain_artifacts(&mut artifacts, &context.staging_budget).await;
+            if let Some(done) = download_done.take() {
+                let _ = done.await;
+            }
             return rollback(&context.game_path, &context.journal, error).await;
         }
         let _ = context.committed.send(artifact.size).await;
     }
 
+    if let Some(download_done) = download_done {
+        // All artifact reservations have been released before waiting here.
+        let verified = download_done.await.unwrap_or(false);
+        if !verified {
+            cancellation.cancel();
+        }
+    }
     if cancellation_seen || cancellation.is_cancelled() {
         return rollback(&context.game_path, &context.journal, AppError::Canceled).await;
     }

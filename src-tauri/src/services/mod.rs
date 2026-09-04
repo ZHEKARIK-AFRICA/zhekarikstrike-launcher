@@ -14,6 +14,8 @@ pub mod content_pack_download_service;
 pub mod content_pack_install_service;
 pub(crate) mod content_pack_metrics;
 pub mod content_pack_plan_service;
+pub(crate) mod content_pack_speed_controller;
+pub(crate) mod content_pack_stream;
 pub mod discord_rpc_service;
 pub mod disk_service;
 pub mod download_service;

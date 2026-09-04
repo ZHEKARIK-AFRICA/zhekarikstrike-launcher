@@ -1,10 +1,16 @@
+#[cfg(test)]
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
 const MIN_JUDGMENT_BYTES: u64 = 64 * 1024 * 1024;
+#[cfg(test)]
 const MAX_TRIAL_BACKLOG: u64 = 256 * 1024 * 1024;
+#[cfg(test)]
 const OUTLIER_PEER_RATE: f64 = 512.0 * 1024.0;
+#[cfg(test)]
 const COOLDOWN: Duration = Duration::from_secs(20);
+#[cfg(test)]
 const PRESSURE_WINDOW: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,9 +38,12 @@ pub struct PressureWindow {
 
 #[derive(Debug, Clone)]
 pub struct ControllerSample {
+    #[cfg_attr(not(test), allow(dead_code))]
+    // Historical baseline telemetry, test-only controller.
     pub useful_bytes: u64,
     /// Verified compressed bytes not yet consumed by a materializer; never the
     /// amount of content still waiting to be downloaded.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub ready_backlog_bytes: u64,
     pub pressure: PressureWindow,
     pub active_attempts: Vec<AttemptProgress>,
@@ -83,17 +92,20 @@ pub struct ControllerDecision {
 }
 
 #[derive(Debug, Clone)]
+#[cfg(test)]
 pub struct ControllerTrial {
     previous_target: usize,
     baseline: f64,
 }
 
 #[derive(Debug, Clone)]
+#[cfg(test)]
 struct PressureEvent {
     at: Instant,
 }
 
 #[derive(Debug, Clone)]
+#[cfg(test)]
 pub struct AdaptivePackController {
     target: usize,
     maximum: usize,
@@ -107,6 +119,7 @@ pub struct AdaptivePackController {
     window_started_at: Option<Instant>,
 }
 
+#[cfg(test)]
 impl AdaptivePackController {
     pub fn new(maximum: usize) -> Self {
         let maximum = maximum.clamp(2, 6);

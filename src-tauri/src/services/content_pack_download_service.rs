@@ -1,5 +1,5 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, VecDeque};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -7,16 +7,22 @@ use std::time::{Duration, Instant};
 use futures_util::StreamExt;
 use reqwest::{header, Client, Response, StatusCode, Url};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+use super::content_pack_controller::AdaptivePackController;
+use super::content_pack_speed_controller::{
+    OptimizedPackController, SpeedSample, WorkQueueController,
+};
+use super::content_pack_stream::{create_generation, ChunkStream, PackGeneration};
 use crate::error::AppError;
 use crate::models::{DrivePackManifest, PackedContentChunk};
 use crate::services::content_pack_cache_service::PackCache;
 use crate::services::content_pack_controller::{
-    AdaptivePackController, AttemptProgress, ControllerSample, PackSource, PressureWindow,
+    AttemptProgress, ControllerSample, PackSource, PressureWindow,
 };
 use crate::services::content_pack_metrics::{Activity, PackRunOptions, RequestGuard, Snapshot};
 use crate::services::content_pack_plan_service::{ByteRange, PackFetchPlan, PackTransferMode};
@@ -28,25 +34,26 @@ const MAX_REPLICA_ATTEMPTS: usize = 2;
 const FULL_PACK_REQUEST_SIZE: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
-pub struct VerifiedPackedChunk {
+pub(crate) struct VerifiedPackedChunk {
     pub raw_sha256: String,
     pub compressed_sha256: String,
-    pub path: PathBuf,
+    pub source: Arc<PackGeneration>,
+    #[cfg(test)]
+    pub baseline_read: bool,
     pub offset: u64,
     pub compressed_size: u64,
     pub uncompressed_size: u64,
 }
 
 #[derive(Debug, Clone)]
-pub enum PackDownloadEvent {
+pub(crate) enum PackDownloadEvent {
     ChunkReady(VerifiedPackedChunk),
     UsefulBytes { pack_sha256: String, bytes: u64 },
 }
 
 #[derive(Debug, Default)]
-pub struct PackDownloadSummary {
+pub(crate) struct PackDownloadSummary {
     pub network_bytes: u64,
-    pub chunks: HashMap<String, VerifiedPackedChunk>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -71,7 +78,6 @@ struct AttemptError {
 struct JobResult {
     pack_sha256: String,
     network_bytes: u64,
-    chunks: Vec<VerifiedPackedChunk>,
 }
 
 #[derive(Clone)]
@@ -104,7 +110,10 @@ pub(crate) async fn download_pack_fetches(
     let useful_bytes = Arc::new(AtomicU64::new(0));
     let active_attempts = Arc::new(Mutex::new(BTreeMap::<String, ActiveAttempt>::new()));
     let pressure = Arc::new(Mutex::new(PressureAccumulator::default()));
-    let mut controller = AdaptivePackController::new(6);
+    let mut controller = OptimizedPackController::new(6);
+    #[cfg(test)]
+    let mut baseline_controller = AdaptivePackController::new(6);
+    let mut queue_controller = WorkQueueController::new();
     let mut ticker = tokio::time::interval(options.interval());
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut jobs = JoinSet::new();
@@ -114,7 +123,14 @@ pub(crate) async fn download_pack_fetches(
     let clock_start = Instant::now();
 
     loop {
-        while jobs.len() < options.target(controller.target()) && !pending.is_empty() {
+        let target = controller.target();
+        #[cfg(test)]
+        let target = if options.optimized() {
+            target
+        } else {
+            baseline_controller.target()
+        };
+        while jobs.len() < options.target(target) && !pending.is_empty() {
             let plan = pending.pop_front().expect("pending plan must exist");
             let client = client.clone();
             let manifest = manifest.clone();
@@ -184,7 +200,15 @@ pub(crate) async fn download_pack_fetches(
                     at
                 } else { Instant::now() };
                 #[cfg(not(test))] let now = Instant::now();
-                let decision = controller.observe(now, sample);
+                let stats = options.metrics.snapshot();
+                let queue = queue_controller.observe(now, stats.raw_ready_bytes, ready_backlog_bytes, stats.materialized_bytes, stats.active_work_sec, stats.available_memory);
+                options.metrics.queue_estimate(queue.limit_bytes, queue.seconds);
+                let decision = controller.observe(now, SpeedSample {
+                    unique_bytes: stats.unique_bytes, active_jobs: stats.active_jobs, pending_jobs: pending.len(),
+                    allow_increase: queue.allow_increase, reduce_for_backlog: queue.reduce,
+                    integrity_epoch: stats.integrity_epoch, pressure: sample.pressure.clone(), active_attempts: sample.active_attempts.clone(),
+                });
+                #[cfg(test)] let decision = if options.optimized() {decision} else {baseline_controller.observe(now, sample)};
                 let reason = decision.reason.as_str();
                 #[cfg(test)] let reason = if options.fixed_jobs.is_some() { "fixed_baseline" } else { reason };
                 let changed = decision.changed;
@@ -224,9 +248,6 @@ pub(crate) async fn download_pack_fetches(
                     }
                 };
                 summary.network_bytes = summary.network_bytes.saturating_add(result.network_bytes);
-                for chunk in result.chunks {
-                    summary.chunks.insert(chunk.raw_sha256.clone(), chunk);
-                }
                 active_attempts.lock().await.remove(&result.pack_sha256);
             }
         }
@@ -268,16 +289,21 @@ async fn download_pack_job(
             let verified = cache.full_path(&plan.pack_sha256)?;
             if verified_full_pack(&verified, pack.size, &plan.pack_sha256).await? {
                 options.metrics.verified(pack.size);
-                let chunks = full_pack_chunks(&manifest, &plan, &verified)?;
+                let chunks = full_pack_chunks(&manifest, &plan, &verified, !options.optimized())?;
                 publish_ready_chunks(&events, &chunks).await?;
                 return Ok(JobResult {
                     pack_sha256: plan.pack_sha256,
                     network_bytes,
-                    chunks,
                 });
             }
             PackCache::discard(&verified).await?;
             let partial = cache.full_partial_path(&plan.pack_sha256)?;
+            options.traffic.observe(
+                &plan.pack_sha256,
+                0,
+                partial_length(&partial, pack.size).await?,
+            );
+            let mut generation = create_generation(&partial).await?;
             for replica_index in replica_order {
                 if disabled_replicas.contains(&replica_index) {
                     continue;
@@ -305,6 +331,10 @@ async fn download_pack_job(
                             preempt: &preempt,
                             active_attempts: &active_attempts,
                             options: &options,
+                            manifest: &manifest,
+                            plan: &plan,
+                            events: &events,
+                            generation: generation.clone(),
                         },
                         &partial,
                         pack.size,
@@ -314,15 +344,19 @@ async fn download_pack_job(
                         Ok(bytes) => {
                             network_bytes = network_bytes.saturating_add(bytes);
                             PackCache::promote(&partial, &verified).await?;
-                            options.metrics.verified(pack.size);
+                            generation.relocated(&verified);
+                            if !options.optimized() {
+                                options.metrics.verified(pack.size);
+                            }
                             publish_useful_bytes(&events, &useful_bytes, &plan.pack_sha256, bytes)
                                 .await?;
-                            let chunks = full_pack_chunks(&manifest, &plan, &verified)?;
-                            publish_ready_chunks(&events, &chunks).await?;
+                            if !options.optimized() {
+                                let chunks = full_pack_chunks(&manifest, &plan, &verified, true)?;
+                                publish_ready_chunks(&events, &chunks).await?;
+                            }
                             return Ok(JobResult {
                                 pack_sha256: plan.pack_sha256,
                                 network_bytes,
-                                chunks,
                             });
                         }
                         Err(failure) => {
@@ -334,7 +368,14 @@ async fn download_pack_job(
                             let retryable = matches!(failure.class, AttemptClass::Retryable);
                             let preempted = matches!(failure.class, AttemptClass::Preempted);
                             if matches!(failure.class, AttemptClass::Integrity) {
-                                PackCache::discard(&partial).await?;
+                                options.metrics.integrity_failed();
+                                generation.retire().await?;
+                                // Available space already excludes retired generations still held by readers.
+                                super::disk_service::ensure_disk_space(
+                                    partial.parent().expect("pack cache parent"),
+                                    pack.size + 2 * 1024 * 1024 * 1024,
+                                )?;
+                                generation = create_generation(&partial).await?;
                             }
                             if matches!(
                                 failure.class,
@@ -358,13 +399,20 @@ async fn download_pack_job(
             }
         }
         PackTransferMode::Ranges(ranges) => {
-            let mut ready = Vec::new();
             for range in ranges {
                 let verified = cache.range_path(&plan.pack_sha256, *range)?;
                 if !verified_range(&verified, *range, &manifest, &plan.required_chunks).await? {
                     PackCache::discard(&verified).await?;
                     let partial = cache.range_partial_path(&plan.pack_sha256, *range)?;
-                    PackCache::discard(&partial).await?;
+                    if !options.optimized() {
+                        PackCache::discard(&partial).await?;
+                    }
+                    options.traffic.observe(
+                        &plan.pack_sha256,
+                        range.start,
+                        range.start + partial_length(&partial, range.len()?).await?,
+                    );
+                    let mut generation = create_generation(&partial).await?;
                     let mut downloaded = false;
                     for &replica_index in &replica_order {
                         if disabled_replicas.contains(&replica_index) {
@@ -395,18 +443,23 @@ async fn download_pack_job(
                                 &preempt,
                                 &active_attempts,
                                 &options,
+                                &manifest,
+                                &plan.required_chunks,
+                                &events,
+                                generation.clone(),
                             )
                             .await
                             {
                                 Ok(bytes) => {
                                     network_bytes = network_bytes.saturating_add(bytes);
-                                    if !verified_range(
-                                        &partial,
-                                        *range,
-                                        &manifest,
-                                        &plan.required_chunks,
-                                    )
-                                    .await?
+                                    if !options.optimized()
+                                        && !verified_range(
+                                            &partial,
+                                            *range,
+                                            &manifest,
+                                            &plan.required_chunks,
+                                        )
+                                        .await?
                                     {
                                         PackCache::discard(&partial).await?;
                                         last_error = Some(AppError::InvalidData(
@@ -417,7 +470,10 @@ async fn download_pack_job(
                                         break;
                                     }
                                     PackCache::promote(&partial, &verified).await?;
-                                    options.metrics.verified(bytes);
+                                    generation.relocated(&verified);
+                                    if !options.optimized() {
+                                        options.metrics.verified(bytes);
+                                    }
                                     publish_useful_bytes(
                                         &events,
                                         &useful_bytes,
@@ -432,7 +488,9 @@ async fn download_pack_job(
                                     network_bytes =
                                         network_bytes.saturating_add(failure.network_bytes);
                                     if matches!(&failure.error, AppError::Canceled) {
-                                        PackCache::discard(&partial).await?;
+                                        if !options.optimized() {
+                                            PackCache::discard(&partial).await?;
+                                        }
                                         return Err(AppError::Canceled);
                                     }
                                     record_pressure(&pressure, &failure).await;
@@ -448,7 +506,17 @@ async fn download_pack_job(
                                         disabled_replicas.insert(replica_index);
                                     }
                                     last_error = Some(failure.error);
-                                    PackCache::discard(&partial).await?;
+                                    if matches!(failure.class, AttemptClass::Integrity)
+                                        || !options.optimized()
+                                    {
+                                        options.metrics.integrity_failed();
+                                        generation.retire().await?;
+                                        super::disk_service::ensure_disk_space(
+                                            partial.parent().expect("range cache parent"),
+                                            range.len()? + 2 * 1024 * 1024 * 1024,
+                                        )?;
+                                        generation = create_generation(&partial).await?;
+                                    }
                                     if preempted {
                                         break;
                                     }
@@ -470,14 +538,13 @@ async fn download_pack_job(
                         }));
                     }
                 }
-                let chunks = range_chunks(&manifest, &plan, *range, &verified)?;
+                let chunks =
+                    range_chunks(&manifest, &plan, *range, &verified, !options.optimized())?;
                 publish_ready_chunks(&events, &chunks).await?;
-                ready.extend(chunks);
             }
             return Ok(JobResult {
                 pack_sha256: plan.pack_sha256,
                 network_bytes,
-                chunks: ready,
             });
         }
     }
@@ -495,6 +562,10 @@ struct FullDownloadAttempt<'a> {
     preempt: &'a CancellationToken,
     active_attempts: &'a Mutex<BTreeMap<String, ActiveAttempt>>,
     options: &'a PackRunOptions,
+    manifest: &'a DrivePackManifest,
+    plan: &'a PackFetchPlan,
+    events: &'a mpsc::Sender<PackDownloadEvent>,
+    generation: Arc<PackGeneration>,
 }
 
 async fn download_full_attempt(
@@ -502,12 +573,44 @@ async fn download_full_attempt(
     partial: &Path,
     pack_size: u64,
 ) -> Result<u64, AttemptError> {
-    let (mut offset, mut hasher) = inspect_full_partial(partial, pack_size).await?;
+    let mut chunk_stream = attempt.options.optimized().then(|| {
+        ChunkStream::new(
+            attempt.manifest,
+            &attempt.plan.required_chunks,
+            attempt.generation.clone(),
+            0,
+            pack_size,
+        )
+    });
+    let (mut offset, mut hasher) = if let Some(chunks) = &mut chunk_stream {
+        let (offset, hasher, ready) = chunks
+            .resume(partial, &attempt.options.metrics)
+            .await
+            .map_err(|error| AttemptError {
+                error,
+                class: AttemptClass::Integrity,
+                retry_after: None,
+                pressure: false,
+                throttled: false,
+                network_bytes: 0,
+            })?;
+        publish_stream_chunks(
+            chunks,
+            ready,
+            attempt.events,
+            attempt.cancellation,
+            &attempt.options.metrics,
+        )
+        .await
+        .map_err(fatal)?;
+        (offset, hasher)
+    } else {
+        inspect_full_partial(partial, pack_size).await?
+    };
     if offset == pack_size {
         if hex::encode(hasher.finalize()) == attempt.pack_sha256 {
             return Ok(0);
         }
-        PackCache::discard(partial).await.map_err(fatal)?;
         return Err(integrity("completed pack partial failed SHA-256", 0));
     }
     let initial_offset = offset;
@@ -559,6 +662,9 @@ async fn download_full_attempt(
                 attempt.active_attempts,
                 &mut hasher,
                 &mut request_guard,
+                attempt.options,
+                chunk_stream.as_mut(),
+                Some(attempt.events),
             )
             .await,
             completed_bytes,
@@ -611,27 +717,71 @@ async fn download_range_attempt(
     preempt: &CancellationToken,
     active_attempts: &Mutex<BTreeMap<String, ActiveAttempt>>,
     options: &PackRunOptions,
+    manifest: &DrivePackManifest,
+    required: &[String],
+    events: &mpsc::Sender<PackDownloadEvent>,
+    generation: Arc<PackGeneration>,
 ) -> Result<u64, AttemptError> {
+    let mut chunks = options.optimized().then(|| {
+        ChunkStream::new(
+            manifest,
+            required,
+            generation,
+            range.start,
+            range.end_inclusive + 1,
+        )
+    });
+    let mut hasher = Sha256::new();
+    let offset = if let Some(stream) = &mut chunks {
+        let (offset, hash, ready) =
+            stream
+                .resume(partial, &options.metrics)
+                .await
+                .map_err(|error| AttemptError {
+                    error,
+                    class: AttemptClass::Integrity,
+                    retry_after: None,
+                    pressure: false,
+                    throttled: false,
+                    network_bytes: 0,
+                })?;
+        hasher = hash;
+        publish_stream_chunks(stream, ready, events, cancellation, &options.metrics)
+            .await
+            .map_err(fatal)?;
+        offset
+    } else {
+        0
+    };
+    if offset == range.len().map_err(fatal)? {
+        return Ok(0);
+    }
+    let request_range = ByteRange {
+        start: range.start + offset,
+        end_inclusive: range.end_inclusive,
+    };
     let mut request_guard = options
-        .request(range.len().map_err(fatal)?)
+        .request(request_range.len().map_err(fatal)?)
         .map_err(fatal)?;
     let request = client
         .get(url.clone())
         .header(header::ACCEPT_ENCODING, "identity")
         .header(
             header::RANGE,
-            format!("bytes={}-{}", range.start, range.end_inclusive),
+            format!(
+                "bytes={}-{}",
+                request_range.start, request_range.end_inclusive
+            ),
         );
     let started = Instant::now();
     let response = send_attempt(request, cancellation, preempt).await?;
     update_header_latency(active_attempts, pack_sha256, started.elapsed()).await;
     validate_common_response(&response, url, pack_sha256)?;
-    validate_range_headers(&response, range, pack_size)?;
-    let mut unused_hasher = Sha256::new();
+    validate_range_headers(&response, request_range, pack_size)?;
     stream_response(
         response,
         partial,
-        0,
+        offset,
         range.len().map_err(fatal)?,
         range.start,
         pack_sha256,
@@ -639,11 +789,14 @@ async fn download_range_attempt(
         cancellation,
         preempt,
         active_attempts,
-        &mut unused_hasher,
+        &mut hasher,
         &mut request_guard,
+        options,
+        chunks.as_mut(),
+        Some(events),
     )
     .await?;
-    range.len().map_err(fatal)
+    request_range.len().map_err(fatal)
 }
 
 async fn send_attempt(
@@ -749,6 +902,9 @@ async fn stream_response(
     active_attempts: &Mutex<BTreeMap<String, ActiveAttempt>>,
     hasher: &mut Sha256,
     request_guard: &mut RequestGuard,
+    run_options: &PackRunOptions,
+    mut chunk_stream: Option<&mut ChunkStream>,
+    events: Option<&mpsc::Sender<PackDownloadEvent>>,
 ) -> Result<(), AttemptError> {
     let mut options = tokio::fs::OpenOptions::new();
     options.create(true).write(true);
@@ -757,53 +913,95 @@ async fn stream_response(
     } else {
         options.truncate(true);
     }
-    let mut output = options.open(partial).await.map_err(fatal)?;
+    let file = options.open(partial).await.map_err(fatal)?;
+    let mut output = BufWriter::with_capacity(
+        if run_options.optimized() {
+            1024 * 1024
+        } else {
+            0
+        },
+        file,
+    );
     let mut written = offset;
     let mut network_bytes = 0_u64;
     let mut stream = response.bytes_stream();
-    loop {
-        let next = tokio::select! {
-            _ = cancellation.cancelled() => return Err(cancelled_with_bytes(network_bytes)),
-            _ = preempt.cancelled() => return Err(preempted_with_bytes(network_bytes)),
-            next = tokio::time::timeout(IDLE_TIMEOUT, stream.next()) => match next {
-                Ok(next) => next,
-                Err(_) => return Err(retryable(
-                    AppError::Network("Google Drive pack download stalled".into()),
-                    None,
-                    true,
-                    false,
+    let transfer_result: Result<(), AttemptError> = async {
+        loop {
+            let next = tokio::select! {
+                _ = cancellation.cancelled() => return Err(cancelled_with_bytes(network_bytes)),
+                _ = preempt.cancelled() => return Err(preempted_with_bytes(network_bytes)),
+                next = tokio::time::timeout(IDLE_TIMEOUT, stream.next()) => match next {
+                    Ok(next) => next,
+                    Err(_) => return Err(retryable(
+                        AppError::Network("Google Drive pack download stalled".into()),
+                        None,
+                        true,
+                        false,
+                        network_bytes,
+                    )),
+                }
+            };
+            let Some(next) = next else { break };
+            let bytes =
+                next.map_err(|error| retryable(error.into(), None, true, false, network_bytes))?;
+            request_guard.received(bytes.len() as u64).map_err(fatal)?;
+            let unique = run_options.traffic.observe(
+                pack_sha256,
+                reported_base_offset + written,
+                reported_base_offset + written + bytes.len() as u64,
+            );
+            run_options.metrics.unique(unique);
+            let previous_offset = written;
+            written = written.checked_add(bytes.len() as u64).ok_or_else(|| {
+                integrity("Google Drive pack response size overflow", network_bytes)
+            })?;
+            if written > expected_size {
+                return Err(integrity(
+                    "Google Drive pack response exceeded its declared size",
                     network_bytes,
-                )),
+                ));
             }
-        };
-        let Some(next) = next else { break };
-        let bytes =
-            next.map_err(|error| retryable(error.into(), None, true, false, network_bytes))?;
-        request_guard.received(bytes.len() as u64).map_err(fatal)?;
-        written = written
-            .checked_add(bytes.len() as u64)
-            .ok_or_else(|| integrity("Google Drive pack response size overflow", network_bytes))?;
-        if written > expected_size {
-            return Err(integrity(
-                "Google Drive pack response exceeded its declared size",
-                network_bytes,
-            ));
+            output.write_all(&bytes).await.map_err(fatal)?;
+            hasher.update(&bytes);
+            network_bytes = network_bytes.saturating_add(bytes.len() as u64);
+            if let Some(chunks) = &mut chunk_stream {
+                let ready = chunks
+                    .feed(reported_base_offset + previous_offset, &bytes)
+                    .map_err(|_| {
+                        integrity("streamed compressed chunk failed SHA-256", network_bytes)
+                    })?;
+                if !ready.is_empty() {
+                    output.flush().await.map_err(fatal)?;
+                    publish_stream_chunks(
+                        chunks,
+                        ready,
+                        events.expect("early chunk event sender"),
+                        cancellation,
+                        &run_options.metrics,
+                    )
+                    .await
+                    .map_err(fatal)?;
+                }
+            }
+            update_attempt_progress(
+                active_attempts,
+                pack_sha256,
+                replica_index,
+                reported_base_offset.saturating_add(written),
+                bytes.len() as u64,
+            )
+            .await;
         }
-        output.write_all(&bytes).await.map_err(fatal)?;
-        hasher.update(&bytes);
-        network_bytes = network_bytes.saturating_add(bytes.len() as u64);
-        update_attempt_progress(
-            active_attempts,
-            pack_sha256,
-            replica_index,
-            reported_base_offset.saturating_add(written),
-            bytes.len() as u64,
-        )
-        .await;
+        Ok(())
     }
+    .await;
     request_guard.response_finished();
-    output.flush().await.map_err(fatal)?;
-    output.sync_all().await.map_err(fatal)?;
+    // Even a canceled/failed attempt must drain in-flight filesystem writes;
+    // otherwise retry/rollback can race a detached tokio file write.
+    let flushed = output.flush().await.map_err(fatal);
+    transfer_result?;
+    flushed?;
+    output.get_ref().sync_all().await.map_err(fatal)?;
     if written != expected_size {
         return Err(retryable(
             AppError::Network("Google Drive pack response ended before exact EOF".into()),
@@ -895,10 +1093,11 @@ fn full_pack_chunks(
     manifest: &DrivePackManifest,
     plan: &PackFetchPlan,
     path: &Path,
+    baseline: bool,
 ) -> Result<Vec<VerifiedPackedChunk>, AppError> {
     plan.required_chunks
         .iter()
-        .map(|raw_sha| packed_chunk_location(raw_sha, &manifest.chunks[raw_sha], path, 0))
+        .map(|raw_sha| packed_chunk_location(raw_sha, &manifest.chunks[raw_sha], path, 0, baseline))
         .collect()
 }
 
@@ -907,6 +1106,7 @@ fn range_chunks(
     plan: &PackFetchPlan,
     range: ByteRange,
     path: &Path,
+    baseline: bool,
 ) -> Result<Vec<VerifiedPackedChunk>, AppError> {
     plan.required_chunks
         .iter()
@@ -914,7 +1114,7 @@ fn range_chunks(
             let chunk = &manifest.chunks[raw_sha];
             range
                 .contains(chunk.offset, chunk.compressed_size)
-                .then(|| packed_chunk_location(raw_sha, chunk, path, range.start))
+                .then(|| packed_chunk_location(raw_sha, chunk, path, range.start, baseline))
         })
         .collect()
 }
@@ -924,11 +1124,16 @@ fn packed_chunk_location(
     chunk: &PackedContentChunk,
     path: &Path,
     base_offset: u64,
+    baseline: bool,
 ) -> Result<VerifiedPackedChunk, AppError> {
+    #[cfg(not(test))]
+    let _ = baseline;
     Ok(VerifiedPackedChunk {
         raw_sha256: raw_sha.to_string(),
         compressed_sha256: chunk.compressed_sha256.clone(),
-        path: path.to_path_buf(),
+        source: PackGeneration::open(path)?,
+        #[cfg(test)]
+        baseline_read: baseline,
         offset: chunk
             .offset
             .checked_sub(base_offset)
@@ -947,6 +1152,33 @@ async fn publish_ready_chunks(
             .send(PackDownloadEvent::ChunkReady(chunk.clone()))
             .await
             .map_err(|_| AppError::Canceled)?;
+    }
+    Ok(())
+}
+
+async fn publish_stream_chunks(
+    stream: &ChunkStream,
+    ready: Vec<(String, PackedContentChunk)>,
+    events: &mpsc::Sender<PackDownloadEvent>,
+    cancellation: &CancellationToken,
+    metrics: &crate::services::content_pack_metrics::PackMetrics,
+) -> Result<(), AppError> {
+    for (raw, chunk) in ready {
+        metrics.verified_chunk(&raw, chunk.compressed_size);
+        let location = VerifiedPackedChunk {
+            raw_sha256: raw,
+            compressed_sha256: chunk.compressed_sha256,
+            source: stream.source.clone(),
+            #[cfg(test)]
+            baseline_read: false,
+            offset: chunk.offset - stream.base,
+            compressed_size: chunk.compressed_size,
+            uncompressed_size: chunk.uncompressed_size,
+        };
+        tokio::select! {
+            _=cancellation.cancelled()=>return Err(AppError::Canceled),
+            result=events.send(PackDownloadEvent::ChunkReady(location))=>result.map_err(|_|AppError::Canceled)?,
+        }
     }
     Ok(())
 }

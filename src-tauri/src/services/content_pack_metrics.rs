@@ -15,6 +15,11 @@ struct Inner {
     requests: Counter,
     materializers: Counter,
     network: AtomicU64,
+    unique: AtomicU64,
+    integrity_epoch: AtomicU64,
+    work_us: AtomicU64,
+    raw_ready: AtomicU64,
+    verified_chunks: Mutex<std::collections::HashSet<String>>,
     verified: AtomicU64,
     materialized: AtomicU64,
     committed: AtomicU64,
@@ -57,6 +62,13 @@ pub(crate) struct Snapshot {
     pub pending_jobs: usize,
     pub ready_backlog_bytes: u64,
     pub received_bytes: u64,
+    pub unique_bytes: u64,
+    pub integrity_epoch: u64,
+    pub active_work_sec: f64,
+    pub raw_ready_bytes: u64,
+    pub queue_limit_bytes: u64,
+    pub queue_seconds: Option<f64>,
+    pub first_materialized_sec: Option<f64>,
     pub verified_bytes: u64,
     pub materialized_bytes: u64,
     pub committed_bytes: u64,
@@ -85,6 +97,11 @@ impl PackMetrics {
             requests: Counter::default(),
             materializers: Counter::default(),
             network: AtomicU64::new(0),
+            unique: AtomicU64::new(0),
+            integrity_epoch: AtomicU64::new(0),
+            work_us: AtomicU64::new(0),
+            raw_ready: AtomicU64::new(0),
+            verified_chunks: Mutex::new(std::collections::HashSet::new()),
             verified: AtomicU64::new(0),
             materialized: AtomicU64::new(0),
             committed: AtomicU64::new(0),
@@ -114,11 +131,50 @@ impl PackMetrics {
     pub fn received(&self, bytes: u64) {
         self.0.network.fetch_add(bytes, Relaxed);
     }
+    pub fn unique(&self, bytes: u64) {
+        self.0.unique.fetch_add(bytes, Relaxed);
+    }
+    pub fn integrity_failed(&self) {
+        self.0.integrity_epoch.fetch_add(1, Relaxed);
+    }
+    pub fn raw_ready(&self, bytes: u64) {
+        self.0.raw_ready.fetch_add(bytes, Relaxed);
+    }
+    pub fn raw_consumed(&self, bytes: u64) {
+        self.0.raw_ready.fetch_sub(bytes, Relaxed);
+    }
+    pub fn worked(&self, duration: Duration) {
+        let workers = self.0.materializers.current.load(Relaxed).max(1) as u128;
+        self.0.work_us.fetch_add(
+            (duration.as_micros() / workers).min(u64::MAX as u128) as u64,
+            Relaxed,
+        );
+    }
+    pub fn queue_estimate(&self, limit: u64, seconds: Option<f64>) {
+        let mut state = self.0.state.lock().expect("pack metrics mutex");
+        state.queue_limit_bytes = limit;
+        state.queue_seconds = seconds;
+    }
     pub fn verified(&self, bytes: u64) {
         self.0.verified.fetch_add(bytes, Relaxed);
     }
+    pub fn verified_chunk(&self, sha: &str, bytes: u64) {
+        if self
+            .0
+            .verified_chunks
+            .lock()
+            .expect("verified chunks")
+            .insert(sha.to_owned())
+        {
+            self.verified(bytes);
+        }
+    }
     pub fn materialized(&self, bytes: u64) {
         self.0.materialized.fetch_add(bytes, Relaxed);
+        let mut state = self.0.state.lock().expect("pack metrics mutex");
+        state
+            .first_materialized_sec
+            .get_or_insert_with(|| self.0.started.elapsed().as_secs_f64());
     }
     pub fn committed(&self, bytes: u64) {
         self.0.committed.fetch_add(bytes, Relaxed);
@@ -189,6 +245,10 @@ impl PackMetrics {
         s.peak_requests = self.0.requests.peak.load(Relaxed);
         s.active_materializers = self.0.materializers.current.load(Relaxed);
         s.received_bytes = self.0.network.load(Relaxed);
+        s.unique_bytes = self.0.unique.load(Relaxed);
+        s.integrity_epoch = self.0.integrity_epoch.load(Relaxed);
+        s.active_work_sec = self.0.work_us.load(Relaxed) as f64 / 1e6;
+        s.raw_ready_bytes = self.0.raw_ready.load(Relaxed);
         s.verified_bytes = self.0.verified.load(Relaxed);
         s.materialized_bytes = self.0.materialized.load(Relaxed);
         s.committed_bytes = self.0.committed.load(Relaxed);
@@ -238,6 +298,9 @@ impl Drop for ActivityGuard {
 #[derive(Clone)]
 pub(crate) struct PackRunOptions {
     pub metrics: PackMetrics,
+    pub traffic: Arc<super::content_pack_stream::UniqueTraffic>,
+    #[cfg(test)]
+    pub profile: PackProfile,
     #[cfg(test)]
     pub fixed_jobs: Option<usize>,
     #[cfg(test)]
@@ -250,10 +313,20 @@ pub(crate) struct PackRunOptions {
     pub budget: Option<Arc<ProbeBudget>>,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PackProfile {
+    Baseline,
+    Optimized,
+}
+
 impl PackRunOptions {
     pub fn new(operation: &str) -> Self {
         Self {
             metrics: PackMetrics::new(operation),
+            traffic: Arc::new(super::content_pack_stream::UniqueTraffic::default()),
+            #[cfg(test)]
+            profile: PackProfile::Optimized,
             #[cfg(test)]
             fixed_jobs: None,
             #[cfg(test)]
@@ -264,6 +337,16 @@ impl PackRunOptions {
             clock_ms: None,
             #[cfg(test)]
             budget: None,
+        }
+    }
+    pub fn optimized(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.profile == PackProfile::Optimized
+        }
+        #[cfg(not(test))]
+        {
+            true
         }
     }
     pub fn target(&self, adaptive: usize) -> usize {

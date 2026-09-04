@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 use sysinfo::System;
 use tauri::AppHandle;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, watch, RwLock};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -21,7 +21,7 @@ use crate::models::{
 use crate::services::api_client::ApiClient;
 use crate::services::config_service;
 use crate::services::content_commit_service::{
-    queue_success_cleanup, retry_background_cleanup, run_streaming_commit, CommitContext,
+    queue_success_cleanup, retry_background_cleanup, run_streaming_commit_verified, CommitContext,
     StagingBudget, VerifiedArtifact,
 };
 use crate::services::content_download_service::{decode_verified_chunk, read_verified_local_chunk};
@@ -322,6 +322,19 @@ async fn run_packed_pipeline(
     let readiness = Arc::new(readiness);
     let packed_chunks = Arc::new(RwLock::new(HashMap::new()));
     let consumed_chunks = Arc::new(Mutex::new(HashSet::new()));
+    let remaining = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
+    for file in &prepared {
+        for raw in &file.file.chunks {
+            if !stable_sources.contains_key(raw) {
+                *remaining
+                    .lock()
+                    .expect("chunk consumers")
+                    .entry(raw.clone())
+                    .or_default() += 1;
+            }
+        }
+    }
+    let (download_done_tx, download_done_rx) = tokio::sync::oneshot::channel();
     let (pack_events_tx, pack_events_rx) = mpsc::channel(64);
     let (artifacts_tx, artifacts_rx) = mpsc::channel(2);
     let (committed_tx, committed_rx) = mpsc::channel(16);
@@ -347,33 +360,44 @@ async fn run_packed_pipeline(
         if result.is_err() {
             download_cancel.cancel();
         }
+        let _ = download_done_tx.send(result.is_ok());
         result.map(|_| ())
     };
     let dispatch_cancel = cancellation.clone();
-    let dispatch = dispatch_pack_events(
-        pack_events_rx,
-        manifest.clone(),
-        packed_chunks.clone(),
-        readiness.clone(),
-        ready_backlog.clone(),
-        progress.clone(),
-        dispatch_cancel,
-    );
+    let dispatch = async {
+        let result = dispatch_pack_events(
+            pack_events_rx,
+            manifest.clone(),
+            packed_chunks.clone(),
+            readiness.clone(),
+            ready_backlog.clone(),
+            progress.clone(),
+            dispatch_cancel.clone(),
+            remaining.clone(),
+            metrics.clone(),
+        )
+        .await;
+        if result.is_err() {
+            dispatch_cancel.cancel();
+        }
+        result
+    };
     let materialize_cancel = cancellation.clone();
     let materialize = async {
         let result = materialize_packed_files(
             prepared,
             ContentInventory::from_v3(&manifest)?.chunks,
             Arc::new(stable_sources),
-            packed_chunks,
-            readiness,
-            ready_backlog,
+            packed_chunks.clone(),
+            readiness.clone(),
+            ready_backlog.clone(),
             consumed_chunks,
             staging,
             artifacts_tx,
             budget,
             materialize_cancel.clone(),
             metrics.clone(),
+            remaining.clone(),
         )
         .await;
         if result.is_err() {
@@ -382,8 +406,14 @@ async fn run_packed_pipeline(
         result
     };
     let commit_cancel = cancellation.clone();
-    let commit = run_streaming_commit(commit_context, artifacts_rx, commit_cancel);
-    let progress_events = consume_committed_progress(committed_rx, progress, metrics.clone());
+    let commit = run_streaming_commit_verified(
+        commit_context,
+        artifacts_rx,
+        commit_cancel,
+        Some(download_done_rx),
+    );
+    let progress_events =
+        consume_committed_progress(committed_rx, progress.clone(), metrics.clone());
 
     let (download_result, dispatch_result, materialize_result, commit_result, progress_result) =
         tokio::join!(download, dispatch, materialize, commit, progress_events);
@@ -445,7 +475,10 @@ async fn dispatch_pack_events(
     ready_backlog: Arc<AtomicU64>,
     progress: PipelineProgress,
     cancellation: CancellationToken,
+    remaining: Arc<Mutex<HashMap<String, usize>>>,
+    metrics: PackMetrics,
 ) -> Result<(), AppError> {
+    let mut published = HashSet::new();
     loop {
         let event = tokio::select! {
             _ = cancellation.cancelled() => return Ok(()),
@@ -459,6 +492,17 @@ async fn dispatch_pack_events(
             }
             PackDownloadEvent::ChunkReady(chunk) => {
                 let raw_sha = chunk.raw_sha256.clone();
+                if !published.insert(raw_sha.clone()) {
+                    continue;
+                }
+                let count = *remaining
+                    .lock()
+                    .expect("chunk consumers")
+                    .get(&raw_sha)
+                    .unwrap_or(&0);
+                if count == 0 {
+                    continue;
+                }
                 let inserted = locations
                     .write()
                     .await
@@ -467,6 +511,11 @@ async fn dispatch_pack_events(
                 if inserted {
                     ready_backlog
                         .fetch_add(manifest.chunks[&raw_sha].compressed_size, Ordering::Relaxed);
+                    metrics.raw_ready(
+                        manifest.chunks[&raw_sha]
+                            .uncompressed_size
+                            .saturating_mul(count as u64),
+                    );
                 }
                 readiness
                     .get(&raw_sha)
@@ -491,6 +540,7 @@ async fn materialize_packed_files(
     budget: StagingBudget,
     cancellation: CancellationToken,
     metrics: PackMetrics,
+    remaining: Arc<Mutex<HashMap<String, usize>>>,
 ) -> Result<(), AppError> {
     let logical_cpus = std::thread::available_parallelism().map_or(1, usize::from);
     let mut system = System::new_all();
@@ -526,6 +576,7 @@ async fn materialize_packed_files(
             let task_budget = budget.clone();
             let task_cancel = cancellation.clone();
             let task_metrics = metrics.clone();
+            let task_remaining = remaining.clone();
             running.spawn(async move {
                 let _activity = task_metrics.activity(Activity::Materializer);
                 let budget_started = Instant::now();
@@ -544,6 +595,7 @@ async fn materialize_packed_files(
                     &task_staging,
                     task_cancel,
                     &task_metrics,
+                    &task_remaining,
                 )
                 .await;
                 match result {
@@ -574,9 +626,11 @@ async fn materialize_packed_files(
             joined = running.join_next() => joined,
         };
         let Some(joined) = joined else { break };
-        match joined.map_err(|error| {
-            AppError::Unknown(format!("packed materializer task failed: {error}"))
-        })? {
+        match joined.unwrap_or_else(|error| {
+            Err(AppError::Unknown(format!(
+                "packed materializer task failed: {error}"
+            )))
+        }) {
             Ok(report) if first_error.is_none() => {
                 window_bytes = window_bytes.saturating_add(report.bytes);
                 window_waited = window_waited.saturating_add(report.waited);
@@ -627,6 +681,7 @@ async fn materialize_packed_file(
     staging: &Path,
     cancellation: CancellationToken,
     metrics: &PackMetrics,
+    remaining: &Mutex<HashMap<String, usize>>,
 ) -> Result<(VerifiedArtifact, MaterializeReport), AppError> {
     let target = safe_join(staging, &file.path)?;
     if let Some(parent) = target.parent() {
@@ -647,6 +702,8 @@ async fn materialize_packed_file(
         let chunk = chunks
             .get(raw_sha)
             .ok_or_else(|| AppError::InvalidData("content chunk closure changed".into()))?;
+        let mut work_started = Instant::now();
+        let packed = !stable_sources.contains_key(raw_sha);
         let raw = if let Some(source) = stable_sources.get(raw_sha) {
             read_stable_local_chunk(source.clone(), raw_sha.clone(), chunk.clone()).await?
         } else {
@@ -664,6 +721,7 @@ async fn materialize_packed_file(
                 .await?,
             );
             metrics.waited(false, wait_started.elapsed());
+            work_started = Instant::now();
             let first_consumer = consumed_chunks
                 .lock()
                 .expect("packed consumed chunk mutex should not be poisoned")
@@ -676,19 +734,33 @@ async fn materialize_packed_file(
                     Ordering::Relaxed,
                 );
             }
-            let location = packed_chunks
-                .read()
-                .await
-                .get(raw_sha)
-                .cloned()
-                .ok_or_else(|| {
-                    AppError::InvalidData("ready packed chunk has no cache location".into())
-                })?;
+            let mut locations = packed_chunks.write().await;
+            let location = locations.get(raw_sha).cloned().ok_or_else(|| {
+                AppError::InvalidData("ready packed chunk has no cache location".into())
+            })?;
+            let last_consumer = {
+                let mut counts = remaining.lock().expect("chunk consumers");
+                let count = counts
+                    .get_mut(raw_sha)
+                    .ok_or_else(|| AppError::InvalidData("missing chunk consumer count".into()))?;
+                *count = count
+                    .checked_sub(1)
+                    .ok_or_else(|| AppError::InvalidData("chunk consumer underflow".into()))?;
+                *count == 0
+            };
+            if last_consumer {
+                locations.remove(raw_sha);
+            }
+            drop(locations);
             read_packed_chunk(location, raw_sha.clone(), chunk.clone()).await?
         };
         output.write_all(&raw).await?;
         hasher.update(&raw);
         metrics.materialized(raw.len() as u64);
+        metrics.worked(work_started.elapsed());
+        if packed {
+            metrics.raw_consumed(raw.len() as u64);
+        }
         written = written
             .checked_add(raw.len() as u64)
             .ok_or_else(|| AppError::InvalidData("materialized content size overflow".into()))?;
@@ -729,15 +801,37 @@ pub(crate) async fn read_packed_chunk(
             "packed content cache location identity changed".into(),
         ));
     }
-    let mut file = tokio::fs::File::open(&location.path).await?;
-    file.seek(std::io::SeekFrom::Start(location.offset)).await?;
-    let length = usize::try_from(location.compressed_size)
-        .map_err(|_| AppError::InvalidData("packed content chunk is too large".into()))?;
-    let mut compressed = vec![0_u8; length];
-    file.read_exact(&mut compressed).await?;
-    tokio::task::spawn_blocking(move || decode_verified_chunk(&compressed, &raw_sha, &chunk))
+    #[cfg(test)]
+    if location.baseline_read {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let mut input = tokio::fs::File::open(location.source.baseline_path()).await?;
+        input
+            .seek(std::io::SeekFrom::Start(location.offset))
+            .await?;
+        let mut compressed = vec![
+            0;
+            usize::try_from(location.compressed_size).map_err(|_| {
+                AppError::InvalidData("pack chunk too large".into())
+            })?
+        ];
+        input.read_exact(&mut compressed).await?;
+        return tokio::task::spawn_blocking(move || {
+            decode_verified_chunk(&compressed, &raw_sha, &chunk)
+        })
         .await
-        .map_err(|error| AppError::Unknown(format!("packed zstd worker failed: {error}")))?
+        .map_err(|error| AppError::Unknown(format!("packed zstd worker failed: {error}")))?;
+    }
+    tokio::task::spawn_blocking(move || {
+        let length = usize::try_from(location.compressed_size)
+            .map_err(|_| AppError::InvalidData("packed content chunk is too large".into()))?;
+        let mut compressed = vec![0_u8; length];
+        location
+            .source
+            .read_exact_at(&mut compressed, location.offset)?;
+        decode_verified_chunk(&compressed, &raw_sha, &chunk)
+    })
+    .await
+    .map_err(|error| AppError::Unknown(format!("packed zstd worker failed: {error}")))?
 }
 
 async fn read_stable_local_chunk(

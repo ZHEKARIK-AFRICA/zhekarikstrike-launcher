@@ -1,28 +1,31 @@
 //! Explicit opt-in, disposable, real-Drive ABBA experiment. Never built into the launcher.
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use sha2::Digest;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::AppError;
 use crate::models::{ContentFile, DrivePackManifest};
 use crate::services::api_client::ApiClient;
 use crate::services::content_pack_install_service::run_packed_probe;
-use crate::services::content_pack_metrics::{PackRunOptions, ProbeBudget, Snapshot};
+use crate::services::content_pack_metrics::{PackProfile, PackRunOptions, ProbeBudget, Snapshot};
 use crate::services::content_pack_plan_service::{
     plan_pack_fetches, PackFetchPlan, PackTransferMode,
 };
 
 const MIB: u64 = 1024 * 1024;
 const TOTAL_BUDGET: u64 = 2048 * MIB;
-const MAX_RUN: u64 = 512 * MIB;
-const TARGET_PACK_BYTES: u64 = 496 * MIB; // Leaves shared room for retries; never increases the cap.
 const ROOT: &str = r"D:\zhekarik-adaptive-pack-probe";
 const OWNER: &str = "adaptive-pack-probe-v1";
+const FROZEN_SERIES: &str =
+    r"D:\zhekarik-adaptive-pack-probe\series-442710e6-dffe-4da2-971f-58e9008523da";
+const EXPECTED_MANIFEST: &str = "ac4ab8a152e3e0371c7a61f77f4e531d5ed163f7283ea5672c1fe47f182cc488";
+const EXPECTED_CONTENT: &str = "01a13dfb3448ce6c55ec2051d70ad61775cbe1c2fa322330542d3b879d9675db";
 
 fn failure(message: &str) -> AppError {
     AppError::InvalidData(message.into())
@@ -100,31 +103,29 @@ fn cleanup_work(series: &Path, work: &Path, marker: &str) -> Result<(), AppError
 
 fn select_files(
     manifest: &DrivePackManifest,
+    prior: &Value,
 ) -> Result<(Vec<ContentFile>, Vec<PackFetchPlan>, u64), AppError> {
     manifest.validate()?;
-    let mut packs = HashSet::new();
-    let mut packed_bytes = 0_u64;
-    let mut raw_bytes = 0_u64;
-    let mut selected = Vec::new();
-    // The original manifest order determines both selection and first-use order.
-    for file in &manifest.files {
-        let new_packs = file
-            .chunks
-            .iter()
-            .map(|sha| manifest.chunks[sha].pack_sha256.clone())
-            .filter(|sha| !packs.contains(sha))
-            .collect::<HashSet<_>>();
-        let extra = new_packs
-            .iter()
-            .map(|sha| manifest.packs[sha].size)
-            .sum::<u64>();
-        if packed_bytes + extra > TARGET_PACK_BYTES || raw_bytes + file.size > 2048 * MIB {
-            continue;
+    let paths = prior["files"]
+        .as_array()
+        .ok_or_else(|| failure("prior report files missing"))?;
+    let mut selected = Vec::with_capacity(paths.len());
+    let mut seen = HashSet::new();
+    for path in paths {
+        let path = path
+            .as_str()
+            .ok_or_else(|| failure("invalid prior file path"))?;
+        if !seen.insert(path) {
+            return Err(failure("duplicate prior file"));
         }
-        packs.extend(new_packs);
-        packed_bytes += extra;
-        raw_bytes += file.size;
-        selected.push(file.clone());
+        selected.push(
+            manifest
+                .files
+                .iter()
+                .find(|f| f.path == path)
+                .cloned()
+                .ok_or_else(|| failure("prior file missing from manifest"))?,
+        );
     }
     let chunks = selected
         .iter()
@@ -140,8 +141,17 @@ fn select_files(
                 .try_fold(0, |sum, range| Ok::<_, AppError>(sum + range.len()?))?,
         };
     }
-    if planned == 0 || planned > MAX_RUN || selected.is_empty() {
+    if planned != 475532317
+        || plans.len() != 8
+        || selected.len() != 359
+        || selected.is_empty()
+        || manifest.manifest_sha256 != EXPECTED_MANIFEST
+        || manifest.content_sha256 != EXPECTED_CONTENT
+    {
         return Err(failure("invalid probe subset size"));
+    }
+    if prior["pack_order"] != json!(plans.iter().map(|p| &p.pack_sha256).collect::<Vec<_>>()) {
+        return Err(failure("prior pack order mismatch"));
     }
     Ok((selected, plans, planned))
 }
@@ -150,12 +160,35 @@ fn seconds(snapshot: &Snapshot) -> f64 {
     snapshot.elapsed_sec - snapshot.pipeline_started_sec.unwrap_or(0.0)
 }
 
-fn decision_counts(history: &[Snapshot]) -> BTreeMap<String, usize> {
-    let mut reasons = BTreeMap::new();
-    for sample in history {
-        *reasons.entry(sample.controller_reason.clone()).or_insert(0) += 1;
+fn protected_snapshots() -> Result<Value, AppError> {
+    let paths = [
+        r"D:\zhekarik-e2e-v3-1.6.16\appdata\ZHEKARIKSTRIKE\config.json",
+        r"D:\zhekarik-e2e-v3-1.6.16\game\ZHEKARIKSTRIKE\.zhekarik\content\state.json",
+    ];
+    let mut out = serde_json::Map::new();
+    for path in paths.iter().chain(std::iter::once(
+        &r"%LOCALAPPDATA%\ZHEKARIKSTRIKE\config.json",
+    )) {
+        let expanded = if path.starts_with('%') {
+            std::env::var("LOCALAPPDATA")
+                .ok()
+                .map(|v| PathBuf::from(v).join(r"ZHEKARIKSTRIKE\config.json"))
+        } else {
+            Some(PathBuf::from(path))
+        };
+        if let Some(path) = expanded {
+            if path.exists() {
+                let bytes = std::fs::read(&path)?;
+                let digest = sha2::Sha256::digest(&bytes);
+                let m = std::fs::metadata(&path)?
+                    .modified()?
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                out.insert(path.to_string_lossy().to_string(), json!({"sha256":format!("{digest:x}"),"mtime_sec":m.as_secs(),"mtime_nanos":m.subsec_nanos()}));
+            }
+        }
     }
-    reasons
+    Ok(Value::Object(out))
 }
 
 fn conclusion(runs: &[Value]) -> Value {
@@ -200,22 +233,15 @@ async fn drive_pack_live_adaptive_probe() -> Result<(), AppError> {
     let report_path = series.join("report.json");
     eprintln!("ADAPTIVE_PROBE_REPORT={}", report_path.display());
     let mut report = json!({"schema_version":1, "id":id, "status":"fetching_manifest", "budget_bytes":TOTAL_BUDGET,
-        "order":["A1-fixed2","B1-adaptive","B2-adaptive","A2-fixed2"], "runs":[]});
+        "order":["A1-baseline-adaptive","B1-optimized","B2-optimized","A2-baseline-adaptive"], "runs":[]});
     save_report(&report_path, &report)?;
-    let api = ApiClient::new()?;
-    let manifest_result = api.get_compatible_pack_manifest().await;
-    let manifest = match manifest_result {
-        Ok(Some(manifest)) => Arc::new(manifest),
-        other => {
-            report["status"] = json!("failed");
-            report["error"] = json!(format!("manifest discovery failed: {other:?}"));
-            save_report(&report_path, &report)?;
-            return Err(failure(
-                "probe manifest discovery failed; see retained report",
-            ));
-        }
-    };
-    let (files, plans, planned) = select_files(&manifest)?;
+    let frozen = PathBuf::from(FROZEN_SERIES);
+    let prior: Value = serde_json::from_slice(&std::fs::read(frozen.join("report.json"))?)?;
+    let manifest: DrivePackManifest =
+        serde_json::from_slice(&std::fs::read(frozen.join("manifest.json"))?)?;
+    manifest.validate()?;
+    let manifest = Arc::new(manifest);
+    let (files, plans, planned) = select_files(&manifest, &prior)?;
     std::fs::write(
         series.join("manifest.json"),
         serde_json::to_vec_pretty(&manifest)?,
@@ -228,6 +254,8 @@ async fn drive_pack_live_adaptive_probe() -> Result<(), AppError> {
     report["pack_order"] = json!(plans.iter().map(|p| &p.pack_sha256).collect::<Vec<_>>());
     report["replica_seed"] = json!("461ea0b9-971f-4b65-bdea-0a7495a0b813");
     report["status"] = json!("running");
+    let protected_before = protected_snapshots()?;
+    report["protected_before"] = protected_before.clone();
     save_report(&report_path, &report)?;
     eprintln!(
         "PROBE subset: {} files, {} packs, {:.1} MiB planned/run",
@@ -236,6 +264,7 @@ async fn drive_pack_live_adaptive_probe() -> Result<(), AppError> {
         planned as f64 / MIB as f64
     );
 
+    let api = ApiClient::new()?;
     let shared_budget = ProbeBudget::new(TOTAL_BUDGET);
     let series_cancel = CancellationToken::new();
     let signal_cancel = series_cancel.clone();
@@ -246,15 +275,19 @@ async fn drive_pack_live_adaptive_probe() -> Result<(), AppError> {
         }
     });
     let mut terminal_error = None;
-    for (index, (name, fixed)) in [
-        ("A1-fixed2", Some(2)),
-        ("B1-adaptive", None),
-        ("B2-adaptive", None),
-        ("A2-fixed2", Some(2)),
+    for (index, (name, profile)) in [
+        ("A1-baseline-adaptive", PackProfile::Baseline),
+        ("B1-optimized", PackProfile::Optimized),
+        ("B2-optimized", PackProfile::Optimized),
+        ("A2-baseline-adaptive", PackProfile::Baseline),
     ]
     .into_iter()
     .enumerate()
     {
+        if protected_snapshots()? != protected_before {
+            terminal_error = Some(failure("protected file changed during probe"));
+            break;
+        }
         if series_cancel.is_cancelled() {
             terminal_error = Some(failure("probe interrupted"));
             break;
@@ -272,7 +305,8 @@ async fn drive_pack_live_adaptive_probe() -> Result<(), AppError> {
         std::fs::create_dir(&work)?;
         std::fs::write(work.join("owner.txt"), &marker)?;
         let mut options = PackRunOptions::new(name);
-        options.fixed_jobs = fixed;
+        options.profile = profile;
+        options.fixed_jobs = None;
         options.budget = Some(shared_budget.clone());
         let metrics = options.metrics.clone();
         let cancellation = series_cancel.child_token();
@@ -302,11 +336,13 @@ async fn drive_pack_live_adaptive_probe() -> Result<(), AppError> {
         let cleanup = cleanup_work(&series, &work, &marker);
         let error = result.err().or_else(|| cleanup.err());
         let start = snapshot.pipeline_started_sec.unwrap_or(0.0);
-        let run = json!({"name":name, "fixed_jobs":fixed, "pipeline_seconds":seconds(&snapshot),
+        let decision_snapshot = snapshot.decision_counts.clone();
+        let run = json!({"name":name, "profile":format!("{profile:?}"), "fixed_jobs":null, "pipeline_seconds":seconds(&snapshot),
             "download_seconds":snapshot.download_finished_sec.map(|t|t-start),
+            "first_materialized_seconds":snapshot.first_materialized_sec.map(|t|t-start),
             "materialization_seconds":snapshot.materialization_finished_sec.map(|t|t-start),
             "materialized_before_download_finished":history.iter().any(|s| s.materialized_bytes > 0 && s.download_finished_sec.is_none()),
-            "snapshot":snapshot, "decisions":decision_counts(&history), "history":history,
+            "snapshot":snapshot, "decisions":decision_snapshot, "history":history,
             "error":error.as_ref().map(ToString::to_string), "temporary_data_removed":!work.exists()});
         eprintln!(
             "PROBE {name}: {:.2}s, {:.1} MiB received, peak {} jobs/{} requests, error={:?}",
@@ -328,6 +364,11 @@ async fn drive_pack_live_adaptive_probe() -> Result<(), AppError> {
     }
     series_cancel.cancel();
     let _ = signal.await;
+    let protected_after = protected_snapshots()?;
+    report["protected_after"] = protected_after.clone();
+    if protected_after != protected_before && terminal_error.is_none() {
+        terminal_error = Some(failure("protected file changed during probe"));
+    }
     report["status"] = json!(if terminal_error.is_some() {
         "incomplete"
     } else {

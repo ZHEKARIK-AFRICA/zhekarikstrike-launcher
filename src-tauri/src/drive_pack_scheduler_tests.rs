@@ -18,6 +18,12 @@ use tokio_util::sync::CancellationToken;
 
 const MIB: u64 = 1024 * 1024;
 type Bodies = Arc<BTreeMap<String, Arc<Vec<u8>>>>;
+fn scratch() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("drive-pack-unit-")
+        .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+        .unwrap()
+}
 fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
@@ -98,6 +104,8 @@ struct Peer {
     throttled: Arc<AtomicBool>,
     active: Arc<AtomicUsize>,
     peak: Arc<AtomicUsize>,
+    pause_at: Arc<AtomicU64>,
+    body_gate: Arc<Semaphore>,
     stop: CancellationToken,
     task: tokio::task::JoinHandle<()>,
 }
@@ -114,6 +122,9 @@ impl Peer {
         let active = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
         let stop = CancellationToken::new();
+        let pause_at = Arc::new(AtomicU64::new(u64::MAX));
+        let body_gate = Arc::new(Semaphore::new(0));
+        let (pause, body_permits) = (pause_at.clone(), body_gate.clone());
         let (tg, tt, ta, tp, ts) = (
             gate.clone(),
             throttled.clone(),
@@ -130,6 +141,7 @@ impl Peer {
                     accepted = listener.accept() => {
                         let (mut socket, _) = accepted.unwrap();
                         let (bodies, gate, throttled, active, peak, stop) = (bodies.clone(), tg.clone(), tt.clone(), ta.clone(), tp.clone(), ts.clone());
+                        let (pause,body_permits)=(pause.clone(),body_permits.clone());
                         connections.spawn(async move {
                             let mut request = Vec::new();
                             loop {
@@ -158,7 +170,12 @@ impl Peer {
                             }
                             let header = format!("HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{}\r\nConnection: close\r\n\r\n", end-start+1, body.len());
                             if socket.write_all(header.as_bytes()).await.is_err() { return; }
-                            let _ = tokio::select! { _ = stop.cancelled() => return, result = socket.write_all(&body[start..=end]) => result };
+                            let split=(pause.load(SeqCst) as usize).clamp(start,end+1);
+                            if split>start { if tokio::select! { _=stop.cancelled()=>return, result=socket.write_all(&body[start..split])=>result }.is_err(){return;} }
+                            if split<=end {
+                                let permit=tokio::select!{_=stop.cancelled()=>return,p=body_permits.acquire()=>p.unwrap()};permit.forget();
+                                let _=tokio::select!{_=stop.cancelled()=>return,result=socket.write_all(&body[split..=end])=>result};
+                            }
                         });
                     }
                 }
@@ -172,6 +189,8 @@ impl Peer {
             throttled,
             active,
             peak,
+            pause_at,
+            body_gate,
             stop,
             task,
         }
@@ -198,12 +217,266 @@ fn reason(metrics: &PackMetrics, reason: &str) -> bool {
         .any(|s| s.controller_reason == reason)
 }
 
+fn pipeline_fixture() -> (Arc<DrivePackManifest>, Bodies, u64) {
+    let mut manifest = crate::drive_pack_tests::two_chunk_manifest();
+    manifest.files.clear();
+    manifest.chunks.clear();
+    manifest.packs.clear();
+    let mut pack = Vec::new();
+    let mut boundary = 0;
+    for i in 0..3 {
+        let mut seed = 72361579123_u64 + i;
+        let mut raw = vec![0u8; 8 * MIB as usize];
+        for block in raw.chunks_exact_mut(8) {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            block.copy_from_slice(&seed.to_le_bytes());
+        }
+        let mut encoder = zstd::stream::Encoder::new(Vec::new(), 6).unwrap();
+        encoder.include_checksum(true).unwrap();
+        encoder.write_all(&raw).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let raw_sha = digest(&raw);
+        manifest.chunks.insert(
+            raw_sha.clone(),
+            PackedContentChunk {
+                uncompressed_size: raw.len() as u64,
+                compressed_size: compressed.len() as u64,
+                compressed_sha256: digest(&compressed),
+                pack_sha256: String::new(),
+                offset: pack.len() as u64,
+            },
+        );
+        pack.extend_from_slice(&compressed);
+        manifest.files.push(ContentFile {
+            path: if i == 0 {
+                "RevLoader.exe".into()
+            } else {
+                format!("data/{i}.bin")
+            },
+            size: raw.len() as u64,
+            sha256: raw_sha.clone(),
+            excluded_from_hash_check: false,
+            temporary: false,
+            additional_check: false,
+            chunks: vec![raw_sha],
+        });
+        if i == 1 {
+            boundary = pack.len() as u64;
+        }
+    }
+    let sha = digest(&pack);
+    let replicas = (0..3)
+        .map(|i| format!("pipeline_replica_{i:03}"))
+        .collect::<Vec<_>>();
+    for chunk in manifest.chunks.values_mut() {
+        chunk.pack_sha256 = sha.clone();
+    }
+    manifest.packs.insert(
+        sha,
+        DrivePack {
+            size: pack.len() as u64,
+            replica_file_ids: replicas.clone(),
+        },
+    );
+    manifest.download_size = pack.len() as u64;
+    manifest.unpacked_size = 24 * MIB;
+    let body = Arc::new(pack);
+    let bodies = replicas.into_iter().map(|id| (id, body.clone())).collect();
+    let manifest = crate::drive_pack_tests::finish_manifest(manifest);
+    manifest.validate().unwrap();
+    (Arc::new(manifest), Arc::new(bodies), boundary)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drive_pack_early_files_cross_range_and_wait_hash_barrier_or_rollback() {
+    use crate::services::{api_client::ApiClient, content_pack_install_service::run_packed_probe};
+    let (manifest, bodies, boundary) = pipeline_fixture();
+    assert!(boundary > 16 * MIB); // second compressed chunk crosses the HTTP boundary
+    for cancel in [false, true] {
+        let peer = Peer::start(bodies.clone()).await;
+        peer.pause_at.store(boundary, SeqCst);
+        peer.gate.add_permits(100);
+        let dir = scratch();
+        let game = dir.path().join("game");
+        let mut options = PackRunOptions::new("early-pipeline");
+        options.local_transport = Some(peer.url.clone());
+        let metrics = options.metrics.clone();
+        let token = CancellationToken::new();
+        let (m, g, c) = (manifest.clone(), game.clone(), token.clone());
+        let task = tokio::spawn(async move {
+            run_packed_probe(
+                &ApiClient::new().unwrap(),
+                m.clone(),
+                g,
+                m.files[..2].to_vec(),
+                options,
+                c,
+            )
+            .await
+        });
+        let scenario = async {
+            until(
+                || metrics.snapshot().committed_bytes == 16 * MIB,
+                "early file commits before pack EOF",
+            )
+            .await;
+            assert!(!task.is_finished());
+            assert!(metrics.snapshot().download_finished_sec.is_none());
+            assert!(!game.join(".zhekarik/content/state.json").exists());
+            assert_eq!(
+                std::fs::metadata(game.join("RevLoader.exe")).unwrap().len(),
+                8 * MIB
+            );
+            if cancel {
+                token.cancel();
+            } else {
+                peer.body_gate.add_permits(100);
+            }
+        };
+        let outcome =
+            futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(scenario)).await;
+        if outcome.is_err() {
+            token.cancel();
+        }
+        let result = task.await.unwrap();
+        if outcome.is_ok() {
+            if cancel {
+                assert!(result.is_err());
+                assert!(!game.join("RevLoader.exe").exists());
+                assert!(!game.join(".zhekarik/content/state.json").exists());
+            } else {
+                assert!(result.is_ok(), "{result:?}");
+                assert!(game.join(".zhekarik/content/state.json").exists());
+            }
+        }
+        assert_eq!(metrics.snapshot().active_jobs, 0);
+        assert_eq!(metrics.snapshot().active_requests, 0);
+        assert_eq!(metrics.snapshot().active_materializers, 0);
+        peer.shutdown().await;
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drive_pack_resume_prefix_and_corruption_never_finalize_unverified_data() {
+    use crate::services::{api_client::ApiClient, content_pack_install_service::run_packed_probe};
+    let (manifest, bodies, _) = pipeline_fixture();
+    // Persisted prefix is rehashed and usable, but contributes no new traffic.
+    let peer = Peer::start(bodies.clone()).await;
+    peer.gate.add_permits(100);
+    let dir = scratch();
+    let cache = PackCache::new(dir.path(), &manifest.content_sha256, "resume")
+        .await
+        .unwrap();
+    let pack_sha = manifest.packs.keys().next().unwrap();
+    let body = bodies.values().next().unwrap();
+    std::fs::write(
+        cache.full_partial_path(pack_sha).unwrap(),
+        &body[..16 * MIB as usize],
+    )
+    .unwrap();
+    let required = manifest
+        .files
+        .iter()
+        .flat_map(|f| f.chunks.clone())
+        .collect::<Vec<_>>();
+    let plans = plan_pack_fetches(&manifest, &required).unwrap();
+    let mut options = PackRunOptions::new("resume");
+    options.local_transport = Some(peer.url.clone());
+    let metrics = options.metrics.clone();
+    let (tx, mut rx) = mpsc::channel(64);
+    let consume = tokio::spawn(async move {
+        let mut count = 0;
+        while let Some(event) = rx.recv().await {
+            if let crate::services::content_pack_download_service::PackDownloadEvent::ChunkReady(
+                _,
+            ) = event
+            {
+                count += 1;
+            }
+        }
+        count
+    });
+    download_pack_fetches(
+        reqwest::Client::new(),
+        manifest.clone(),
+        plans,
+        cache,
+        "resume",
+        CancellationToken::new(),
+        tx,
+        Arc::new(AtomicU64::new(0)),
+        options,
+    )
+    .await
+    .unwrap();
+    assert_eq!(consume.await.unwrap(), 3);
+    assert_eq!(
+        metrics.snapshot().received_bytes,
+        body.len() as u64 - 16 * MIB
+    );
+    assert_eq!(
+        metrics.snapshot().unique_bytes,
+        metrics.snapshot().received_bytes
+    );
+    peer.shutdown().await;
+    // Valid compressed/raw chunks are still insufficient: the full pack and
+    // final file hashes independently veto state/inventory finalization.
+    for corrupt in ["pack", "chunk", "file"] {
+        let mut bad = (*manifest).clone();
+        if corrupt == "pack" {
+            let old = bad.packs.keys().next().unwrap().clone();
+            let pack = bad.packs.remove(&old).unwrap();
+            let wrong = "f".repeat(64);
+            bad.packs.insert(wrong.clone(), pack);
+            for chunk in bad.chunks.values_mut() {
+                chunk.pack_sha256 = wrong.clone();
+            }
+        } else if corrupt == "chunk" {
+            bad.chunks
+                .get_mut(&bad.files[0].chunks[0])
+                .unwrap()
+                .compressed_sha256 = "f".repeat(64);
+        } else {
+            bad.files[0].sha256 = "f".repeat(64);
+        }
+        let bad = Arc::new(crate::drive_pack_tests::finish_manifest(bad));
+        bad.validate().unwrap();
+        let peer = Peer::start(bodies.clone()).await;
+        peer.gate.add_permits(100);
+        let dir = scratch();
+        let game = dir.path().join("game");
+        let mut options = PackRunOptions::new(corrupt);
+        options.local_transport = Some(peer.url.clone());
+        let metrics = options.metrics.clone();
+        let result = run_packed_probe(
+            &ApiClient::new().unwrap(),
+            bad.clone(),
+            game.clone(),
+            bad.files.clone(),
+            options,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(result.is_err(), "{corrupt} corruption was accepted");
+        assert!(!game.join(".zhekarik/content/state.json").exists());
+        assert!(!game.join("RevLoader.exe").exists());
+        assert_eq!(metrics.snapshot().active_jobs, 0);
+        assert_eq!(metrics.snapshot().active_materializers, 0);
+        peer.shutdown().await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn drive_pack_real_scheduler_trials_backlog_pressure_and_cancel() {
     let (manifest, bodies) = fixture();
-    for reject in [false, true] {
+    for (reject, optimized) in [(false, false), (true, false), (false, true), (true, true)] {
         let peer = Peer::start(bodies.clone()).await;
-        let game = tempfile::tempdir().unwrap();
+        let game = scratch();
         let cache = PackCache::new(game.path(), &manifest.content_sha256, "scheduler-probe")
             .await
             .unwrap();
@@ -219,6 +492,12 @@ async fn drive_pack_real_scheduler_trials_backlog_pressure_and_cancel() {
         let clock = Arc::new(AtomicU64::new(0));
         let backlog = Arc::new(AtomicU64::new(if reject { 0 } else { 256 * MIB }));
         let mut options = PackRunOptions::new("controlled-scheduler");
+        options.profile = if optimized {
+            crate::services::content_pack_metrics::PackProfile::Optimized
+        } else {
+            crate::services::content_pack_metrics::PackProfile::Baseline
+        };
+        options.metrics.materializer(2, 2, 0., 4096 * MIB);
         options.local_transport = Some(peer.url.clone());
         options.tick_interval = Duration::from_millis(10);
         options.clock_ms = Some(clock.clone());
@@ -245,15 +524,23 @@ async fn drive_pack_real_scheduler_trials_backlog_pressure_and_cancel() {
                 "initial two requests",
             )
             .await;
-            let mut at = 8000;
+            let mut at = if optimized && reject { 10000 } else { 8000 };
             if !reject {
                 clock.store(at, SeqCst);
                 peer.gate.add_permits(8);
-                until(|| reason(&metrics, "ready_backlog"), "backlog hold").await;
+                until(
+                    || {
+                        reason(&metrics, "ready_backlog")
+                            && metrics.snapshot().received_bytes >= 64 * MIB
+                    },
+                    "backlog hold",
+                )
+                .await;
                 assert_eq!(metrics.snapshot().target_jobs, 2);
                 assert_eq!(metrics.snapshot().peak_jobs, 2);
                 backlog.store(0, SeqCst);
-                at += 8000;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                at += if optimized { 10000 } else { 8000 };
             }
             clock.store(at, SeqCst);
             peer.gate.add_permits(8);
@@ -267,8 +554,40 @@ async fn drive_pack_real_scheduler_trials_backlog_pressure_and_cancel() {
             )
             .await;
             assert_eq!(metrics.snapshot().target_jobs, 3);
-            clock.store(at + if reject { 8000 } else { 4000 }, SeqCst);
-            peer.gate.add_permits(8);
+            if optimized {
+                tokio::time::sleep(Duration::from_millis(50)).await; // Observe the actual third task.
+                clock.store(at + 2000, SeqCst);
+                tokio::time::sleep(Duration::from_millis(50)).await; // Start post-warmup window.
+            }
+            let verdict_at = at
+                + if optimized {
+                    if reject {
+                        16000
+                    } else {
+                        12000
+                    }
+                } else if reject {
+                    8000
+                } else {
+                    4000
+                };
+            if optimized {
+                // Deliver the controlled window before advancing virtual time.
+                // Otherwise the first 64 MiB at t=10s legitimately opens an
+                // extension before the ninth pack arrives at that SAME instant.
+                let count = if reject { 8 } else { 9 };
+                let expected = metrics.snapshot().received_bytes + count as u64 * 8 * MIB;
+                peer.gate.add_permits(count);
+                until(
+                    || metrics.snapshot().received_bytes >= expected,
+                    "controlled window bytes",
+                )
+                .await;
+                clock.store(verdict_at, SeqCst);
+            } else {
+                clock.store(verdict_at, SeqCst);
+                peer.gate.add_permits(8);
+            }
             until(
                 || {
                     reason(

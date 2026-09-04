@@ -45,6 +45,23 @@ impl PackCache {
             .join(content_sha256);
         tokio::fs::create_dir_all(root.join("full")).await?;
         tokio::fs::create_dir_all(root.join("ranges")).await?;
+        // A crashed process cannot retain handles. Clean only our uniquely named
+        // retired generations; normal .part/verified files remain resumable.
+        for directory in [root.join("full"), root.join("ranges")] {
+            let mut entries = tokio::fs::read_dir(directory).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let parts = name.rsplit('.').collect::<Vec<_>>();
+                if parts.first() == Some(&"retired")
+                    && parts
+                        .get(1)
+                        .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+                {
+                    Self::regular_file_size(&entry.path()).await?;
+                    Self::discard(&entry.path()).await?;
+                }
+            }
+        }
         let claims = root.join("claims");
         tokio::fs::create_dir_all(&claims).await?;
         let mut entries = tokio::fs::read_dir(&claims).await?;
