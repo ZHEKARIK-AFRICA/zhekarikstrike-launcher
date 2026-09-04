@@ -986,6 +986,30 @@ pub(crate) async fn run_packed_probe(
     options: PackRunOptions,
     cancellation: CancellationToken,
 ) -> Result<(), AppError> {
+    run_packed_probe_scenario(
+        api,
+        manifest,
+        game_path,
+        files,
+        options,
+        cancellation,
+        "461ea0b9-971f-4b65-bdea-0a7495a0b813",
+        false,
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(crate) async fn run_packed_probe_scenario(
+    api: &ApiClient,
+    manifest: Arc<DrivePackManifest>,
+    game_path: PathBuf,
+    files: Vec<crate::models::ContentFile>,
+    options: PackRunOptions,
+    cancellation: CancellationToken,
+    seed: &str,
+    repair: bool,
+) -> Result<(), AppError> {
     manifest.validate()?;
     if tokio::fs::try_exists(&game_path).await? {
         return Err(AppError::InvalidData(
@@ -993,7 +1017,7 @@ pub(crate) async fn run_packed_probe(
         ));
     }
     let inventory = ContentInventory::from_v3(&manifest)?;
-    let prepared = files
+    let mut prepared = files
         .into_iter()
         .map(|file| PreparedFile {
             file,
@@ -1022,6 +1046,24 @@ pub(crate) async fn run_packed_probe(
         disk_required,
     )?;
     tokio::fs::create_dir(&game_path).await?;
+    if repair {
+        for item in &mut prepared {
+            let target = safe_join(&game_path, &item.file.path)?;
+            tokio::fs::create_dir_all(target.parent().unwrap()).await?;
+            tokio::fs::write(&target, b"probe-corruption").await?;
+            // The same SHA reader used by normal integrity verification; only
+            // this explicit subset is examined, the server manifest stays whole.
+            let actual = crate::utils::hash_utils::sha256_file(&target).await?;
+            if actual == item.file.sha256 {
+                return Err(AppError::InvalidData(
+                    "repair fixture was not corrupt".into(),
+                ));
+            }
+            item.had_original = true;
+            item.original_size = tokio::fs::metadata(&target).await?.len();
+        }
+        tokio::fs::write(game_path.join("probe-user-preserved.txt"), b"preserve").await?;
+    }
     let transaction_id = Uuid::new_v4().to_string();
     let cache = PackCache::new(&game_path, &manifest.content_sha256, &transaction_id).await?;
     let journal = ContentJournal {
@@ -1036,7 +1078,7 @@ pub(crate) async fn run_packed_probe(
     write_journal(&game_path, &journal).await?;
     let budget = StagingBudget::new(staging_limit)?;
     // Same seed in isolated A/B roots selects the same initial Drive replicas.
-    let operation = "461ea0b9-971f-4b65-bdea-0a7495a0b813".to_string();
+    let operation = seed.to_string();
     let progress =
         PipelineProgress::new(ProgressEmitter::headless(&operation), planned, materialized);
     run_packed_pipeline(

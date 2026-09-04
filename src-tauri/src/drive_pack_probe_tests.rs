@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::error::AppError;
 use crate::models::{ContentFile, DrivePackManifest};
 use crate::services::api_client::ApiClient;
-use crate::services::content_pack_install_service::run_packed_probe;
+use crate::services::content_pack_install_service::{run_packed_probe, run_packed_probe_scenario};
 use crate::services::content_pack_metrics::{PackProfile, PackRunOptions, ProbeBudget, Snapshot};
 use crate::services::content_pack_plan_service::{
     plan_pack_fetches, PackFetchPlan, PackTransferMode,
@@ -26,6 +26,7 @@ const FROZEN_SERIES: &str =
     r"D:\zhekarik-adaptive-pack-probe\series-442710e6-dffe-4da2-971f-58e9008523da";
 const EXPECTED_MANIFEST: &str = "ac4ab8a152e3e0371c7a61f77f4e531d5ed163f7283ea5672c1fe47f182cc488";
 const EXPECTED_CONTENT: &str = "01a13dfb3448ce6c55ec2051d70ad61775cbe1c2fa322330542d3b879d9675db";
+const NEXT_OWNER: &str = "adaptive-pack-next-v1:";
 
 fn failure(message: &str) -> AppError {
     AppError::InvalidData(message.into())
@@ -379,6 +380,181 @@ async fn drive_pack_live_adaptive_probe() -> Result<(), AppError> {
     save_report(&report_path, &report)?;
     eprintln!("PROBE conclusion: {}", report["conclusion"]);
     if let Some(error) = terminal_error {
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SingleProbeInput {
+    manifest_path: PathBuf,
+    files: Vec<String>,
+    budget_bytes: u64,
+    seed: String,
+    report_path: PathBuf,
+    scenario: String,
+    name: String,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "explicit single real Google Drive probe; requires orchestrator JSON input"]
+async fn drive_pack_live_single_probe() -> Result<(), AppError> {
+    if !cfg!(windows) || std::env::var("ZHEKARIK_ADAPTIVE_PACK_PROBE").as_deref() != Ok("1") {
+        return Err(failure("single probe requires explicit Windows opt-in"));
+    }
+    let input_path = PathBuf::from(
+        std::env::var("ZHEKARIK_PACK_PROBE_INPUT").map_err(|_| failure("missing probe input"))?,
+    );
+    let input: SingleProbeInput = serde_json::from_slice(&std::fs::read(input_path)?)?;
+    if !input.manifest_path.is_absolute()
+        || !input.report_path.is_absolute()
+        || !matches!(input.scenario.as_str(), "install" | "repair")
+        || input.budget_bytes == 0
+        || input.budget_bytes > 4 * 1024 * MIB
+        || input.files.is_empty()
+    {
+        return Err(failure("invalid single probe input"));
+    }
+    uuid::Uuid::parse_str(&input.seed).map_err(|_| failure("invalid probe seed"))?;
+    let series = input
+        .report_path
+        .parent()
+        .ok_or_else(|| failure("missing series"))?;
+    safe_directory(series)?;
+    if series.parent() != Some(Path::new(ROOT)) {
+        return Err(failure("report must be inside a direct owned series"));
+    }
+    let name = series.file_name().unwrap_or_default().to_string_lossy();
+    let suffix = name
+        .strip_prefix("next-")
+        .ok_or_else(|| failure("invalid series name"))?;
+    uuid::Uuid::parse_str(suffix).map_err(|_| failure("invalid series UUID"))?;
+    let marker = format!("{NEXT_OWNER}{suffix}");
+    if std::fs::read_to_string(series.join("owner.txt"))? != marker || input.report_path.exists() {
+        return Err(failure("series marker mismatch or existing report"));
+    }
+    let manifest: Arc<DrivePackManifest> = Arc::new(serde_json::from_slice(&std::fs::read(
+        &input.manifest_path,
+    )?)?);
+    manifest.validate()?;
+    if manifest.manifest_sha256 != EXPECTED_MANIFEST || manifest.content_sha256 != EXPECTED_CONTENT
+    {
+        return Err(failure("unexpected frozen manifest identity"));
+    }
+    let mut seen = HashSet::new();
+    let mut files = Vec::new();
+    for name in &input.files {
+        if !seen.insert(name) {
+            return Err(failure("duplicate selected file"));
+        }
+        files.push(
+            manifest
+                .files
+                .iter()
+                .find(|f| &f.path == name)
+                .cloned()
+                .ok_or_else(|| failure("unknown selected file"))?,
+        );
+    }
+    let protected_before = protected_snapshots()?;
+    let mut report = json!({"schema_version":1,"name":input.name,"scenario":input.scenario,
+        "status":"running","received_bytes":0,"budget_bytes":input.budget_bytes,
+        "seed":input.seed,"files":input.files,"manifest_sha256":manifest.manifest_sha256,
+        "content_sha256":manifest.content_sha256,"protected_before":protected_before});
+    save_report(&input.report_path, &report)?;
+    let api = ApiClient::new()?;
+    let work = series.join(format!("work-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&work)?;
+    std::fs::write(work.join("owner.txt"), &marker)?;
+    let cancel = CancellationToken::new();
+    let stop = cancel.clone();
+    let deadline = tokio::spawn(async move {
+        tokio::select! {
+            _ = stop.cancelled() => {},
+            _ = tokio::time::sleep(Duration::from_secs(15 * 60)) => stop.cancel(),
+            _ = tokio::signal::ctrl_c() => stop.cancel(),
+        }
+    });
+    let mut options = PackRunOptions::new(&input.name);
+    options.profile = PackProfile::Optimized;
+    options.fixed_jobs = None;
+    let budget = ProbeBudget::new(input.budget_bytes);
+    options.budget = Some(budget.clone());
+    let metrics = options.metrics.clone();
+    let result = run_packed_probe_scenario(
+        &api,
+        manifest,
+        work.join("game"),
+        files.clone(),
+        options,
+        cancel.clone(),
+        &input.seed,
+        input.scenario == "repair",
+    )
+    .await;
+    cancel.cancel();
+    let _ = deadline.await;
+    // Capture timing BEFORE independent final-file verification and cleanup.
+    let snapshot = metrics.snapshot();
+    let mut error = result.err();
+    if error.is_none() {
+        let check: Result<(), AppError> = async {
+            for file in &files {
+                let path = crate::utils::path_utils::safe_join(&work.join("game"), &file.path)?;
+                if tokio::fs::metadata(&path).await?.len() != file.size
+                    || crate::utils::hash_utils::sha256_file(&path).await? != file.sha256
+                {
+                    return Err(failure("final probe file failed SHA/size verification"));
+                }
+            }
+            if input.scenario == "repair"
+                && tokio::fs::read(work.join("game/probe-user-preserved.txt")).await? != b"preserve"
+            {
+                return Err(failure("repair modified unknown user sentinel"));
+            }
+            Ok(())
+        }
+        .await;
+        error = check.err();
+    }
+    if snapshot.active_jobs != 0
+        || snapshot.active_requests != 0
+        || snapshot.received_bytes != budget.received.load(Ordering::Relaxed)
+    {
+        error = Some(failure(
+            "probe tasks not drained or traffic counters disagree",
+        ));
+    }
+    let cleanup = cleanup_work(series, &work, &marker);
+    if error.is_none() {
+        error = cleanup.err();
+    }
+    let protected_after = protected_snapshots()?;
+    if protected_before != protected_after {
+        error = Some(failure("protected installation changed"));
+    }
+    report["protected_after"] = protected_after;
+    report["received_bytes"] = json!(budget.received.load(Ordering::Relaxed));
+    report["pipeline_seconds"] = json!(seconds(&snapshot));
+    report["snapshot"] = json!(snapshot);
+    report["history"] = json!(metrics.history());
+    report["temporary_data_removed"] = json!(!work.exists());
+    report["status"] = json!(if error.is_none() {
+        "complete"
+    } else {
+        "failed"
+    });
+    report["error"] = json!(error.as_ref().map(ToString::to_string));
+    save_report(&input.report_path, &report)?;
+    eprintln!(
+        "SINGLE_PROBE {}: {:.3}s, {} bytes, error={:?}",
+        input.name,
+        seconds(&snapshot),
+        snapshot.received_bytes,
+        error
+    );
+    if let Some(error) = error {
         return Err(error);
     }
     Ok(())
