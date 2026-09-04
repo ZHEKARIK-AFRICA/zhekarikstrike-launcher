@@ -36,7 +36,7 @@ fn sha(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-fn finish_manifest(mut manifest: DrivePackManifest) -> DrivePackManifest {
+pub(crate) fn finish_manifest(mut manifest: DrivePackManifest) -> DrivePackManifest {
     manifest.content_sha256 = legacy_json_identity(&manifest.legacy_content_projection().unwrap())
         .expect("legacy identity");
     let mut value = serde_json::to_value(&manifest).unwrap();
@@ -45,7 +45,7 @@ fn finish_manifest(mut manifest: DrivePackManifest) -> DrivePackManifest {
     manifest
 }
 
-fn two_chunk_manifest() -> DrivePackManifest {
+pub(crate) fn two_chunk_manifest() -> DrivePackManifest {
     let raw_a = vec![b'a'; 10];
     let raw_b = vec![b'b'; 90];
     let raw_a_sha = sha(&raw_a);

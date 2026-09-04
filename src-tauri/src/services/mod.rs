@@ -12,6 +12,7 @@ pub mod content_pack_cache_service;
 pub mod content_pack_controller;
 pub mod content_pack_download_service;
 pub mod content_pack_install_service;
+pub(crate) mod content_pack_metrics;
 pub mod content_pack_plan_service;
 pub mod discord_rpc_service;
 pub mod disk_service;

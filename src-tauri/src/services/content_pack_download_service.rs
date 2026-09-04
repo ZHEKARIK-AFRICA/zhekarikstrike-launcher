@@ -18,6 +18,7 @@ use crate::services::content_pack_cache_service::PackCache;
 use crate::services::content_pack_controller::{
     AdaptivePackController, AttemptProgress, ControllerSample, PackSource, PressureWindow,
 };
+use crate::services::content_pack_metrics::{Activity, PackRunOptions, RequestGuard, Snapshot};
 use crate::services::content_pack_plan_service::{ByteRange, PackFetchPlan, PackTransferMode};
 use crate::utils::hash_utils::sha256_file;
 
@@ -86,7 +87,7 @@ struct PressureAccumulator {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn download_pack_fetches(
+pub(crate) async fn download_pack_fetches(
     client: Client,
     manifest: Arc<DrivePackManifest>,
     plans: Vec<PackFetchPlan>,
@@ -95,6 +96,7 @@ pub async fn download_pack_fetches(
     cancellation: CancellationToken,
     events: mpsc::Sender<PackDownloadEvent>,
     ready_backlog: Arc<AtomicU64>,
+    options: PackRunOptions,
 ) -> Result<PackDownloadSummary, AppError> {
     manifest.validate()?;
     let operation_id = operation_id.to_string();
@@ -103,13 +105,16 @@ pub async fn download_pack_fetches(
     let active_attempts = Arc::new(Mutex::new(BTreeMap::<String, ActiveAttempt>::new()));
     let pressure = Arc::new(Mutex::new(PressureAccumulator::default()));
     let mut controller = AdaptivePackController::new(6);
-    let mut ticker = tokio::time::interval(Duration::from_secs(2));
+    let mut ticker = tokio::time::interval(options.interval());
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut jobs = JoinSet::new();
     let mut summary = PackDownloadSummary::default();
+    let mut last_sample = Snapshot::default();
+    #[cfg(test)]
+    let clock_start = Instant::now();
 
     loop {
-        while jobs.len() < controller.target() && !pending.is_empty() {
+        while jobs.len() < options.target(controller.target()) && !pending.is_empty() {
             let plan = pending.pop_front().expect("pending plan must exist");
             let client = client.clone();
             let manifest = manifest.clone();
@@ -120,7 +125,9 @@ pub async fn download_pack_fetches(
             let active_attempts = active_attempts.clone();
             let pressure = pressure.clone();
             let useful_bytes = useful_bytes.clone();
+            let job_options = options.clone();
             jobs.spawn(async move {
+                let _job = job_options.metrics.activity(Activity::Job);
                 download_pack_job(
                     client,
                     manifest,
@@ -132,6 +139,7 @@ pub async fn download_pack_fetches(
                     active_attempts,
                     pressure,
                     useful_bytes,
+                    job_options,
                 )
                 .await
             });
@@ -156,7 +164,8 @@ pub async fn download_pack_fetches(
                     .collect::<Vec<_>>();
                 let mut current_pressure = pressure.lock().await;
                 let ready_backlog_bytes = ready_backlog.load(Ordering::Relaxed);
-                let sample = ControllerSample {
+                #[allow(unused_mut)]
+                let mut sample = ControllerSample {
                     useful_bytes: useful_bytes.load(Ordering::Relaxed),
                     ready_backlog_bytes,
                     pressure: PressureWindow {
@@ -167,11 +176,27 @@ pub async fn download_pack_fetches(
                 };
                 *current_pressure = PressureAccumulator::default();
                 drop(current_pressure);
-                let decision = controller.observe(Instant::now(), sample);
-                if decision.changed {
+                #[cfg(test)] let now = if let Some(clock) = &options.clock_ms {
+                    let at = clock_start + Duration::from_millis(clock.load(Ordering::Relaxed));
+                    for attempt in &mut sample.active_attempts {
+                        attempt.last_progress_at = at.checked_sub(attempt.last_progress_at.elapsed()).unwrap_or(clock_start);
+                    }
+                    at
+                } else { Instant::now() };
+                #[cfg(not(test))] let now = Instant::now();
+                let decision = controller.observe(now, sample);
+                let reason = decision.reason.as_str();
+                #[cfg(test)] let reason = if options.fixed_jobs.is_some() { "fixed_baseline" } else { reason };
+                let changed = decision.changed;
+                #[cfg(test)] let changed = changed && options.fixed_jobs.is_none();
+                options.metrics.controller(options.target(decision.target), pending.len(), ready_backlog_bytes, reason);
+                if changed {
+                    options.metrics.log_sample(&mut last_sample);
+                }
+                if changed {
                     crate::logger::info(&format!(
                         "Google Drive pack concurrency changed to {}; ready backlog={} bytes; pending packs={}",
-                        decision.target, ready_backlog_bytes, pending.len()
+                        options.target(decision.target), ready_backlog_bytes, pending.len()
                     ));
                 }
                 if let Some(preempt) = decision.preempt {
@@ -206,6 +231,8 @@ pub async fn download_pack_fetches(
             }
         }
     }
+    options.metrics.phase_finished(true);
+    options.metrics.log_sample(&mut last_sample);
     Ok(summary)
 }
 
@@ -221,6 +248,7 @@ async fn download_pack_job(
     active_attempts: Arc<Mutex<BTreeMap<String, ActiveAttempt>>>,
     pressure: Arc<Mutex<PressureAccumulator>>,
     useful_bytes: Arc<AtomicU64>,
+    options: PackRunOptions,
 ) -> Result<JobResult, AppError> {
     let _claim = cache.claim(&plan.pack_sha256).await?;
     let pack = manifest
@@ -239,6 +267,7 @@ async fn download_pack_job(
         PackTransferMode::Full => {
             let verified = cache.full_path(&plan.pack_sha256)?;
             if verified_full_pack(&verified, pack.size, &plan.pack_sha256).await? {
+                options.metrics.verified(pack.size);
                 let chunks = full_pack_chunks(&manifest, &plan, &verified)?;
                 publish_ready_chunks(&events, &chunks).await?;
                 return Ok(JobResult {
@@ -253,7 +282,9 @@ async fn download_pack_job(
                 if disabled_replicas.contains(&replica_index) {
                     continue;
                 }
-                let url = DrivePackManifest::drive_url(&pack.replica_file_ids[replica_index])?;
+                let url = options.request_url(&DrivePackManifest::drive_url(
+                    &pack.replica_file_ids[replica_index],
+                )?);
                 for retry in 0..MAX_REPLICA_ATTEMPTS {
                     let preempt = CancellationToken::new();
                     register_attempt(
@@ -273,6 +304,7 @@ async fn download_pack_job(
                             cancellation: &cancellation,
                             preempt: &preempt,
                             active_attempts: &active_attempts,
+                            options: &options,
                         },
                         &partial,
                         pack.size,
@@ -282,6 +314,7 @@ async fn download_pack_job(
                         Ok(bytes) => {
                             network_bytes = network_bytes.saturating_add(bytes);
                             PackCache::promote(&partial, &verified).await?;
+                            options.metrics.verified(pack.size);
                             publish_useful_bytes(&events, &useful_bytes, &plan.pack_sha256, bytes)
                                 .await?;
                             let chunks = full_pack_chunks(&manifest, &plan, &verified)?;
@@ -337,8 +370,9 @@ async fn download_pack_job(
                         if disabled_replicas.contains(&replica_index) {
                             continue;
                         }
-                        let url =
-                            DrivePackManifest::drive_url(&pack.replica_file_ids[replica_index])?;
+                        let url = options.request_url(&DrivePackManifest::drive_url(
+                            &pack.replica_file_ids[replica_index],
+                        )?);
                         for retry in 0..MAX_REPLICA_ATTEMPTS {
                             let preempt = CancellationToken::new();
                             register_attempt(
@@ -360,6 +394,7 @@ async fn download_pack_job(
                                 &cancellation,
                                 &preempt,
                                 &active_attempts,
+                                &options,
                             )
                             .await
                             {
@@ -382,6 +417,7 @@ async fn download_pack_job(
                                         break;
                                     }
                                     PackCache::promote(&partial, &verified).await?;
+                                    options.metrics.verified(bytes);
                                     publish_useful_bytes(
                                         &events,
                                         &useful_bytes,
@@ -458,6 +494,7 @@ struct FullDownloadAttempt<'a> {
     cancellation: &'a CancellationToken,
     preempt: &'a CancellationToken,
     active_attempts: &'a Mutex<BTreeMap<String, ActiveAttempt>>,
+    options: &'a PackRunOptions,
 }
 
 async fn download_full_attempt(
@@ -477,6 +514,10 @@ async fn download_full_attempt(
     while offset < pack_size {
         let range = full_pack_request_range(offset, pack_size).map_err(fatal)?;
         let completed_bytes = offset.saturating_sub(initial_offset);
+        let mut request_guard = attempt
+            .options
+            .request(range.len().map_err(fatal)?)
+            .map_err(fatal)?;
         let request = attempt
             .client
             .get(attempt.url.clone())
@@ -517,6 +558,7 @@ async fn download_full_attempt(
                 attempt.preempt,
                 attempt.active_attempts,
                 &mut hasher,
+                &mut request_guard,
             )
             .await,
             completed_bytes,
@@ -568,7 +610,11 @@ async fn download_range_attempt(
     cancellation: &CancellationToken,
     preempt: &CancellationToken,
     active_attempts: &Mutex<BTreeMap<String, ActiveAttempt>>,
+    options: &PackRunOptions,
 ) -> Result<u64, AttemptError> {
+    let mut request_guard = options
+        .request(range.len().map_err(fatal)?)
+        .map_err(fatal)?;
     let request = client
         .get(url.clone())
         .header(header::ACCEPT_ENCODING, "identity")
@@ -594,6 +640,7 @@ async fn download_range_attempt(
         preempt,
         active_attempts,
         &mut unused_hasher,
+        &mut request_guard,
     )
     .await?;
     range.len().map_err(fatal)
@@ -701,6 +748,7 @@ async fn stream_response(
     preempt: &CancellationToken,
     active_attempts: &Mutex<BTreeMap<String, ActiveAttempt>>,
     hasher: &mut Sha256,
+    request_guard: &mut RequestGuard,
 ) -> Result<(), AttemptError> {
     let mut options = tokio::fs::OpenOptions::new();
     options.create(true).write(true);
@@ -731,6 +779,7 @@ async fn stream_response(
         let Some(next) = next else { break };
         let bytes =
             next.map_err(|error| retryable(error.into(), None, true, false, network_bytes))?;
+        request_guard.received(bytes.len() as u64).map_err(fatal)?;
         written = written
             .checked_add(bytes.len() as u64)
             .ok_or_else(|| integrity("Google Drive pack response size overflow", network_bytes))?;
@@ -752,6 +801,7 @@ async fn stream_response(
         )
         .await;
     }
+    request_guard.response_finished();
     output.flush().await.map_err(fatal)?;
     output.sync_all().await.map_err(fatal)?;
     if written != expected_size {

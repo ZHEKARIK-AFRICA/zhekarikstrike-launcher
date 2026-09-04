@@ -39,6 +39,7 @@ use crate::services::content_pack_cache_service::PackCache;
 use crate::services::content_pack_download_service::{
     download_pack_fetches, PackDownloadEvent, VerifiedPackedChunk,
 };
+use crate::services::content_pack_metrics::{Activity, PackMetrics, PackRunOptions, Snapshot};
 use crate::services::content_pack_plan_service::{
     plan_pack_fetches, PackFetchPlan, PackTransferMode,
 };
@@ -238,7 +239,8 @@ pub async fn install_or_update_packed_content(
         staging_budget,
         pipeline_progress,
         pipeline_cancel,
-        operation_id,
+        operation_id.clone(),
+        PackRunOptions::new(&operation_id),
     )
     .await;
     let state = match result {
@@ -277,7 +279,33 @@ async fn run_packed_pipeline(
     progress: PipelineProgress,
     cancellation: CancellationToken,
     operation_id: String,
+    options: PackRunOptions,
 ) -> Result<crate::services::content_journal_service::ContentCompletionState, AppError> {
+    let metrics = options.metrics.clone();
+    metrics.pipeline_started();
+    let ready_backlog = Arc::new(AtomicU64::new(0));
+    let monitor_backlog = ready_backlog.clone();
+    let monitor_budget = budget.clone();
+    let final_backlog = ready_backlog.clone();
+    let final_budget = budget.clone();
+    let monitor_stop = CancellationToken::new();
+    let monitor_token = monitor_stop.clone();
+    let monitor_metrics = metrics.clone();
+    let monitor = tokio::spawn(async move {
+        let mut previous = Snapshot::default();
+        let mut timer =
+            tokio::time::interval_at(tokio::time::Instant::now() + CONTROL_WINDOW, CONTROL_WINDOW);
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = monitor_token.cancelled() => break,
+                _ = timer.tick() => {
+                    monitor_metrics.queues(monitor_backlog.load(Ordering::Relaxed), monitor_budget.available_bytes().await);
+                    monitor_metrics.log_sample(&mut previous);
+                },
+            }
+        }
+    });
     let mut readiness = HashMap::new();
     for raw_sha in prepared
         .iter()
@@ -293,7 +321,6 @@ async fn run_packed_pipeline(
     }
     let readiness = Arc::new(readiness);
     let packed_chunks = Arc::new(RwLock::new(HashMap::new()));
-    let ready_backlog = Arc::new(AtomicU64::new(0));
     let consumed_chunks = Arc::new(Mutex::new(HashSet::new()));
     let (pack_events_tx, pack_events_rx) = mpsc::channel(64);
     let (artifacts_tx, artifacts_rx) = mpsc::channel(2);
@@ -314,6 +341,7 @@ async fn run_packed_pipeline(
             download_cancel.clone(),
             pack_events_tx,
             download_ready_backlog,
+            options,
         )
         .await;
         if result.is_err() {
@@ -345,6 +373,7 @@ async fn run_packed_pipeline(
             artifacts_tx,
             budget,
             materialize_cancel.clone(),
+            metrics.clone(),
         )
         .await;
         if result.is_err() {
@@ -354,10 +383,28 @@ async fn run_packed_pipeline(
     };
     let commit_cancel = cancellation.clone();
     let commit = run_streaming_commit(commit_context, artifacts_rx, commit_cancel);
-    let progress_events = consume_committed_progress(committed_rx, progress);
+    let progress_events = consume_committed_progress(committed_rx, progress, metrics.clone());
 
     let (download_result, dispatch_result, materialize_result, commit_result, progress_result) =
         tokio::join!(download, dispatch, materialize, commit, progress_events);
+    monitor_stop.cancel();
+    let _ = monitor.await;
+    metrics.queues(
+        final_backlog.load(Ordering::Relaxed),
+        final_budget.available_bytes().await,
+    );
+    metrics.finish(
+        if download_result.is_ok()
+            && dispatch_result.is_ok()
+            && materialize_result.is_ok()
+            && commit_result.is_ok()
+            && progress_result.is_ok()
+        {
+            "complete"
+        } else {
+            "failed_or_canceled"
+        },
+    );
     let mut errors = Vec::new();
     if let Err(error) = download_result {
         errors.push(error);
@@ -443,11 +490,18 @@ async fn materialize_packed_files(
     artifacts: mpsc::Sender<VerifiedArtifact>,
     budget: StagingBudget,
     cancellation: CancellationToken,
+    metrics: PackMetrics,
 ) -> Result<(), AppError> {
     let logical_cpus = std::thread::available_parallelism().map_or(1, usize::from);
     let mut system = System::new_all();
     let (initial, maximum) = materializer_worker_limits(logical_cpus, system.available_memory());
     let mut controller = AdaptiveMaterializerController::new(initial, maximum);
+    metrics.materializer(
+        initial,
+        maximum,
+        system.global_cpu_usage(),
+        system.available_memory(),
+    );
     let chunks = Arc::new(chunks);
     let mut pending = VecDeque::from(prepared);
     let mut running = JoinSet::new();
@@ -471,10 +525,14 @@ async fn materialize_packed_files(
             let task_artifacts = artifacts.clone();
             let task_budget = budget.clone();
             let task_cancel = cancellation.clone();
+            let task_metrics = metrics.clone();
             running.spawn(async move {
+                let _activity = task_metrics.activity(Activity::Materializer);
+                let budget_started = Instant::now();
                 task_budget
                     .reserve(prepared.file.size, &task_cancel)
                     .await?;
+                task_metrics.waited(true, budget_started.elapsed());
                 let result = materialize_packed_file(
                     &prepared.file,
                     &task_chunks,
@@ -485,6 +543,7 @@ async fn materialize_packed_files(
                     &task_consumed,
                     &task_staging,
                     task_cancel,
+                    &task_metrics,
                 )
                 .await;
                 match result {
@@ -540,12 +599,19 @@ async fn materialize_packed_files(
                 system.available_memory(),
                 (window_waited.as_secs_f64() / elapsed / controller.current() as f64).min(1.0),
             );
+            metrics.materializer(
+                controller.current(),
+                maximum,
+                system.global_cpu_usage(),
+                system.available_memory(),
+            );
             window_started = Instant::now();
             window_bytes = 0;
             window_waited = Duration::ZERO;
         }
     }
     drop(artifacts);
+    metrics.phase_finished(false);
     first_error.map_or(Ok(()), Err)
 }
 
@@ -560,6 +626,7 @@ async fn materialize_packed_file(
     consumed_chunks: &Mutex<HashSet<String>>,
     staging: &Path,
     cancellation: CancellationToken,
+    metrics: &PackMetrics,
 ) -> Result<(VerifiedArtifact, MaterializeReport), AppError> {
     let target = safe_join(staging, &file.path)?;
     if let Some(parent) = target.parent() {
@@ -583,6 +650,7 @@ async fn materialize_packed_file(
         let raw = if let Some(source) = stable_sources.get(raw_sha) {
             read_stable_local_chunk(source.clone(), raw_sha.clone(), chunk.clone()).await?
         } else {
+            let wait_started = Instant::now();
             waited = waited.saturating_add(
                 crate::services::content_install_service::wait_until_chunk_ready(
                     readiness
@@ -595,6 +663,7 @@ async fn materialize_packed_file(
                 )
                 .await?,
             );
+            metrics.waited(false, wait_started.elapsed());
             let first_consumer = consumed_chunks
                 .lock()
                 .expect("packed consumed chunk mutex should not be poisoned")
@@ -619,6 +688,7 @@ async fn materialize_packed_file(
         };
         output.write_all(&raw).await?;
         hasher.update(&raw);
+        metrics.materialized(raw.len() as u64);
         written = written
             .checked_add(raw.len() as u64)
             .ok_or_else(|| AppError::InvalidData("materialized content size overflow".into()))?;
@@ -800,11 +870,102 @@ async fn persist_compatibility_manifest(
 async fn consume_committed_progress(
     mut committed: mpsc::Receiver<u64>,
     progress: PipelineProgress,
+    metrics: PackMetrics,
 ) -> Result<(), AppError> {
     while let Some(bytes) = committed.recv().await {
+        metrics.committed(bytes);
         if let Err(error) = progress.add_materialized(bytes, "") {
             crate::logger::warn(&format!("could not emit packed commit progress: {error}"));
         }
     }
+    Ok(())
+}
+
+/// Test-only entry below launcher lifecycle/config mutation. The caller owns a
+/// disposable marked directory; the full server manifest remains unchanged.
+#[cfg(test)]
+pub(crate) async fn run_packed_probe(
+    api: &ApiClient,
+    manifest: Arc<DrivePackManifest>,
+    game_path: PathBuf,
+    files: Vec<crate::models::ContentFile>,
+    options: PackRunOptions,
+    cancellation: CancellationToken,
+) -> Result<(), AppError> {
+    manifest.validate()?;
+    if tokio::fs::try_exists(&game_path).await? {
+        return Err(AppError::InvalidData(
+            "probe requires a new empty game directory".into(),
+        ));
+    }
+    let inventory = ContentInventory::from_v3(&manifest)?;
+    let prepared = files
+        .into_iter()
+        .map(|file| PreparedFile {
+            file,
+            had_original: false,
+            original_size: 0,
+        })
+        .collect::<Vec<_>>();
+    let plans = plan_pack_fetches(&manifest, &ordered_required_chunks(&prepared))?;
+    let planned = planned_download_bytes(&manifest, &plans)?;
+    let materialized = prepared.iter().map(|p| p.file.size).sum::<u64>();
+    let staging_limit = prepared
+        .iter()
+        .map(|p| p.file.size)
+        .max()
+        .unwrap_or(0)
+        .max(MIN_STAGING_BUDGET);
+    let disk_required = planned
+        .checked_add(materialized)
+        .and_then(|n| n.checked_add(staging_limit))
+        .and_then(|n| n.checked_add(INSTALL_SAFETY_RESERVE))
+        .ok_or_else(|| AppError::InvalidData("probe disk arithmetic overflow".into()))?;
+    ensure_disk_space(
+        game_path
+            .parent()
+            .ok_or_else(|| AppError::InvalidData("probe parent missing".into()))?,
+        disk_required,
+    )?;
+    tokio::fs::create_dir(&game_path).await?;
+    let transaction_id = Uuid::new_v4().to_string();
+    let cache = PackCache::new(&game_path, &manifest.content_sha256, &transaction_id).await?;
+    let journal = ContentJournal {
+        schema_version: 2,
+        transaction_id: transaction_id.clone(),
+        release_id: manifest.release_id.clone(),
+        content_sha256: manifest.content_sha256.clone(),
+        phase: ContentJournalPhase::StreamingCommit,
+        files: replacement_journal_entries(&game_path, &prepared, &NoContentFsHooks).await?,
+    };
+    persist_compatibility_manifest(&game_path, &inventory).await?;
+    write_journal(&game_path, &journal).await?;
+    let budget = StagingBudget::new(staging_limit)?;
+    // Same seed in isolated A/B roots selects the same initial Drive replicas.
+    let operation = "461ea0b9-971f-4b65-bdea-0a7495a0b813".to_string();
+    let progress =
+        PipelineProgress::new(ProgressEmitter::headless(&operation), planned, materialized);
+    run_packed_pipeline(
+        api,
+        manifest,
+        plans,
+        prepared,
+        HashMap::new(),
+        cache,
+        staging_path(&game_path, &transaction_id),
+        CommitContext {
+            game_path,
+            journal,
+            inventory,
+            staging_budget: budget.clone(),
+            committed: mpsc::channel(1).0,
+        },
+        budget,
+        progress,
+        cancellation,
+        operation,
+        options,
+    )
+    .await?;
     Ok(())
 }

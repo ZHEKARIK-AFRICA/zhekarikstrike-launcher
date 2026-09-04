@@ -35,6 +35,9 @@ pub struct StagingBudget {
 }
 
 impl StagingBudget {
+    pub(crate) async fn available_bytes(&self) -> u64 {
+        *self.available.lock().await
+    }
     pub fn new(limit: u64) -> Result<Self, AppError> {
         if limit == 0 {
             return Err(AppError::InvalidData(

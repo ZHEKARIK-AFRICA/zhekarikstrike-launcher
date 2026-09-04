@@ -46,11 +46,40 @@ pub struct AdaptivePreemption {
     pub replica_index: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControllerReason {
+    InsufficientMeasurements,
+    ReadyBacklog,
+    TrialIncrease,
+    TrialAccepted,
+    TrialRejected,
+    Pressure,
+    Cooldown,
+    AtLimit,
+}
+
+impl ControllerReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InsufficientMeasurements => "insufficient_measurements",
+            Self::ReadyBacklog => "ready_backlog",
+            Self::TrialIncrease => "trial_increase",
+            Self::TrialAccepted => "trial_accepted",
+            Self::TrialRejected => "trial_rejected",
+            Self::Pressure => "pressure",
+            Self::Cooldown => "cooldown",
+            Self::AtLimit => "at_limit",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControllerDecision {
     pub target: usize,
     pub changed: bool,
     pub preempt: Option<AdaptivePreemption>,
+    pub reason: ControllerReason,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +130,7 @@ impl AdaptivePackController {
 
     pub fn observe(&mut self, now: Instant, sample: ControllerSample) -> ControllerDecision {
         let previous_target = self.target;
+        let mut reason = ControllerReason::InsufficientMeasurements;
         if self.window_started_at.is_none() {
             self.window_started_at = Some(now);
             self.sample_useful_bytes = sample.useful_bytes;
@@ -122,6 +152,7 @@ impl AdaptivePackController {
             self.pressure_events.pop_front();
         }
         if self.pressure_events.len() >= 3 {
+            reason = ControllerReason::Pressure;
             self.target = (self.target / 2).max(1);
             self.trial = None;
             self.cooldown_until = Some(now + COOLDOWN);
@@ -142,8 +173,10 @@ impl AdaptivePackController {
                 self.ewma_bytes_per_second = Some(ewma);
                 if let Some(trial) = self.trial.take() {
                     if ewma >= trial.baseline * 1.05 {
+                        reason = ControllerReason::TrialAccepted;
                         self.accepted_baselines.insert(self.target, ewma);
                     } else {
+                        reason = ControllerReason::TrialRejected;
                         self.target = trial.previous_target;
                         self.cooldown_until = Some(now + COOLDOWN);
                     }
@@ -151,10 +184,14 @@ impl AdaptivePackController {
                     self.accepted_baselines.insert(self.target, ewma);
                     let cooldown_complete =
                         self.cooldown_until.is_none_or(|cooldown| now >= cooldown);
-                    if self.target < self.maximum
-                        && sample.ready_backlog_bytes < MAX_TRIAL_BACKLOG
-                        && cooldown_complete
-                    {
+                    if self.target >= self.maximum {
+                        reason = ControllerReason::AtLimit;
+                    } else if sample.ready_backlog_bytes >= MAX_TRIAL_BACKLOG {
+                        reason = ControllerReason::ReadyBacklog;
+                    } else if !cooldown_complete {
+                        reason = ControllerReason::Cooldown;
+                    } else {
+                        reason = ControllerReason::TrialIncrease;
                         self.trial = Some(ControllerTrial {
                             previous_target: self.target,
                             baseline: ewma,
@@ -186,6 +223,7 @@ impl AdaptivePackController {
             target: self.target,
             changed: self.target != previous_target,
             preempt,
+            reason,
         }
     }
 
@@ -193,5 +231,70 @@ impl AdaptivePackController {
         self.sample_ticks = 0;
         self.sample_useful_bytes = useful_bytes;
         self.window_started_at = Some(now);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(useful_bytes: u64, ready_backlog_bytes: u64) -> ControllerSample {
+        ControllerSample {
+            useful_bytes,
+            ready_backlog_bytes,
+            pressure: PressureWindow::default(),
+            active_attempts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn drive_pack_reason_sequence_tracks_target_transitions() {
+        let start = Instant::now();
+        let mut controller = AdaptivePackController::new(4);
+        assert_eq!(
+            controller.observe(start, sample(0, 0)).reason,
+            ControllerReason::InsufficientMeasurements
+        );
+        assert_eq!(
+            controller
+                .observe(start + Duration::from_secs(1), sample(32 * 1024 * 1024, 0))
+                .reason,
+            ControllerReason::InsufficientMeasurements
+        );
+        assert_eq!(
+            controller
+                .observe(start + Duration::from_secs(2), sample(64 * 1024 * 1024, 0))
+                .reason,
+            ControllerReason::TrialIncrease
+        );
+        assert_eq!(controller.target(), 3);
+        assert_eq!(
+            controller
+                .observe(start + Duration::from_secs(3), sample(80 * 1024 * 1024, 0))
+                .reason,
+            ControllerReason::InsufficientMeasurements
+        );
+        assert_eq!(
+            controller
+                .observe(start + Duration::from_secs(4), sample(96 * 1024 * 1024, 0))
+                .reason,
+            ControllerReason::InsufficientMeasurements
+        );
+        let rejected =
+            controller.observe(start + Duration::from_secs(5), sample(128 * 1024 * 1024, 0));
+        assert_eq!(rejected.reason, ControllerReason::TrialRejected);
+        assert_eq!(rejected.target, 2);
+        assert!(rejected.changed);
+    }
+
+    #[test]
+    fn drive_pack_pressure_reason_wins() {
+        let mut controller = AdaptivePackController::new(4);
+        let now = Instant::now();
+        let mut pressured = sample(0, 0);
+        pressured.pressure.throttled = true;
+        let decision = controller.observe(now, pressured);
+        assert_eq!(decision.reason, ControllerReason::Pressure);
+        assert_eq!(decision.target, 1);
     }
 }

@@ -62,7 +62,7 @@ impl ProgressPayload {
 
 #[derive(Clone)]
 pub struct ProgressEmitter {
-    app: AppHandle,
+    app: Option<AppHandle>,
     event: String,
     operation_id: String,
 }
@@ -70,7 +70,7 @@ pub struct ProgressEmitter {
 impl ProgressEmitter {
     pub fn new(app: AppHandle, event: impl Into<String>, operation_id: impl Into<String>) -> Self {
         Self {
-            app,
+            app: Some(app),
             event: event.into(),
             operation_id: operation_id.into(),
         }
@@ -81,8 +81,19 @@ impl ProgressEmitter {
     }
 
     pub fn emit(&self, payload: ProgressPayload) -> Result<(), AppError> {
-        self.app.emit(&self.event, payload)?;
+        if let Some(app) = &self.app {
+            app.emit(&self.event, payload)?;
+        }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn headless(operation_id: &str) -> Self {
+        Self {
+            app: None,
+            event: String::new(),
+            operation_id: operation_id.to_owned(),
+        }
     }
 
     pub fn emit_stage(
