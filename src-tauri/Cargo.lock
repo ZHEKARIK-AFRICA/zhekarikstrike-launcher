@@ -716,6 +716,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6"
 
 [[package]]
+name = "content-pack-core"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde",
+ "sha2",
+ "thiserror 2.0.18",
+ "zstd",
+]
+
+[[package]]
 name = "cookie"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6643,12 +6654,16 @@ name = "zhekarikstrike_launcher"
 version = "1.6.16"
 dependencies = [
  "anyhow",
+ "bytes",
  "chrono",
+ "content-pack-core",
  "directories",
  "discord-rich-presence",
  "fs_extra",
  "futures-util",
+ "h2",
  "hex",
+ "http",
  "minisign-verify",
  "reqwest 0.12.28",
  "semver",

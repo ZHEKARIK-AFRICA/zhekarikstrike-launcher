@@ -201,3 +201,8 @@ mod release_1_6_11_tests {
         }
     }
 }
+impl From<content_pack_core::integrity::CoreError> for AppError {
+    fn from(error: content_pack_core::integrity::CoreError) -> Self {
+        Self::InvalidData(error.to_string())
+    }
+}

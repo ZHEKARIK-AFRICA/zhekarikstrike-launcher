@@ -4,9 +4,9 @@ use crate::{
     error::AppError,
     models::{DrivePackManifest, PackedContentChunk},
 };
-use sha2::{Digest, Sha256};
+pub(crate) use content_pack_core::integrity::UniqueTraffic;
+use content_pack_core::integrity::{ChunkSpan, ChunkVerifier, StreamSha};
 use std::{
-    collections::HashMap,
     fs::File,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -91,39 +91,9 @@ impl Drop for PackGeneration {
     }
 }
 
-/// Pack-relative intervals; cached prefix is registered without traffic credit.
-#[derive(Default)]
-pub(crate) struct UniqueTraffic(Mutex<HashMap<String, Vec<(u64, u64)>>>);
-impl UniqueTraffic {
-    pub fn observe(&self, pack: &str, start: u64, end: u64) -> u64 {
-        if end <= start {
-            return 0;
-        }
-        let mut map = self.0.lock().expect("unique pack intervals");
-        let intervals = map.entry(pack.to_owned()).or_default();
-        let duplicate: u64 = intervals
-            .iter()
-            .map(|(a, b)| end.min(*b).saturating_sub(start.max(*a)))
-            .sum();
-        intervals.push((start, end));
-        intervals.sort_unstable();
-        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(intervals.len());
-        for &(a, b) in intervals.iter() {
-            if let Some(last) = merged.last_mut().filter(|last| a <= last.1) {
-                last.1 = last.1.max(b);
-            } else {
-                merged.push((a, b));
-            }
-        }
-        *intervals = merged;
-        end - start - duplicate
-    }
-}
-
 pub(crate) struct ChunkStream {
     chunks: Vec<(String, PackedContentChunk)>,
-    next: usize,
-    hash: Sha256,
+    verifier: ChunkVerifier,
     pub source: Arc<PackGeneration>,
     pub base: u64,
 }
@@ -144,10 +114,20 @@ impl ChunkStream {
             })
             .collect::<Vec<_>>();
         chunks.sort_by_key(|(_, chunk)| chunk.offset);
+        let verifier = ChunkVerifier::new(
+            chunks
+                .iter()
+                .map(|(_, c)| ChunkSpan {
+                    offset: c.offset,
+                    size: c.compressed_size,
+                    sha256: c.compressed_sha256.clone(),
+                })
+                .collect(),
+            base,
+        );
         Self {
             chunks,
-            next: 0,
-            hash: Sha256::new(),
+            verifier,
             source,
             base,
         }
@@ -158,42 +138,21 @@ impl ChunkStream {
         absolute_start: u64,
         bytes: &[u8],
     ) -> Result<Vec<(String, PackedContentChunk)>, AppError> {
-        let end = absolute_start + bytes.len() as u64;
-        let mut ready = Vec::new();
-        while let Some((raw, chunk)) = self.chunks.get(self.next) {
-            let chunk_end = chunk.offset + chunk.compressed_size;
-            if end <= chunk.offset {
-                break;
-            }
-            let from = absolute_start.max(chunk.offset);
-            let to = end.min(chunk_end);
-            if from < to {
-                self.hash.update(
-                    &bytes[(from - absolute_start) as usize..(to - absolute_start) as usize],
-                );
-            }
-            if end < chunk_end {
-                break;
-            }
-            let hash = std::mem::take(&mut self.hash);
-            if hex::encode(hash.finalize()) != chunk.compressed_sha256 {
-                return Err(AppError::InvalidData(
-                    "streamed compressed chunk failed SHA-256".into(),
-                ));
-            }
-            ready.push((raw.clone(), chunk.clone()));
-            self.next += 1;
-        }
-        Ok(ready)
+        Ok(self
+            .verifier
+            .feed(absolute_start, bytes)?
+            .into_iter()
+            .map(|i| self.chunks[i].clone())
+            .collect())
     }
     pub async fn resume(
         &mut self,
         path: &Path,
         metrics: &PackMetrics,
-    ) -> Result<(u64, Sha256, Vec<(String, PackedContentChunk)>), AppError> {
+    ) -> Result<(u64, StreamSha, Vec<(String, PackedContentChunk)>), AppError> {
         let mut file = tokio::fs::File::open(path).await?;
         let mut buffer = vec![0; 1024 * 1024];
-        let mut hasher = Sha256::new();
+        let mut hasher = StreamSha::new();
         let mut offset = 0;
         let mut ready = Vec::new();
         loop {

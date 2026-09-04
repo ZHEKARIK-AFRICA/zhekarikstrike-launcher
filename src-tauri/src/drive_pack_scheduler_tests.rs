@@ -105,6 +105,7 @@ struct Peer {
     active: Arc<AtomicUsize>,
     peak: Arc<AtomicUsize>,
     pause_at: Arc<AtomicU64>,
+    pause_first_only: Arc<AtomicBool>,
     body_gate: Arc<Semaphore>,
     stop: CancellationToken,
     task: tokio::task::JoinHandle<()>,
@@ -123,6 +124,8 @@ impl Peer {
         let peak = Arc::new(AtomicUsize::new(0));
         let stop = CancellationToken::new();
         let pause_at = Arc::new(AtomicU64::new(u64::MAX));
+        let pause_first_only = Arc::new(AtomicBool::new(false));
+        let first_only = pause_first_only.clone();
         let body_gate = Arc::new(Semaphore::new(0));
         let (pause, body_permits) = (pause_at.clone(), body_gate.clone());
         let (tg, tt, ta, tp, ts) = (
@@ -142,6 +145,7 @@ impl Peer {
                         let (mut socket, _) = accepted.unwrap();
                         let (bodies, gate, throttled, active, peak, stop) = (bodies.clone(), tg.clone(), tt.clone(), ta.clone(), tp.clone(), ts.clone());
                         let (pause,body_permits)=(pause.clone(),body_permits.clone());
+                        let first_only=first_only.clone();
                         connections.spawn(async move {
                             let mut request = Vec::new();
                             loop {
@@ -170,7 +174,7 @@ impl Peer {
                             }
                             let header = format!("HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{}\r\nConnection: close\r\n\r\n", end-start+1, body.len());
                             if socket.write_all(header.as_bytes()).await.is_err() { return; }
-                            let split=(pause.load(SeqCst) as usize).clamp(start,end+1);
+                            let split=if start>0 && first_only.load(SeqCst) {end+1} else {(pause.load(SeqCst) as usize).clamp(start,end+1)};
                             if split>start { if tokio::select! { _=stop.cancelled()=>return, result=socket.write_all(&body[start..split])=>result }.is_err(){return;} }
                             if split<=end {
                                 let permit=tokio::select!{_=stop.cancelled()=>return,p=body_permits.acquire()=>p.unwrap()};permit.forget();
@@ -190,6 +194,7 @@ impl Peer {
             active,
             peak,
             pause_at,
+            pause_first_only,
             body_gate,
             stop,
             task,
@@ -310,7 +315,7 @@ async fn drive_pack_early_files_cross_range_and_wait_hash_barrier_or_rollback() 
                 &ApiClient::new().unwrap(),
                 m.clone(),
                 g,
-                m.files[..2].to_vec(),
+                m.files.clone(),
                 options,
                 c,
             )
@@ -468,6 +473,72 @@ async fn drive_pack_resume_prefix_and_corruption_never_finalize_unverified_data(
         assert_eq!(metrics.snapshot().active_jobs, 0);
         assert_eq!(metrics.snapshot().active_materializers, 0);
         peer.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drive_pack_prefetch_overlaps_current_caps_buffer_and_drains_cancel() {
+    use crate::services::{api_client::ApiClient, content_pack_install_service::run_packed_probe};
+    let (manifest, bodies, _) = pipeline_fixture();
+    for cancel in [false, true] {
+        let peer = Peer::start(bodies.clone()).await;
+        peer.pause_at.store(15 * MIB, SeqCst);
+        peer.pause_first_only.store(true, SeqCst);
+        peer.gate.add_permits(100);
+        let dir = scratch();
+        let game = dir.path().join("game");
+        let mut options = PackRunOptions::new("prefetch-test");
+        options.local_transport = Some(peer.url.clone());
+        options.metrics.materializer(2, 2, 0., 4096 * MIB);
+        let metrics = options.metrics.clone();
+        let token = CancellationToken::new();
+        let (m, g, c) = (manifest.clone(), game.clone(), token.clone());
+        let task = tokio::spawn(async move {
+            run_packed_probe(
+                &ApiClient::new().unwrap(),
+                m.clone(),
+                g,
+                m.files.clone(),
+                options,
+                c,
+            )
+            .await
+        });
+        let scenario = async {
+            until(
+                || metrics.snapshot().prefetch_bytes >= MIB,
+                "bounded prefetch while current is paused",
+            )
+            .await;
+            let snapshot = metrics.snapshot();
+            // Socket reads can be shorter than64KiB: the bound is a maximum,
+            // not a promise that the32 slots always contain exactly2MiB.
+            assert!(snapshot.prefetch_bytes >= MIB && snapshot.prefetch_bytes <= 2 * MIB);
+            assert!(snapshot.prefetch_peak_buffer_bytes <= 2 * MIB);
+            assert_eq!(snapshot.peak_requests, 2);
+            assert!(snapshot.peak_requests <= 6);
+            assert!(snapshot.http_protocols.contains_key("HTTP/1.1"));
+            assert!(!game.join(".zhekarik/content/state.json").exists());
+            assert!(!task.is_finished());
+        };
+        let outcome =
+            futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(scenario)).await;
+        if cancel || outcome.is_err() {
+            token.cancel();
+        } else {
+            peer.body_gate.add_permits(100);
+        }
+        let result = task.await.unwrap();
+        if outcome.is_ok() {
+            assert_eq!(result.is_err(), cancel, "{result:?}");
+            assert_eq!(game.join(".zhekarik/content/state.json").exists(), !cancel);
+        }
+        assert_eq!(metrics.snapshot().active_requests, 0);
+        assert_eq!(metrics.snapshot().active_jobs, 0);
+        peer.shutdown().await;
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
     }
 }
 

@@ -45,6 +45,7 @@ impl PackCache {
             .join(content_sha256);
         tokio::fs::create_dir_all(root.join("full")).await?;
         tokio::fs::create_dir_all(root.join("ranges")).await?;
+        tokio::fs::create_dir_all(root.join("plans")).await?;
         // A crashed process cannot retain handles. Clean only our uniquely named
         // retired generations; normal .part/verified files remain resumable.
         for directory in [root.join("full"), root.join("ranges")] {
@@ -98,6 +99,104 @@ impl PackCache {
         file.write_all(self.transaction_id.as_bytes()).await?;
         file.flush().await?;
         Ok(PackClaim { path })
+    }
+
+    /// Freeze only when a job starts. Dynamic measurements never change the
+    /// layout underneath an existing partial file.
+    pub async fn freeze_plan(
+        &self,
+        manifest: &crate::models::DrivePackManifest,
+        proposed: super::content_pack_plan_service::PackFetchPlan,
+    ) -> Result<super::content_pack_plan_service::PackFetchPlan, AppError> {
+        use super::content_pack_plan_service::{
+            legacy_plan_pack_fetches, validate_fetch_plan, PackFetchPlan, PackTransferMode,
+        };
+        #[derive(serde::Serialize, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Saved {
+            schema_version: u32,
+            manifest_sha256: String,
+            plan: PackFetchPlan,
+        }
+        validate_fetch_plan(manifest, &proposed)?;
+        // std/Tokio support long paths, but the atomic Win32 rename needs the
+        // verbatim prefix returned by canonicalize for our nested CAS paths.
+        let path = tokio::fs::canonicalize(self.root.join("plans"))
+            .await?
+            .join(format!("{}.json", proposed.pack_sha256));
+        let mut selected = proposed.clone();
+        if let Some(size) = Self::regular_file_size(&path).await? {
+            if size > 1024 * 1024 {
+                return Err(AppError::InvalidData("oversized frozen pack plan".into()));
+            }
+            let saved: Saved = serde_json::from_slice(&tokio::fs::read(&path).await?)?;
+            if saved.schema_version != 1
+                || saved.manifest_sha256 != manifest.manifest_sha256
+                || saved.plan.pack_sha256 != proposed.pack_sha256
+            {
+                return Err(AppError::InvalidData(
+                    "frozen pack plan identity mismatch".into(),
+                ));
+            }
+            validate_fetch_plan(manifest, &saved.plan)?;
+            selected.mode = saved.plan.mode;
+            // A later repair can need additional chunks. Preserve complete old
+            // ranges and append only missing chunk spans; never rewrite them.
+            if validate_fetch_plan(manifest, &selected).is_err() {
+                if let PackTransferMode::Ranges(ranges) = &mut selected.mode {
+                    for raw in &selected.required_chunks {
+                        let c = &manifest.chunks[raw];
+                        if !ranges
+                            .iter()
+                            .any(|r| r.contains(c.offset, c.compressed_size))
+                        {
+                            ranges.push(ByteRange {
+                                start: c.offset,
+                                end_inclusive: c.offset + c.compressed_size - 1,
+                            });
+                        }
+                    }
+                    ranges.sort_by_key(|r| r.start);
+                }
+            }
+        } else if Self::regular_file_size(&self.full_partial_path(&selected.pack_sha256)?)
+            .await?
+            .is_some()
+            || Self::regular_file_size(&self.full_path(&selected.pack_sha256)?)
+                .await?
+                .is_some()
+        {
+            selected.mode = PackTransferMode::Full;
+        } else {
+            let legacy = legacy_plan_pack_fetches(manifest, &selected.required_chunks)?.remove(0);
+            if let PackTransferMode::Ranges(ranges) = &legacy.mode {
+                for range in ranges {
+                    if Self::regular_file_size(
+                        &self.range_partial_path(&selected.pack_sha256, *range)?,
+                    )
+                    .await?
+                    .is_some()
+                        || Self::regular_file_size(&self.range_path(&selected.pack_sha256, *range)?)
+                            .await?
+                            .is_some()
+                    {
+                        selected.mode = legacy.mode.clone();
+                        break;
+                    }
+                }
+            }
+        }
+        validate_fetch_plan(manifest, &selected)?;
+        super::content_journal_service::atomic_json(
+            &path,
+            &Saved {
+                schema_version: 1,
+                manifest_sha256: manifest.manifest_sha256.clone(),
+                plan: selected.clone(),
+            },
+        )
+        .await?;
+        Ok(selected)
     }
 
     pub async fn has_resume_data(&self) -> Result<bool, AppError> {

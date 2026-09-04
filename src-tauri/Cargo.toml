@@ -20,6 +20,7 @@ portable = []
 e2e = ["dep:tauri-plugin-wdio", "dep:tauri-plugin-wdio-webdriver"]
 
 [dependencies]
+content-pack-core = { path = "crates/content-pack-core" }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-log = "2"
@@ -74,6 +75,9 @@ minisign-verify = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+h2 = "0.4"
+http = "1"
+bytes = "1"
 
 # Generated Win32 bindings can exhaust the pagefile when LLVM optimizes their
 # full release surface at level 3. They are thin FFI wrappers, so a smaller
@@ -88,4 +92,12 @@ codegen-units = 64
 # compression and HTTP work stays release-optimized in dependencies.
 [profile.release.package.zhekarikstrike_launcher]
 opt-level = 0
+codegen-units = 16
+
+[workspace]
+members = ["crates/content-pack-core"]
+resolver = "2"
+
+[profile.release.package.content-pack-core]
+opt-level = 3
 codegen-units = 16

@@ -30,6 +30,7 @@ impl ApiClient {
             .build()?;
 
         let direct_http = Client::builder()
+            .http2_adaptive_window(true)
             .connect_timeout(Duration::from_secs(15))
             .pool_idle_timeout(Duration::from_secs(90))
             .redirect(reqwest::redirect::Policy::none())

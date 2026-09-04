@@ -208,7 +208,8 @@ async fn drive_pack_planning_cache_spans_and_integrity_matrix() {
         .flat_map(|file| file.chunks.iter().cloned())
         .collect::<Vec<_>>();
     let sparse = plan_pack_fetches(&manifest, &raw[..1]).unwrap();
-    assert!(matches!(sparse[0].mode, PackTransferMode::Ranges(_)));
+    // For a 100-byte pack, saving 90 bytes cannot pay for request latency.
+    assert!(matches!(sparse[0].mode, PackTransferMode::Full));
     let dense = plan_pack_fetches(&manifest, &raw).unwrap();
     assert!(matches!(dense[0].mode, PackTransferMode::Full));
 
@@ -238,6 +239,76 @@ async fn drive_pack_planning_cache_spans_and_integrity_matrix() {
     .await
     .unwrap();
     assert_eq!(decoded, b"packed data");
+}
+
+#[tokio::test]
+async fn drive_pack_frozen_plans_validate_identity_closure_and_adopt_legacy() {
+    use crate::services::content_pack_cache_service::PackCache;
+    use crate::services::content_pack_plan_service::{validate_fetch_plan, PackFetchPlan};
+    let manifest = two_chunk_manifest();
+    let required = manifest
+        .files
+        .iter()
+        .flat_map(|f| f.chunks.clone())
+        .collect::<Vec<_>>();
+    let dir = tempfile::tempdir().unwrap();
+    let cache = PackCache::new(dir.path(), &manifest.content_sha256, "freeze")
+        .await
+        .unwrap();
+    let sha = manifest.packs.keys().next().unwrap().clone();
+    let legacy = ByteRange {
+        start: 0,
+        end_inclusive: 9,
+    };
+    tokio::fs::write(cache.range_partial_path(&sha, legacy).unwrap(), [1; 5])
+        .await
+        .unwrap();
+    let proposed = plan_pack_fetches(&manifest, &required[..1])
+        .unwrap()
+        .remove(0);
+    let frozen = cache.freeze_plan(&manifest, proposed).await.unwrap();
+    assert_eq!(frozen.mode, PackTransferMode::Ranges(vec![legacy]));
+    let same = cache
+        .freeze_plan(
+            &manifest,
+            PackFetchPlan {
+                mode: PackTransferMode::Full,
+                ..frozen.clone()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(same, frozen);
+    let extended = cache
+        .freeze_plan(
+            &manifest,
+            PackFetchPlan {
+                pack_sha256: sha.clone(),
+                mode: PackTransferMode::Full,
+                required_chunks: required.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    validate_fetch_plan(&manifest, &extended).unwrap();
+    assert!(
+        matches!(extended.mode,PackTransferMode::Ranges(ref ranges) if ranges[0]==legacy && ranges.len()==2)
+    );
+    assert_eq!(
+        tokio::fs::read(cache.range_partial_path(&sha, legacy).unwrap())
+            .await
+            .unwrap(),
+        vec![1; 5]
+    );
+    let mut mismatched = manifest.clone();
+    mismatched.manifest_sha256 = "f".repeat(64);
+    assert!(cache.freeze_plan(&mismatched, extended).await.is_err());
+    let bad = PackFetchPlan {
+        pack_sha256: sha,
+        mode: PackTransferMode::Ranges(vec![]),
+        required_chunks: required,
+    };
+    assert!(validate_fetch_plan(&manifest, &bad).is_err());
 }
 
 #[test]

@@ -7,13 +7,13 @@ const FULL_PACK_THRESHOLD_PERCENT: u64 = 25;
 const RANGE_COALESCE_GAP: u64 = 64 * 1024;
 const RANGE_MAX_SIZE: u64 = 16 * 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PackTransferMode {
     Full,
     Ranges(Vec<ByteRange>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ByteRange {
     pub start: u64,
     pub end_inclusive: u64,
@@ -21,10 +21,12 @@ pub struct ByteRange {
 
 impl ByteRange {
     pub fn len(self) -> Result<u64, AppError> {
-        self.end_inclusive
-            .checked_sub(self.start)
-            .and_then(|length| length.checked_add(1))
-            .ok_or_else(|| AppError::InvalidData("invalid inclusive pack range".into()))
+        content_pack_core::planner::ByteRange {
+            start: self.start,
+            end_inclusive: self.end_inclusive,
+        }
+        .len()
+        .map_err(Into::into)
     }
 
     pub fn contains(self, start: u64, size: u64) -> bool {
@@ -34,7 +36,7 @@ impl ByteRange {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PackFetchPlan {
     pub pack_sha256: String,
     pub mode: PackTransferMode,
@@ -42,6 +44,18 @@ pub struct PackFetchPlan {
 }
 
 pub fn plan_pack_fetches(
+    manifest: &DrivePackManifest,
+    required_raw_chunks_in_first_use_order: &[String],
+) -> Result<Vec<PackFetchPlan>, AppError> {
+    let plans = legacy_plan_pack_fetches(manifest, required_raw_chunks_in_first_use_order)?;
+    plans
+        .into_iter()
+        .map(|plan| measured_plan(manifest, plan, Default::default()))
+        .collect()
+}
+
+/// Kept only for adopting an already-written cache from older launchers.
+pub(crate) fn legacy_plan_pack_fetches(
     manifest: &DrivePackManifest,
     required_raw_chunks_in_first_use_order: &[String],
 ) -> Result<Vec<PackFetchPlan>, AppError> {
@@ -93,6 +107,76 @@ pub fn plan_pack_fetches(
             })
         })
         .collect()
+}
+
+pub(crate) fn required_spans(
+    manifest: &DrivePackManifest,
+    plan: &PackFetchPlan,
+) -> Result<Vec<content_pack_core::planner::ByteRange>, AppError> {
+    plan.required_chunks
+        .iter()
+        .map(|raw| {
+            let c = manifest
+                .chunks
+                .get(raw)
+                .filter(|c| c.pack_sha256 == plan.pack_sha256)
+                .ok_or_else(|| AppError::InvalidData("unknown chunk in saved pack plan".into()))?;
+            Ok(content_pack_core::planner::ByteRange {
+                start: c.offset,
+                end_inclusive: c
+                    .offset
+                    .checked_add(c.compressed_size)
+                    .and_then(|n| n.checked_sub(1))
+                    .ok_or_else(|| AppError::InvalidData("pack span overflow".into()))?,
+            })
+        })
+        .collect()
+}
+pub(crate) fn measured_plan(
+    manifest: &DrivePackManifest,
+    mut plan: PackFetchPlan,
+    estimate: content_pack_core::planner::CostEstimate,
+) -> Result<PackFetchPlan, AppError> {
+    let mode = content_pack_core::planner::choose_plan(
+        manifest.packs[&plan.pack_sha256].size,
+        &required_spans(manifest, &plan)?,
+        estimate,
+    )?;
+    plan.mode = match mode {
+        content_pack_core::planner::TransferMode::Full => PackTransferMode::Full,
+        content_pack_core::planner::TransferMode::Ranges(ranges) => PackTransferMode::Ranges(
+            ranges
+                .into_iter()
+                .map(|r| ByteRange {
+                    start: r.start,
+                    end_inclusive: r.end_inclusive,
+                })
+                .collect(),
+        ),
+    };
+    Ok(plan)
+}
+pub(crate) fn validate_fetch_plan(
+    manifest: &DrivePackManifest,
+    plan: &PackFetchPlan,
+) -> Result<(), AppError> {
+    let pack = manifest
+        .packs
+        .get(&plan.pack_sha256)
+        .ok_or_else(|| AppError::InvalidData("unknown frozen pack".into()))?;
+    let mode = match &plan.mode {
+        PackTransferMode::Full => content_pack_core::planner::TransferMode::Full,
+        PackTransferMode::Ranges(r) => content_pack_core::planner::TransferMode::Ranges(
+            r.iter()
+                .map(|s| content_pack_core::planner::ByteRange {
+                    start: s.start,
+                    end_inclusive: s.end_inclusive,
+                })
+                .collect(),
+        ),
+    };
+    content_pack_core::planner::validate_plan(&mode, pack.size, &required_spans(manifest, plan)?)?;
+    Ok(())
 }
 
 fn coalesced_ranges(

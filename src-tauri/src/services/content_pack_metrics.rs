@@ -86,9 +86,40 @@ pub(crate) struct Snapshot {
     pub download_finished_sec: Option<f64>,
     pub materialization_finished_sec: Option<f64>,
     pub finished: Option<String>,
+    pub http_protocols: std::collections::BTreeMap<String, u64>,
+    pub request_count: u64,
+    pub header_wait_sec: f64,
+    pub body_receive_sec: f64,
+    pub buffer_wait_sec: f64,
+    pub local_write_sec: f64,
+    pub prefetch_requests: u64,
+    pub prefetch_bytes: u64,
+    pub prefetch_peak_buffer_bytes: u64,
 }
 
 impl PackMetrics {
+    pub fn response_headers(&self, protocol: &str, seconds: f64, prefetch: bool) {
+        let mut s = self.0.state.lock().expect("metrics");
+        *s.http_protocols.entry(protocol.to_owned()).or_default() += 1;
+        s.header_wait_sec += seconds;
+        let _ = prefetch;
+    }
+    pub fn request_started(&self, prefetch: bool) {
+        let mut s = self.0.state.lock().expect("metrics");
+        s.request_count += 1;
+        s.prefetch_requests += u64::from(prefetch);
+    }
+    pub fn transport_time(&self, body: f64, buffer: f64, write: f64) {
+        let mut s = self.0.state.lock().expect("metrics");
+        s.body_receive_sec += body;
+        s.buffer_wait_sec += buffer;
+        s.local_write_sec += write;
+    }
+    pub fn prefetched(&self, bytes: u64, buffered: u64) {
+        let mut s = self.0.state.lock().expect("metrics");
+        s.prefetch_bytes += bytes;
+        s.prefetch_peak_buffer_bytes = s.prefetch_peak_buffer_bytes.max(buffered);
+    }
     pub fn new(operation: &str) -> Self {
         Self(Arc::new(Inner {
             started: Instant::now(),
@@ -299,6 +330,8 @@ impl Drop for ActivityGuard {
 pub(crate) struct PackRunOptions {
     pub metrics: PackMetrics,
     pub traffic: Arc<super::content_pack_stream::UniqueTraffic>,
+    pub http_slots: Arc<tokio::sync::Semaphore>,
+    pub calibration: Arc<Mutex<content_pack_core::planner::RequestCalibration>>,
     #[cfg(test)]
     pub profile: PackProfile,
     #[cfg(test)]
@@ -325,6 +358,8 @@ impl PackRunOptions {
         Self {
             metrics: PackMetrics::new(operation),
             traffic: Arc::new(super::content_pack_stream::UniqueTraffic::default()),
+            http_slots: Arc::new(tokio::sync::Semaphore::new(6)),
+            calibration: Arc::new(Mutex::new(Default::default())),
             #[cfg(test)]
             profile: PackProfile::Optimized,
             #[cfg(test)]

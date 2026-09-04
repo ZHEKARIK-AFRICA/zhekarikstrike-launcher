@@ -486,6 +486,9 @@ async fn dispatch_pack_events(
         };
         let Some(event) = event else { return Ok(()) };
         match event {
+            PackDownloadEvent::Forecast { previous, next } => {
+                progress.revise_download(previous, next)?
+            }
             PackDownloadEvent::UsefulBytes { pack_sha256, bytes } => {
                 crate::models::validate_sha256(&pack_sha256, "pack progress")?;
                 progress.add_downloaded(bytes)?;
@@ -692,7 +695,7 @@ async fn materialize_packed_file(
         .create_new(true)
         .open(&target)
         .await?;
-    let mut hasher = Sha256::new();
+    let mut hasher = content_pack_core::integrity::StreamSha::new();
     let mut written = 0_u64;
     let mut waited = Duration::ZERO;
     for raw_sha in &file.chunks {
@@ -767,7 +770,7 @@ async fn materialize_packed_file(
     }
     output.flush().await?;
     output.sync_all().await?;
-    if written != file.size || hex::encode(hasher.finalize()) != file.sha256 {
+    if written != file.size || hasher.finish() != file.sha256 {
         return Err(AppError::InvalidData(format!(
             "materialized packed content file failed verification: {}",
             file.path

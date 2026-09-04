@@ -202,6 +202,7 @@ pub enum IntegrityMode {
 
 struct PipelineProgressState {
     started: Instant,
+    download_total: u64,
     downloaded: u64,
     materialized: u64,
     last_progress: f64,
@@ -210,7 +211,6 @@ struct PipelineProgressState {
 #[derive(Clone)]
 pub(crate) struct PipelineProgress {
     emitter: ProgressEmitter,
-    download_total: u64,
     materialize_total: u64,
     status_message: Option<String>,
     state: Arc<Mutex<PipelineProgressState>>,
@@ -224,11 +224,11 @@ impl PipelineProgress {
     ) -> Self {
         Self {
             emitter,
-            download_total,
             materialize_total,
             status_message: None,
             state: Arc::new(Mutex::new(PipelineProgressState {
                 started: Instant::now(),
+                download_total,
                 downloaded: 0,
                 materialized: 0,
                 last_progress: 0.0,
@@ -250,6 +250,16 @@ impl PipelineProgress {
         self.emit_locked(&mut state, None)
     }
 
+    pub(crate) fn revise_download(&self, previous: u64, next: u64) -> Result<(), AppError> {
+        let mut state = self.state.lock().expect("content progress mutex");
+        state.download_total = state
+            .download_total
+            .checked_sub(previous)
+            .and_then(|n| n.checked_add(next))
+            .ok_or_else(|| AppError::InvalidData("download forecast overflow".into()))?;
+        self.emit_locked(&mut state, None)
+    }
+
     pub(crate) fn add_materialized(&self, bytes: u64, current_file: &str) -> Result<(), AppError> {
         let mut state = self
             .state
@@ -264,7 +274,7 @@ impl PipelineProgress {
         state: &mut PipelineProgressState,
         current_file: Option<String>,
     ) -> Result<(), AppError> {
-        let work_total = self
+        let work_total = state
             .download_total
             .saturating_add(self.materialize_total)
             .max(1);
@@ -275,7 +285,7 @@ impl PipelineProgress {
         let network_speed = state.downloaded as f64 / elapsed;
         let materialize_speed = state.materialized as f64 / elapsed;
         let network_eta = if network_speed > 0.0 {
-            self.download_total.saturating_sub(state.downloaded) as f64 / network_speed
+            state.download_total.saturating_sub(state.downloaded) as f64 / network_speed
         } else {
             0.0
         };
@@ -291,7 +301,7 @@ impl PipelineProgress {
         payload.progress = Some(state.last_progress);
         payload.current_file = current_file;
         payload.downloaded_bytes = Some(state.downloaded);
-        payload.total_bytes = Some(self.download_total);
+        payload.total_bytes = Some(state.download_total);
         payload.speed_bytes_per_sec = Some(network_speed);
         payload.time_remaining_sec = Some(network_eta.max(materialize_eta));
         payload.message = self.status_message.clone();
