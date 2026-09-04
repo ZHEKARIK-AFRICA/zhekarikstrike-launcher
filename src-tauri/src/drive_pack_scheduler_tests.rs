@@ -175,7 +175,7 @@ impl Peer {
                             let header = format!("HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{}\r\nConnection: close\r\n\r\n", end-start+1, body.len());
                             if socket.write_all(header.as_bytes()).await.is_err() { return; }
                             let split=if start>0 && first_only.load(SeqCst) {end+1} else {(pause.load(SeqCst) as usize).clamp(start,end+1)};
-                            if split>start { if tokio::select! { _=stop.cancelled()=>return, result=socket.write_all(&body[start..split])=>result }.is_err(){return;} }
+                            if split>start && tokio::select! { _=stop.cancelled()=>return, result=socket.write_all(&body[start..split])=>result }.is_err(){return;}
                             if split<=end {
                                 let permit=tokio::select!{_=stop.cancelled()=>return,p=body_permits.acquire()=>p.unwrap()};permit.forget();
                                 let _=tokio::select!{_=stop.cancelled()=>return,result=socket.write_all(&body[split..=end])=>result};

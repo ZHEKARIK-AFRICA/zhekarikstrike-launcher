@@ -7,6 +7,9 @@ pub struct ByteRange {
     pub end_inclusive: u64,
 }
 impl ByteRange {
+    pub fn is_empty(self) -> bool {
+        self.start > self.end_inclusive
+    }
     pub fn len(self) -> Result<u64, CoreError> {
         self.end_inclusive
             .checked_sub(self.start)
@@ -76,7 +79,7 @@ impl RequestCalibration {
         fn median(mut values: Vec<f64>) -> f64 {
             values.sort_by(f64::total_cmp);
             let n = values.len();
-            if n % 2 == 0 {
+            if n.is_multiple_of(2) {
                 (values[n / 2 - 1] + values[n / 2]) / 2.
             } else {
                 values[n / 2]

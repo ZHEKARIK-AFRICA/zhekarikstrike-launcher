@@ -95,6 +95,7 @@ pub struct CommitContext {
     pub committed: mpsc::Sender<u64>,
 }
 
+#[cfg(test)]
 pub async fn run_streaming_commit(
     context: CommitContext,
     artifacts: mpsc::Receiver<VerifiedArtifact>,

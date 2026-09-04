@@ -467,6 +467,8 @@ async fn run_packed_pipeline(
     state.ok_or_else(|| AppError::Unknown("streaming commit produced no state".into()))
 }
 
+// Keep independent channel/state ownership explicit at this task boundary.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_pack_events(
     mut events: mpsc::Receiver<PackDownloadEvent>,
     manifest: Arc<DrivePackManifest>,
@@ -1003,6 +1005,7 @@ pub(crate) async fn run_packed_probe(
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)] // Test-only injection of the real pipeline inputs.
 pub(crate) async fn run_packed_probe_scenario(
     api: &ApiClient,
     manifest: Arc<DrivePackManifest>,

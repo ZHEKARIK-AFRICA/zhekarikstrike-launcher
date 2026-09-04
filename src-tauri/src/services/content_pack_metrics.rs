@@ -394,7 +394,7 @@ impl PackRunOptions {
     pub fn interval(&self) -> Duration {
         #[cfg(test)]
         {
-            return self.tick_interval;
+            self.tick_interval
         }
         #[cfg(not(test))]
         {

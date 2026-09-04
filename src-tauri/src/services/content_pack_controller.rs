@@ -1,5 +1,6 @@
 #[cfg(test)]
 use std::collections::{BTreeMap, VecDeque};
+#[cfg(test)]
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
@@ -13,9 +14,10 @@ const COOLDOWN: Duration = Duration::from_secs(20);
 #[cfg(test)]
 const PRESSURE_WINDOW: Duration = Duration::from_secs(30);
 
+#[cfg(test)]
+pub use content_pack_core::controller::{AdaptivePreemption, ControllerDecision, ControllerReason};
 pub use content_pack_core::controller::{
-    AdaptivePreemption, AttemptProgress, ControllerDecision, ControllerReason, ControllerSample,
-    PackSource, PressureWindow,
+    AttemptProgress, ControllerSample, PackSource, PressureWindow,
 };
 
 #[derive(Debug, Clone)]

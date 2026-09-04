@@ -218,6 +218,7 @@ pub struct QueueDecision {
     pub limit_bytes: u64,
     pub seconds: Option<f64>,
 }
+#[derive(Default)]
 pub struct WorkQueueController {
     sample: (u64, f64),
     rate: Option<f64>,
