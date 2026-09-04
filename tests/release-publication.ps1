@@ -127,6 +127,18 @@ if (-not $downgradeRejected) {
 }
 
 $releaseSource = Get-Content -LiteralPath "$PSScriptRoot\..\scripts\release.ps1" -Raw
+foreach ($workspaceGate in @(
+    "@('fmt', '--manifest-path', 'src-tauri/Cargo.toml', '--all', '--', '--check')",
+    "@('clippy', '--manifest-path', 'src-tauri/Cargo.toml', '--workspace', '--all-targets', '--', '-D', 'warnings')",
+    "@('test', '--manifest-path', 'src-tauri/Cargo.toml', '--workspace')"
+)) {
+    if (-not $releaseSource.Contains($workspaceGate)) {
+        throw "Release gate must include content-pack-core: $workspaceGate"
+    }
+}
+if ($releaseSource -match "Invoke-Native\s+\`$cargo\s+@\('clean'") {
+    throw 'Release gate must preserve healthy Cargo caches.'
+}
 if ($releaseSource -match '(?i)--clobber') {
     throw 'Published launcher assets must never be overwritten with --clobber'
 }
