@@ -35,7 +35,7 @@ fn fixture() -> (Arc<DrivePackManifest>, Bodies) {
     let mut bodies = BTreeMap::new();
     let mut raw = vec![0_u8; 8 * MIB as usize];
     let mut seed = 0x647fa732db98765_u64;
-    for bytes in raw.chunks_exact_mut(8) {
+    for bytes in raw.as_chunks_mut::<8>().0 {
         seed ^= seed << 13;
         seed ^= seed >> 7;
         seed ^= seed << 17;
@@ -232,7 +232,7 @@ fn pipeline_fixture() -> (Arc<DrivePackManifest>, Bodies, u64) {
     for i in 0..3 {
         let mut seed = 72361579123_u64 + i;
         let mut raw = vec![0u8; 8 * MIB as usize];
-        for block in raw.chunks_exact_mut(8) {
+        for block in raw.as_chunks_mut::<8>().0 {
             seed ^= seed << 13;
             seed ^= seed >> 7;
             seed ^= seed << 17;
