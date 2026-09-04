@@ -6651,7 +6651,7 @@ dependencies = [
 
 [[package]]
 name = "zhekarikstrike_launcher"
-version = "1.6.17"
+version = "1.6.18"
 dependencies = [
  "anyhow",
  "bytes",
