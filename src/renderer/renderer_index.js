@@ -295,6 +295,7 @@ checkFilesButton?.addEventListener('click', async () => {
 function statusKeyForProgress(payload) {
     const current = status.getState();
     if (payload.stage === 'complete') return current.statusKey;
+    if (payload.message === 'resume') return 'status.resuming_install';
     const repairing = ['install', 'download', 'update', 'copy', 'extract'].includes(payload.stage);
     if (current.flow === 'manual-verify') {
         return repairing ? 'status.repairing_files' : 'status.verifying_files';

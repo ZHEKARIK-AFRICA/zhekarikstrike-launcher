@@ -41,6 +41,7 @@
         "recovery_failed": "failed to recover game files safely",
         "install_idle": "waiting...",
         "installing": "installing game...",
+        "resuming_install": "resuming interrupted installation...",
         "prerequisite_detecting": "detecting required components...",
         "prerequisite_downloading": "downloading prerequisite component...",
         "prerequisite_verifying": "verifying prerequisite component...",

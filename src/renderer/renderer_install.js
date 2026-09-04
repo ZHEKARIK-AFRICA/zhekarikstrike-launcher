@@ -161,6 +161,7 @@ async function restoreCurrentOperation(operation, prerequisite) {
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
+    document.body.classList.add('fade-in');
     try {
         await waitForE2eReady();
         await initializeLanguage();
@@ -181,7 +182,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
         initialized = true;
         if (!restored) status.setIdle('status.install_idle');
-        document.body.classList.add('fade-in');
     } catch (error) {
         startupFailed = true;
         status.fail(status.getState().flow === 'recovery'
@@ -275,7 +275,9 @@ chooseFolderButton?.addEventListener('click', async () => {
 });
 
 void listenUntilPageHide('install-progress', ({ payload }) => {
-    const progressStatus = payload.stage === 'checking'
+    const progressStatus = payload.message === 'resume'
+        ? 'status.resuming_install'
+        : payload.stage === 'checking'
         ? 'status.verifying_files'
         : 'status.installing';
     status.applyProgress(payload, progressStatus);

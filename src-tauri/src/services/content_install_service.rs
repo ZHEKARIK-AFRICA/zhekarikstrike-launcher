@@ -1,3 +1,5 @@
+#![allow(dead_code)] // Legacy v2 pipeline remains readable while v3 reuses its verified helpers.
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -112,7 +114,7 @@ impl AdaptiveDownloadController {
 }
 
 #[derive(Debug)]
-struct AdaptiveMaterializerController {
+pub(crate) struct AdaptiveMaterializerController {
     current: usize,
     max: usize,
     trial_baseline: Option<f64>,
@@ -120,7 +122,7 @@ struct AdaptiveMaterializerController {
 }
 
 impl AdaptiveMaterializerController {
-    fn new(initial: usize, max: usize) -> Self {
+    pub(crate) fn new(initial: usize, max: usize) -> Self {
         Self {
             current: initial.clamp(1, max.max(1)),
             max: max.max(1),
@@ -129,7 +131,11 @@ impl AdaptiveMaterializerController {
         }
     }
 
-    fn observe(
+    pub(crate) fn current(&self) -> usize {
+        self.current
+    }
+
+    pub(crate) fn observe(
         &mut self,
         throughput: f64,
         cpu_percent: f32,
@@ -176,41 +182,53 @@ pub(crate) fn materializer_worker_limits(
 }
 
 #[derive(Clone)]
-struct LocalChunkSource {
-    path: PathBuf,
-    offset: u64,
+pub(crate) struct LocalChunkSource {
+    pub(crate) path: PathBuf,
+    pub(crate) offset: u64,
 }
 
 #[derive(Clone)]
-struct PreparedFile {
-    file: ContentFile,
-    had_original: bool,
-    original_size: u64,
+pub(crate) struct PreparedFile {
+    pub(crate) file: ContentFile,
+    pub(crate) had_original: bool,
+    pub(crate) original_size: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegrityMode {
+    FastUpdate,
+    FullIntegrity,
 }
 
 struct PipelineProgressState {
     started: Instant,
+    download_total: u64,
     downloaded: u64,
     materialized: u64,
     last_progress: f64,
 }
 
 #[derive(Clone)]
-struct PipelineProgress {
+pub(crate) struct PipelineProgress {
     emitter: ProgressEmitter,
-    download_total: u64,
     materialize_total: u64,
+    status_message: Option<String>,
     state: Arc<Mutex<PipelineProgressState>>,
 }
 
 impl PipelineProgress {
-    fn new(emitter: ProgressEmitter, download_total: u64, materialize_total: u64) -> Self {
+    pub(crate) fn new(
+        emitter: ProgressEmitter,
+        download_total: u64,
+        materialize_total: u64,
+    ) -> Self {
         Self {
             emitter,
-            download_total,
             materialize_total,
+            status_message: None,
             state: Arc::new(Mutex::new(PipelineProgressState {
                 started: Instant::now(),
+                download_total,
                 downloaded: 0,
                 materialized: 0,
                 last_progress: 0.0,
@@ -218,7 +236,12 @@ impl PipelineProgress {
         }
     }
 
-    fn add_downloaded(&self, bytes: u64) -> Result<(), AppError> {
+    pub(crate) fn with_status_message(mut self, message: Option<String>) -> Self {
+        self.status_message = message;
+        self
+    }
+
+    pub(crate) fn add_downloaded(&self, bytes: u64) -> Result<(), AppError> {
         let mut state = self
             .state
             .lock()
@@ -227,7 +250,17 @@ impl PipelineProgress {
         self.emit_locked(&mut state, None)
     }
 
-    fn add_materialized(&self, bytes: u64, current_file: &str) -> Result<(), AppError> {
+    pub(crate) fn revise_download(&self, previous: u64, next: u64) -> Result<(), AppError> {
+        let mut state = self.state.lock().expect("content progress mutex");
+        state.download_total = state
+            .download_total
+            .checked_sub(previous)
+            .and_then(|n| n.checked_add(next))
+            .ok_or_else(|| AppError::InvalidData("download forecast overflow".into()))?;
+        self.emit_locked(&mut state, None)
+    }
+
+    pub(crate) fn add_materialized(&self, bytes: u64, current_file: &str) -> Result<(), AppError> {
         let mut state = self
             .state
             .lock()
@@ -241,7 +274,7 @@ impl PipelineProgress {
         state: &mut PipelineProgressState,
         current_file: Option<String>,
     ) -> Result<(), AppError> {
-        let work_total = self
+        let work_total = state
             .download_total
             .saturating_add(self.materialize_total)
             .max(1);
@@ -252,7 +285,7 @@ impl PipelineProgress {
         let network_speed = state.downloaded as f64 / elapsed;
         let materialize_speed = state.materialized as f64 / elapsed;
         let network_eta = if network_speed > 0.0 {
-            self.download_total.saturating_sub(state.downloaded) as f64 / network_speed
+            state.download_total.saturating_sub(state.downloaded) as f64 / network_speed
         } else {
             0.0
         };
@@ -268,9 +301,10 @@ impl PipelineProgress {
         payload.progress = Some(state.last_progress);
         payload.current_file = current_file;
         payload.downloaded_bytes = Some(state.downloaded);
-        payload.total_bytes = Some(self.download_total);
+        payload.total_bytes = Some(state.download_total);
         payload.speed_bytes_per_sec = Some(network_speed);
         payload.time_remaining_sec = Some(network_eta.max(materialize_eta));
+        payload.message = self.status_message.clone();
         self.emitter.emit(payload)
     }
 }
@@ -387,6 +421,7 @@ pub async fn install_or_update_content(
         &game_path,
         &manifest,
         previous.as_ref(),
+        IntegrityMode::FastUpdate,
         &progress,
         &cancel,
     )
@@ -592,11 +627,30 @@ pub(crate) async fn cleanup_failed_materialization_with_hooks(
     operation_error
 }
 
-async fn load_previous_manifest(game_path: &Path) -> Result<Option<ContentManifest>, AppError> {
+pub(crate) async fn load_previous_manifest(
+    game_path: &Path,
+) -> Result<Option<ContentManifest>, AppError> {
     let state = match load_completion_state(game_path).await {
         Ok(Some(state)) if state.schema_version == 1 => state,
         Ok(_) | Err(_) => return Ok(None),
     };
+    match crate::services::content_inventory_service::migrate_persisted_v2_manifest(
+        game_path,
+        &state.content_sha256,
+        &state.release_id,
+    )
+    .await
+    {
+        Ok(Some(inventory)) => {
+            if inventory.game_version == state.game_version {
+                return Ok(Some(inventory.as_v2_manifest()));
+            }
+            return Ok(None);
+        }
+        Ok(None) => {}
+        // A corrupt or untrusted ownership record must never authorize deletion.
+        Err(_) => return Ok(None),
+    }
     let manifest = match load_persisted_content_manifest_with_hooks(
         game_path,
         &state.content_sha256,
@@ -674,7 +728,7 @@ fn validate_content_transition(
     Ok(())
 }
 
-async fn plan_obsolete_content_entries(
+pub(crate) async fn plan_obsolete_content_entries(
     game_path: &Path,
     previous: Option<&ContentManifest>,
     manifest: &ContentManifest,
@@ -710,7 +764,7 @@ async fn plan_obsolete_content_entries(
     Ok(entries)
 }
 
-async fn obsolete_existing_backup_bytes(
+pub(crate) async fn obsolete_existing_backup_bytes(
     _game_path: &Path,
     entries: &[ContentJournalEntry],
 ) -> Result<u64, AppError> {
@@ -728,7 +782,7 @@ async fn obsolete_existing_backup_bytes(
     Ok(total)
 }
 
-async fn replacement_journal_entries(
+pub(crate) async fn replacement_journal_entries(
     game_path: &Path,
     prepared: &[PreparedFile],
     hooks: &dyn ContentFsHooks,
@@ -760,10 +814,11 @@ async fn replacement_journal_entries(
     Ok(entries)
 }
 
-async fn files_requiring_materialization(
+pub(crate) async fn files_requiring_materialization(
     game_path: &Path,
     manifest: &ContentManifest,
     previous: Option<&ContentManifest>,
+    integrity_mode: IntegrityMode,
     progress: &ProgressEmitter,
     cancel: &CancellationToken,
 ) -> Result<Vec<PreparedFile>, AppError> {
@@ -815,7 +870,11 @@ async fn files_requiring_materialization(
         let known_unchanged = previous_files
             .get(&file.path.to_ascii_lowercase())
             .is_some_and(|old| old.size == file.size && old.sha256 == file.sha256);
-        if had_original && original_size == file.size && known_unchanged {
+        if integrity_mode == IntegrityMode::FastUpdate
+            && had_original
+            && original_size == file.size
+            && known_unchanged
+        {
             dispositions.push(Disposition::Ready);
             continue;
         }
@@ -886,7 +945,7 @@ fn emit_content_check_progress(
     progress.emit(payload)
 }
 
-fn local_chunk_candidates(
+pub(crate) fn local_chunk_candidates(
     game_path: &Path,
     manifest: &ContentManifest,
     previous: Option<&ContentManifest>,
@@ -1004,7 +1063,7 @@ async fn run_content_pipeline(
     }
 }
 
-fn ordered_missing_chunks(
+pub(crate) fn ordered_missing_chunks(
     prepared: &[PreparedFile],
     manifest: &ContentManifest,
     available: &HashSet<String>,

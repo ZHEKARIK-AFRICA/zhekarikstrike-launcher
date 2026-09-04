@@ -14,6 +14,7 @@ vi.mock('@tauri-apps/api/event', () => ({ listen }));
 vi.mock('../../src/renderer/navigation.js', () => ({ navigateToPage }));
 
 function renderInstallPage() {
+    document.body.className = '';
     document.body.innerHTML = `
         <main class="launcher-container">
             <button id="start-install"></button>
@@ -57,6 +58,29 @@ describe('install prerequisite flow', () => {
             if (command === 'recover_pending_install') return { recovered: false };
             return null;
         });
+    });
+
+    it('shows the recovery status while interrupted content recovery is still running', async () => {
+        let finishRecovery;
+        const pendingRecovery = new Promise((resolve) => { finishRecovery = resolve; });
+        invoke.mockImplementation(async (command) => {
+            if (command === 'get_language') return 'en';
+            if (command === 'get_current_state') return { operation: 'idle' };
+            if (command === 'get_prerequisite_state') return { active: false, outcome: 'none' };
+            if (command === 'recover_pending_install') return pendingRecovery;
+            return null;
+        });
+
+        await loadRenderer();
+        await vi.waitFor(() => expect(invoke).toHaveBeenCalledWith(
+            'recover_pending_install', expect.objectContaining({ operationId: expect.any(String) })
+        ));
+
+        expect(document.body.classList.contains('fade-in')).toBe(true);
+        expect(document.getElementById('install-status').textContent)
+            .toBe('recovering an interrupted installation...');
+        finishRecovery({ recovered: false });
+        await vi.waitFor(() => expect(invoke).toHaveBeenCalledWith('get_game_path'));
     });
 
     it('shows exact prerequisite failure and routes installed content to main', async () => {

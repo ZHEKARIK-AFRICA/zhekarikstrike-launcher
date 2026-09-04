@@ -1,4 +1,5 @@
-use std::io::Read;
+#![allow(dead_code)] // Loose v2 transport is retained only for recovery/downgrade compatibility.
+
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -96,32 +97,14 @@ pub fn decode_verified_chunk(
     expected_raw_sha256: &str,
     chunk: &ContentChunk,
 ) -> Result<Vec<u8>, AppError> {
-    if compressed.len() as u64 != chunk.compressed_size
-        || hex::encode(Sha256::digest(compressed)) != chunk.compressed_sha256
-    {
-        return Err(AppError::InvalidData(
-            "compressed content chunk failed verification".into(),
-        ));
-    }
-    let decoder = zstd::stream::read::Decoder::new(compressed)
-        .map_err(|error| AppError::InvalidData(format!("invalid zstd chunk: {error}")))?;
-    let limit = chunk
-        .uncompressed_size
-        .checked_add(1)
-        .ok_or_else(|| AppError::InvalidData("content chunk size overflow".into()))?;
-    let mut raw = Vec::with_capacity(chunk.uncompressed_size as usize);
-    decoder
-        .take(limit)
-        .read_to_end(&mut raw)
-        .map_err(|error| AppError::InvalidData(format!("invalid zstd chunk: {error}")))?;
-    if raw.len() as u64 != chunk.uncompressed_size
-        || hex::encode(Sha256::digest(&raw)) != expected_raw_sha256
-    {
-        return Err(AppError::InvalidData(
-            "raw content chunk failed verification".into(),
-        ));
-    }
-    Ok(raw)
+    content_pack_core::integrity::decode_verified(
+        compressed,
+        chunk.compressed_size,
+        &chunk.compressed_sha256,
+        chunk.uncompressed_size,
+        expected_raw_sha256,
+    )
+    .map_err(Into::into)
 }
 
 pub async fn read_verified_local_chunk(

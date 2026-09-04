@@ -191,13 +191,13 @@ try {
     Invoke-NpmWithoutWorkspaces -Executable $npm -Arguments @('run', 'test:unit')
     Invoke-NpmWithoutWorkspaces -Executable $npm -Arguments @('run', 'test:e2e:browser')
     Invoke-NpmWithoutWorkspaces -Executable $npm -Arguments @('run', 'build:frontend')
-    Invoke-Native $cargo @('fmt', '--manifest-path', 'src-tauri/Cargo.toml', '--', '--check')
-    Invoke-Native $cargo @('clippy', '--manifest-path', 'src-tauri/Cargo.toml', '--all-targets', '--', '-D', 'warnings')
-    Invoke-Native $cargo @('test', '--manifest-path', 'src-tauri/Cargo.toml')
+    Invoke-Native $cargo @('fmt', '--manifest-path', 'src-tauri/Cargo.toml', '--all', '--', '--check')
+    Invoke-Native $cargo @('clippy', '--manifest-path', 'src-tauri/Cargo.toml', '--workspace', '--all-targets', '--', '-D', 'warnings')
+    Invoke-Native $cargo @('test', '--manifest-path', 'src-tauri/Cargo.toml', '--workspace')
     Invoke-NpmWithoutWorkspaces -Executable $npm -Arguments @('run', 'test:e2e:tauri')
 
-    # Debug + WebDriver artifacts are large on Windows and are not release inputs.
-    Invoke-Native $cargo @('clean', '--manifest-path', 'src-tauri/Cargo.toml', '--profile', 'dev')
+    # Keep healthy debug/WebDriver caches for subsequent scoped verification.
+    # They are not copied into release artifacts.
 
     $targetTriple = 'x86_64-pc-windows-msvc'
     Invoke-NpmWithoutWorkspaces -Executable $npx -Arguments @(

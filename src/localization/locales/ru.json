@@ -41,6 +41,7 @@
         "recovery_failed": "не удалось безопасно восстановить игровые файлы",
         "install_idle": "ожидание...",
         "installing": "устанавливаем игру...",
+        "resuming_install": "продолжаем прерванную установку...",
         "prerequisite_detecting": "определяем необходимые компоненты...",
         "prerequisite_downloading": "скачиваем необходимый компонент...",
         "prerequisite_verifying": "проверяем необходимый компонент...",

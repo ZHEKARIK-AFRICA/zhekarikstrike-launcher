@@ -2,6 +2,7 @@ use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
@@ -12,6 +13,7 @@ use crate::utils::hash_utils::sha256_file;
 use crate::utils::path_utils::{ensure_safe_descendant, safe_join};
 
 const CONTENT_DIRECTORY: &str = ".zhekarik/content";
+const RECOVERY_ENTRY_CONCURRENCY: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ContentFsOperation {
@@ -41,6 +43,7 @@ impl ContentFsHooks for NoContentFsHooks {}
 pub enum ContentJournalPhase {
     Materialize,
     Commit,
+    StreamingCommit,
     RolledBack,
 }
 
@@ -348,7 +351,7 @@ pub(crate) async fn recover_pending_content_with_hooks(
             cleanup_transaction_with_hooks(game_path, &journal.transaction_id, hooks).await?;
             guarded_remove_file_if_exists(game_path, &path, hooks).await?;
         }
-        ContentJournalPhase::Commit => {
+        ContentJournalPhase::Commit | ContentJournalPhase::StreamingCommit => {
             let committed = load_completion_state_with_hooks(game_path, hooks)
                 .await?
                 .is_some_and(|state| {
@@ -438,6 +441,7 @@ pub(crate) async fn remove_empty_obsolete_directories_with_hooks(
     Ok(())
 }
 
+#[allow(dead_code)] // Used by the retained v2 transactional implementation.
 pub async fn cleanup_transaction(game_path: &Path, transaction_id: &str) -> Result<(), AppError> {
     cleanup_transaction_with_hooks(game_path, transaction_id, &NoContentFsHooks).await
 }
@@ -732,6 +736,7 @@ async fn restore_backup(
 struct ContentReleaseBinding<'a> {
     content_sha256: &'a str,
     release_id: &'a str,
+    allow_partial_staging: bool,
 }
 
 async fn rollback_replace_entry(
@@ -764,9 +769,10 @@ async fn rollback_replace_entry(
                 }
             }
             if let Some(staged_actual) = &staged_actual {
-                if target_expected
-                    .as_ref()
-                    .is_some_and(|expected| staged_actual != expected)
+                if !binding.allow_partial_staging
+                    && target_expected
+                        .as_ref()
+                        .is_some_and(|expected| staged_actual != expected)
                 {
                     return Err(ambiguous_rollback(entry, "staged identity is unexpected"));
                 }
@@ -825,7 +831,7 @@ async fn rollback_replace_entry(
             ));
         }
         if let Some(staged_actual) = staged_actual {
-            if target_expected.as_ref() != Some(&staged_actual) {
+            if !binding.allow_partial_staging && target_expected.as_ref() != Some(&staged_actual) {
                 return Err(ambiguous_rollback(
                     entry,
                     "unstarted staged file identity changed",
@@ -851,7 +857,9 @@ async fn rollback_replace_entry(
                 "legacy unstarted replacement facts conflict",
             ));
         }
-        if target_expected.as_ref() != Some(&staged_actual) || target_actual.is_some() {
+        if (!binding.allow_partial_staging && target_expected.as_ref() != Some(&staged_actual))
+            || target_actual.is_some()
+        {
             return Err(ambiguous_rollback(
                 entry,
                 "unstarted replacement facts conflict",
@@ -1023,7 +1031,10 @@ async fn rollback_content_transaction_with_hooks(
         cleanup_transaction_with_hooks(game_path, &journal.transaction_id, hooks).await?;
         return guarded_remove_file_if_exists(game_path, &journal_path(game_path), hooks).await;
     }
-    if journal.phase != ContentJournalPhase::Commit {
+    if !matches!(
+        journal.phase,
+        ContentJournalPhase::Commit | ContentJournalPhase::StreamingCommit
+    ) {
         return Err(AppError::InvalidData(
             "content rollback requires commit phase".into(),
         ));
@@ -1034,25 +1045,54 @@ async fn rollback_content_transaction_with_hooks(
     let binding = ContentReleaseBinding {
         content_sha256: &journal.content_sha256,
         release_id: &journal.release_id,
+        // Streaming materializers create staging files before all chunks arrive.
+        // Their bytes are disposable; installed targets and backups still need
+        // full identity checks before anything can be removed or restored.
+        allow_partial_staging: journal.phase == ContentJournalPhase::StreamingCommit,
     };
-    for entry in journal.files.iter().rev() {
-        match entry.action {
-            ContentJournalAction::Replace => {
-                rollback_replace_entry(
-                    game_path,
-                    &staging_root,
-                    &backup_root,
-                    entry,
-                    schema_version,
-                    &binding,
-                    hooks,
-                )
-                .await?;
-            }
-            ContentJournalAction::Remove => {
-                rollback_remove_entry(game_path, &backup_root, entry, hooks).await?;
+    let mut pending = journal.files.iter().rev().map(|entry| {
+        let staging_root = &staging_root;
+        let backup_root = &backup_root;
+        let binding = &binding;
+        async move {
+            match entry.action {
+                ContentJournalAction::Replace => {
+                    rollback_replace_entry(
+                        game_path,
+                        staging_root,
+                        backup_root,
+                        entry,
+                        schema_version,
+                        binding,
+                        hooks,
+                    )
+                    .await
+                }
+                ContentJournalAction::Remove => {
+                    rollback_remove_entry(game_path, backup_root, entry, hooks).await
+                }
             }
         }
+    });
+    let mut running = FuturesUnordered::new();
+    for entry in pending.by_ref().take(RECOVERY_ENTRY_CONCURRENCY) {
+        running.push(entry);
+    }
+    let mut first_error = None;
+    while let Some(result) = running.next().await {
+        if let Err(error) = result {
+            first_error.get_or_insert(error);
+        }
+        // Do not start more work after an error, but drain in-flight filesystem
+        // operations before releasing the lease or allowing another recovery.
+        if first_error.is_none() {
+            if let Some(entry) = pending.next() {
+                running.push(entry);
+            }
+        }
+    }
+    if let Some(error) = first_error {
+        return Err(error);
     }
     journal.schema_version = 2;
     journal.phase = ContentJournalPhase::RolledBack;

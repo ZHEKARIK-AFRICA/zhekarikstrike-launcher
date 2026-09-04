@@ -159,6 +159,12 @@ impl From<crate::services::prerequisite_service::PrerequisiteError> for AppError
     }
 }
 
+impl From<content_pack_core::integrity::CoreError> for AppError {
+    fn from(error: content_pack_core::integrity::CoreError) -> Self {
+        Self::InvalidData(error.to_string())
+    }
+}
+
 #[cfg(test)]
 mod release_1_6_11_tests {
     use super::AppError;

@@ -2,7 +2,7 @@ use crate::error::AppError;
 use crate::models::GameManifest;
 use crate::services::api_client::ApiClient;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifyMode {
     Full,
     AdditionalOnly,

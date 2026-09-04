@@ -716,6 +716,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6"
 
 [[package]]
+name = "content-pack-core"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde",
+ "sha2",
+ "thiserror 2.0.18",
+ "zstd",
+]
+
+[[package]]
 name = "cookie"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3746,6 +3757,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "ryu-js"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04d056b875a9d2e6cb9a61d127afee9ac5999b9f87bcb32079d1318e505be714"
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3942,6 +3959,17 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "serde_json_canonicalizer"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe52319a927259afbfa5180c5157cd8167edfd3e8c254f9558c7fef44c5649f2"
+dependencies = [
+ "ryu-js",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -6623,20 +6651,25 @@ dependencies = [
 
 [[package]]
 name = "zhekarikstrike_launcher"
-version = "1.6.15"
+version = "1.6.17"
 dependencies = [
  "anyhow",
+ "bytes",
  "chrono",
+ "content-pack-core",
  "directories",
  "discord-rich-presence",
  "fs_extra",
  "futures-util",
+ "h2",
  "hex",
+ "http",
  "minisign-verify",
  "reqwest 0.12.28",
  "semver",
  "serde",
  "serde_json",
+ "serde_json_canonicalizer",
  "sha2",
  "sys-locale",
  "sysinfo",

@@ -94,6 +94,8 @@ src-tauri/target/
 src-tauri/gen/
 release/
 .worktrees/
+.superpowers/
+src-tauri/drive-pack-unit-*/
 
 # Gatsby files
 .cache/
