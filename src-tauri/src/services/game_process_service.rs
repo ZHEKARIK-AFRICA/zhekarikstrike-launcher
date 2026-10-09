@@ -66,7 +66,7 @@ pub async fn launch_game(
 
         let pure_source = patch_roots.game_files_pure;
         let copied_pure =
-            copy_files_and_track(pure_source, game_path.clone(), true, Some(patch_cancel)).await?;
+            copy_files_and_track(pure_source, game_path.clone(), Some(patch_cancel)).await?;
         *state.copied_pure_files.lock().await = copied_pure;
 
         if let Err(error) = discord_rpc_service::start_rich_presence(app.clone(), state).await {

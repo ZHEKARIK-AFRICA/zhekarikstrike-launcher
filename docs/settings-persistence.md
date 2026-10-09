@@ -19,6 +19,12 @@ already lost by an older launcher. Operators must keep required integration
 commands separate from player defaults; putting repeated player resets in an
 autoexec script will still execute them in the engine.
 
+Pure runtime overlays, including `items_game.txt`, remain unchanged for the
+entire owned game session. Elapsed startup time never selects the normal layer.
+Normal files are restored through the existing cleanup after the owned game
+process exits. This keeps subsequent server connections consistent with the
+pure layer installed at launch.
+
 ## Verification and delivery
 
 Run `cargo test --manifest-path src-tauri/Cargo.toml --lib settings` for the
