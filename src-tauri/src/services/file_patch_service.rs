@@ -34,6 +34,11 @@ pub async fn copy_files_and_track(
                 .strip_prefix(&source_root)
                 .map_err(|error| AppError::FileSystem(error.to_string()))?;
             let target = target_root.join(relative);
+            if super::user_settings_service::is_user_settings_path(&relative.to_string_lossy()) {
+                seed_user_settings(entry.path(), &target).await?;
+                // Persistent defaults never enter launch cleanup or delayed replacement.
+                continue;
+            }
             copy_one(entry.path(), &target).await?;
             copied.push(target.clone());
 
@@ -122,6 +127,42 @@ async fn copy_one(source: &Path, target: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
+async fn seed_user_settings(source: &Path, target: &Path) -> Result<(), AppError> {
+    use tokio::io::AsyncWriteExt;
+    if let Some(parent) = target.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    // create_new is atomic: another writer cannot be truncated between probe and copy.
+    let mut output = match tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)
+        .await
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if !tokio::fs::symlink_metadata(target).await?.is_file() {
+                return Err(AppError::InvalidData(
+                    "user settings path is not a regular file".into(),
+                ));
+            }
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let result = async {
+        output.write_all(&tokio::fs::read(source).await?).await?;
+        output.flush().await?;
+        Ok::<(), AppError>(())
+    }
+    .await;
+    drop(output);
+    if result.is_err() {
+        tokio::fs::remove_file(target).await?;
+    }
+    result
+}
+
 async fn delete_one(path: &Path) -> Result<(), AppError> {
     retry_operation(|| async {
         if is_locked(path).await? {
@@ -198,6 +239,40 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{copy_files_and_track, restore_game_files};
+
+    #[tokio::test]
+    async fn user_settings_seed_once_and_survive_launch_cleanup_and_updated_defaults() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("game_files_pure");
+        let target = directory.path().join("game");
+        fs::create_dir_all(source.join("csgo/cfg")).unwrap();
+        fs::write(source.join("csgo/cfg/config.cfg"), b"packaged defaults").unwrap();
+        let tracked = copy_files_and_track(source.clone(), target.clone(), false, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read(target.join("csgo/cfg/config.cfg")).unwrap(),
+            b"packaged defaults"
+        );
+        assert!(
+            tracked.is_empty(),
+            "persistent defaults must never enter launch cleanup"
+        );
+        fs::write(
+            target.join("csgo/cfg/config.cfg"),
+            b"my binds and sensitivity",
+        )
+        .unwrap();
+        fs::write(source.join("csgo/cfg/config.cfg"), b"updated defaults").unwrap();
+        let tracked = copy_files_and_track(source, target.clone(), false, None)
+            .await
+            .unwrap();
+        super::delete_tracked_files(tracked).await.unwrap();
+        assert_eq!(
+            fs::read(target.join("csgo/cfg/config.cfg")).unwrap(),
+            b"my binds and sensitivity"
+        );
+    }
 
     #[tokio::test]
     async fn missing_cached_game_files_are_a_cleanup_noop() {

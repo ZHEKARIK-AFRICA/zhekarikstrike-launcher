@@ -35,3 +35,4 @@ pub mod shutdown_service;
 pub mod verify_hash_service;
 pub mod verify_service;
 pub mod window_resize_service;
+pub mod user_settings_service;

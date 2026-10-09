@@ -744,11 +744,10 @@ pub(crate) async fn plan_obsolete_content_entries(
         .map(|file| file.path.to_ascii_lowercase())
         .collect::<HashSet<_>>();
     let mut entries = Vec::new();
-    for file in previous
-        .files
-        .iter()
-        .filter(|file| !retained.contains(&file.path.to_ascii_lowercase()))
-    {
+    for file in previous.files.iter().filter(|file| {
+        !retained.contains(&file.path.to_ascii_lowercase())
+            && !super::user_settings_service::is_user_settings_path(&file.path)
+    }) {
         let target = safe_join(game_path, &file.path)?;
         let original = capture_content_file_identity(game_path, &target, hooks).await?;
         entries.push(ContentJournalEntry {
@@ -863,7 +862,11 @@ pub(crate) async fn files_requiring_materialization(
             None,
             None,
         )?;
-        if had_original && (file.excluded_from_hash_check || file.temporary) {
+        if had_original
+            && (file.excluded_from_hash_check
+                || file.temporary
+                || super::user_settings_service::is_user_settings_path(&file.path))
+        {
             dispositions.push(Disposition::Ready);
             continue;
         }
