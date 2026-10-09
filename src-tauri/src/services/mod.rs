@@ -32,7 +32,7 @@ pub mod prerequisite_service;
 pub mod rev_ini_service;
 pub mod shortcut_service;
 pub mod shutdown_service;
+pub mod user_settings_service;
 pub mod verify_hash_service;
 pub mod verify_service;
 pub mod window_resize_service;
-pub mod user_settings_service;
