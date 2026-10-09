@@ -40,3 +40,9 @@ release artifacts. Existing user settings do not need a migration or deletion.
 Rollback restores the prior launcher binary; never restore packaged settings
 over the player's configuration. Older launchers need publisher-side exclusion
 flags for these paths before a rollback is safe for preferences.
+
+Release 1.6.20 pins Rust 1.96.0 and Node 24.18.1 to the native Windows
+acceptance environment. The 1.6.19 signing run stopped before publication when
+the moving `stable` compiler introduced a deprecation denied by Clippy. Its Git
+tag remains immutable; 1.6.20 carries the same player-settings and pure-layer
+behavior through the reproducible signed release flow.
