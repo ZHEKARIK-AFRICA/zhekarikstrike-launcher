@@ -13,20 +13,22 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          node-version: 24
+          node-version: 24.18.1
           cache: npm
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
         with:
+          toolchain: 1.96.0
+          components: clippy, rustfmt
           targets: x86_64-pc-windows-msvc
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
         with:
           workspaces: src-tauri
 
