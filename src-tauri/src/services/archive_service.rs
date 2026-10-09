@@ -36,8 +36,33 @@ pub async fn extract_zip(
                 if let Some(parent) = enclosed.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                let mut out = File::create(&enclosed)?;
-                io::copy(&mut entry, &mut out)?;
+                let output = if super::user_settings_service::is_user_settings_path(entry.name()) {
+                    match std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&enclosed)
+                    {
+                        Ok(file) => Some(file),
+                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                            if !std::fs::symlink_metadata(&enclosed)?.is_file() {
+                                return Err(AppError::InvalidData(
+                                    "user settings path is not a regular file".into(),
+                                ));
+                            }
+                            None
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                } else {
+                    Some(File::create(&enclosed)?)
+                };
+                if let Some(mut out) = output {
+                    if let Err(error) = io::copy(&mut entry, &mut out) {
+                        drop(out);
+                        std::fs::remove_file(&enclosed)?;
+                        return Err(error.into());
+                    }
+                }
             }
 
             progress.emit_stage(
@@ -78,6 +103,40 @@ mod tests {
     use std::path::Path;
 
     use super::safe_zip_path;
+
+    #[tokio::test]
+    async fn archive_settings_defaults_do_not_replace_a_partial_install_users_edits() {
+        use std::io::Write;
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("client.zip");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        for name in ["csgo/cfg/config.cfg", "csgo/cfg/autoexec.cfg"] {
+            writer
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(b"packaged defaults").unwrap();
+        }
+        writer.finish().unwrap();
+        let game = root.path().join("game");
+        std::fs::create_dir_all(game.join("csgo/cfg")).unwrap();
+        std::fs::write(game.join("csgo/cfg/config.cfg"), b"existing edits").unwrap();
+        super::extract_zip(
+            archive,
+            game.clone(),
+            crate::models::ProgressEmitter::headless("settings"),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read(game.join("csgo/cfg/config.cfg")).unwrap(),
+            b"existing edits"
+        );
+        assert_eq!(
+            std::fs::read(game.join("csgo/cfg/autoexec.cfg")).unwrap(),
+            b"packaged defaults"
+        );
+    }
 
     #[test]
     fn zip_entries_cannot_escape_the_target_directory() {

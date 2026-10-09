@@ -145,7 +145,10 @@ async fn classify_file(
         return Ok(());
     }
 
-    if exclude_files.contains(&file.path) || file.excluded_from_hash_check {
+    if super::user_settings_service::is_user_settings_path(&file.path)
+        || exclude_files.contains(&file.path)
+        || file.excluded_from_hash_check
+    {
         return Ok(());
     }
 
@@ -219,6 +222,53 @@ mod tests {
                     temporary: false,
                 })
                 .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_verification_seeds_missing_defaults_but_preserves_edited_files() {
+        let root = tempdir().unwrap();
+        let mut file = complete_manifest("1.0.3.6").files.remove(0);
+        for path in [
+            "csgo/cfg/config.cfg",
+            "csgo/cfg/autoexec.cfg",
+            "csgo/cfg/video.txt",
+            "csgo/video.txt",
+            "cfg/video.txt",
+            "cfg/videodefaults.txt",
+            "cfg/video.cfg",
+            "userdata/123/730/local/cfg/config.cfg",
+        ] {
+            file.path = path.into();
+            let mut downloads = Vec::new();
+            let mut hashes = Vec::new();
+            classify_file(
+                root.path(),
+                &file,
+                &HashSet::new(),
+                &mut downloads,
+                &mut hashes,
+            )
+            .await
+            .unwrap();
+            assert_eq!(downloads.len(), 1, "missing defaults should be installed");
+            let target = root.path().join(path);
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            fs::write(target, b"user settings differ in size and checksum").unwrap();
+            downloads.clear();
+            classify_file(
+                root.path(),
+                &file,
+                &HashSet::new(),
+                &mut downloads,
+                &mut hashes,
+            )
+            .await
+            .unwrap();
+            assert!(
+                downloads.is_empty() && hashes.is_empty(),
+                "existing {path} must be preserved independently of publisher flags"
+            );
         }
     }
 

@@ -1,17 +1,14 @@
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 
-use crate::constants::TEMPORARY_FILES;
 use crate::error::AppError;
 use crate::utils::hash_utils::sha256_file;
 
 pub async fn copy_files_and_track(
     source_root: PathBuf,
     target_root: PathBuf,
-    temporary_mode: bool,
     cancel: Option<CancellationToken>,
 ) -> Result<Vec<PathBuf>, AppError> {
     let mut copied = Vec::new();
@@ -34,28 +31,13 @@ pub async fn copy_files_and_track(
                 .strip_prefix(&source_root)
                 .map_err(|error| AppError::FileSystem(error.to_string()))?;
             let target = target_root.join(relative);
+            if super::user_settings_service::is_user_settings_path(&relative.to_string_lossy()) {
+                seed_user_settings(entry.path(), &target).await?;
+                // Persistent defaults never enter launch cleanup or delayed replacement.
+                continue;
+            }
             copy_one(entry.path(), &target).await?;
             copied.push(target.clone());
-
-            if temporary_mode && is_temporary(relative) {
-                let replacement_source = source_root
-                    .to_string_lossy()
-                    .replace("game_files_pure", "game_files");
-                let replacement = PathBuf::from(replacement_source).join(relative);
-                let target_clone = target.clone();
-                let cancel = cancel.clone();
-                tokio::spawn(async move {
-                    if let Some(cancel) = cancel {
-                        tokio::select! {
-                            _ = tokio::time::sleep(Duration::from_millis(25_000)) => {}
-                            _ = cancel.cancelled() => return,
-                        }
-                    } else {
-                        tokio::time::sleep(Duration::from_millis(25_000)).await;
-                    }
-                    let _ = copy_one(&replacement, &target_clone).await;
-                });
-            }
         }
         Ok::<(), AppError>(())
     }
@@ -89,7 +71,7 @@ pub async fn restore_game_files(
     if !tokio::fs::try_exists(&source_root).await.unwrap_or(false) {
         return Ok(Vec::new());
     }
-    copy_files_and_track(source_root, target_root, false, None).await
+    copy_files_and_track(source_root, target_root, None).await
 }
 
 async fn copy_one(source: &Path, target: &Path) -> Result<(), AppError> {
@@ -122,6 +104,42 @@ async fn copy_one(source: &Path, target: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
+async fn seed_user_settings(source: &Path, target: &Path) -> Result<(), AppError> {
+    use tokio::io::AsyncWriteExt;
+    if let Some(parent) = target.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    // create_new is atomic: another writer cannot be truncated between probe and copy.
+    let mut output = match tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)
+        .await
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if !tokio::fs::symlink_metadata(target).await?.is_file() {
+                return Err(AppError::InvalidData(
+                    "user settings path is not a regular file".into(),
+                ));
+            }
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let result = async {
+        output.write_all(&tokio::fs::read(source).await?).await?;
+        output.flush().await?;
+        Ok::<(), AppError>(())
+    }
+    .await;
+    drop(output);
+    if result.is_err() {
+        tokio::fs::remove_file(target).await?;
+    }
+    result
+}
+
 async fn delete_one(path: &Path) -> Result<(), AppError> {
     retry_operation(|| async {
         if is_locked(path).await? {
@@ -148,7 +166,8 @@ where
             Err(error) => {
                 last_error = Some(error);
                 if attempt < 2 {
-                    tokio::time::sleep(Duration::from_millis(300 * 2_u64.pow(attempt))).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(300 * 2_u64.pow(attempt)))
+                        .await;
                 }
             }
         }
@@ -184,13 +203,6 @@ async fn is_locked(path: &Path) -> Result<bool, AppError> {
     .map_err(|error| AppError::Unknown(error.to_string()))?
 }
 
-fn is_temporary(relative: &Path) -> bool {
-    let normalized = relative.to_string_lossy().replace('/', "\\");
-    TEMPORARY_FILES
-        .iter()
-        .any(|temporary| temporary.eq_ignore_ascii_case(&normalized))
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -198,6 +210,68 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{copy_files_and_track, restore_game_files};
+
+    #[tokio::test]
+    async fn pure_items_remain_active_until_session_cleanup() {
+        let root = tempdir().unwrap();
+        let pure = root.path().join("game_files_pure");
+        let normal = root.path().join("game_files");
+        let game = root.path().join("game");
+        let relative = "csgo/scripts/items/items_game.txt";
+        fs::create_dir_all(pure.join("csgo/scripts/items")).unwrap();
+        fs::create_dir_all(normal.join("csgo/scripts/items")).unwrap();
+        fs::write(pure.join(relative), b"server-compatible pure items").unwrap();
+        fs::write(normal.join(relative), b"custom normal items").unwrap();
+        let tracked = copy_files_and_track(pure, game.clone(), None)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(26)).await;
+        assert_eq!(
+            fs::read(game.join(relative)).unwrap(),
+            b"server-compatible pure items",
+            "elapsed startup time must not replace the active session overlay"
+        );
+        super::delete_tracked_files(tracked).await.unwrap();
+        restore_game_files(normal, game.clone()).await.unwrap();
+        assert_eq!(
+            fs::read(game.join(relative)).unwrap(),
+            b"custom normal items"
+        );
+    }
+
+    #[tokio::test]
+    async fn user_settings_seed_once_and_survive_launch_cleanup_and_updated_defaults() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("game_files_pure");
+        let target = directory.path().join("game");
+        fs::create_dir_all(source.join("csgo/cfg")).unwrap();
+        fs::write(source.join("csgo/cfg/config.cfg"), b"packaged defaults").unwrap();
+        let tracked = copy_files_and_track(source.clone(), target.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read(target.join("csgo/cfg/config.cfg")).unwrap(),
+            b"packaged defaults"
+        );
+        assert!(
+            tracked.is_empty(),
+            "persistent defaults must never enter launch cleanup"
+        );
+        fs::write(
+            target.join("csgo/cfg/config.cfg"),
+            b"my binds and sensitivity",
+        )
+        .unwrap();
+        fs::write(source.join("csgo/cfg/config.cfg"), b"updated defaults").unwrap();
+        let tracked = copy_files_and_track(source, target.clone(), None)
+            .await
+            .unwrap();
+        super::delete_tracked_files(tracked).await.unwrap();
+        assert_eq!(
+            fs::read(target.join("csgo/cfg/config.cfg")).unwrap(),
+            b"my binds and sensitivity"
+        );
+    }
 
     #[tokio::test]
     async fn missing_cached_game_files_are_a_cleanup_noop() {
@@ -241,7 +315,7 @@ mod tests {
         fs::write(source.join("a.bin"), b"copied first").expect("first source should exist");
         fs::write(source.join("b.bin"), b"must fail").expect("second source should exist");
 
-        assert!(copy_files_and_track(source, target.clone(), false, None)
+        assert!(copy_files_and_track(source, target.clone(), None)
             .await
             .is_err());
         assert!(

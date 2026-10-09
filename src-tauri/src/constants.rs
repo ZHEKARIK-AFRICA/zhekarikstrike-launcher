@@ -21,7 +21,6 @@ pub const MAX_DOWNLOAD_CONCURRENCY: usize = 32;
 pub const PROCESS_POLL_INTERVAL_MS: u64 = 3_000;
 pub const GAME_START_TIMEOUT_MS: u64 = 60_000;
 
-pub const TEMPORARY_FILES: &[&str] = &["csgo\\scripts\\items\\items_game.txt"];
 pub const ALLOWED_EXTERNAL_URLS: &[&str] = &[
     "https://zhekarik.africa/",
     "https://zhekarik.africa/strike",

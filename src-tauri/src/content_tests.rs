@@ -104,6 +104,67 @@ fn encoded(raw: &[u8]) -> Vec<u8> {
     zstd::stream::encode_all(Cursor::new(raw), 6).expect("fixture should compress")
 }
 
+#[tokio::test]
+async fn user_settings_survive_content_repair_updates_and_obsolete_cleanup() {
+    use crate::models::ProgressEmitter;
+    use crate::services::content_install_service::{
+        files_requiring_materialization, plan_obsolete_content_entries, IntegrityMode,
+    };
+    use crate::services::content_journal_service::NoContentFsHooks;
+    use std::fs;
+    let root = tempdir().unwrap();
+    let manifest = content_deletion_manifest(
+        'a',
+        "1.0.3.4-r1",
+        "1.0.3.4",
+        &[("csgo/cfg/config.cfg", b"packaged binds")],
+    );
+    let progress = ProgressEmitter::headless("settings-test");
+    let cancel = CancellationToken::new();
+    let initial = files_requiring_materialization(
+        root.path(),
+        &manifest,
+        None,
+        IntegrityMode::FullIntegrity,
+        &progress,
+        &cancel,
+    )
+    .await
+    .unwrap();
+    assert!(initial
+        .iter()
+        .any(|file| file.file.path == "csgo/cfg/config.cfg"));
+    fs::create_dir_all(root.path().join("csgo/cfg")).unwrap();
+    fs::write(root.path().join("csgo/cfg/config.cfg"), b"my edited binds").unwrap();
+    for mode in [IntegrityMode::FullIntegrity, IntegrityMode::FastUpdate] {
+        let repair = files_requiring_materialization(
+            root.path(),
+            &manifest,
+            Some(&manifest),
+            mode,
+            &progress,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !repair
+                .iter()
+                .any(|file| file.file.path == "csgo/cfg/config.cfg"),
+            "repair/update must preserve edited defaults"
+        );
+    }
+    let next = content_deletion_manifest('b', "1.0.3.5-r1", "1.0.3.5", &[]);
+    let removals =
+        plan_obsolete_content_entries(root.path(), Some(&manifest), &next, &NoContentFsHooks)
+            .await
+            .unwrap();
+    assert!(
+        removals.is_empty(),
+        "removed packaged defaults must not delete user settings"
+    );
+}
+
 fn manifest_json(raw: &[u8], compressed: &[u8]) -> serde_json::Value {
     let raw_sha = sha256(raw);
     let compressed_sha = sha256(compressed);
